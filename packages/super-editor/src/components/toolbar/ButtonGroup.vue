@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, h } from 'vue';
+import { computed, ref, h, onMounted, onBeforeUnmount } from 'vue';
 import ToolbarButton from './ToolbarButton.vue';
 import ToolbarSeparator from './ToolbarSeparator.vue';
 import OverflowMenu from './OverflowMenu.vue';
@@ -203,6 +203,21 @@ const handleFocus = (e) => {
     firstButton.focus();
   }
 };
+
+const handleDocumentPointerDown = (event) => {
+  if (!currentItem.value?.expand) return;
+  const target = event.target;
+  if (target?.closest?.('[data-editor-ui-surface]') || target?.closest?.('.n-dropdown')) return;
+  closeDropdowns();
+};
+
+onMounted(() => {
+  document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+});
 
 const handleDropdownUpdateShow = (open) => {
   if (!open) {
