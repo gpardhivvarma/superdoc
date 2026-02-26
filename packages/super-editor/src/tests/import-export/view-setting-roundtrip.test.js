@@ -217,5 +217,26 @@ describe('w:view setting roundtrip', () => {
       expect(viewElements.length).toBe(1);
       expect(viewElements[0].attributes['w:val']).toBe('normal');
     });
+
+    it('preserves w:view position in element order', () => {
+      const viewXml = { type: 'element', name: 'w:view', attributes: { 'w:val': 'web' }, elements: [] };
+      const converter = { viewSetting: { val: 'web', originalXml: carbonCopy(viewXml) } };
+      const convertedXml = {
+        'word/settings.xml': makeSettingsXml('<w:compat/><w:view w:val="print"/><w:defaultTabStop w:val="720"/>'),
+      };
+
+      const { updatedXml } = prepareFootnotesXmlForExport({
+        footnotes: [],
+        editor: {},
+        converter,
+        convertedXml,
+      });
+
+      const root = updatedXml['word/settings.xml']?.elements?.[0];
+      const names = root?.elements?.map((el) => el?.name);
+
+      expect(names).toEqual(['w:compat', 'w:view', 'w:defaultTabStop']);
+      expect(root.elements[1].attributes['w:val']).toBe('web');
+    });
   });
 });

@@ -143,9 +143,9 @@ const applyViewSettingToSettings = (converter, convertedXml) => {
   if (!updatedRoot) return convertedXml;
 
   const elements = Array.isArray(updatedRoot.elements) ? updatedRoot.elements : [];
-  const nextElements = elements.filter((el) => el?.name !== 'w:view');
-  nextElements.push(carbonCopy(viewSetting.originalXml));
-  updatedRoot.elements = nextElements;
+  const idx = elements.findIndex((el) => el?.name === 'w:view');
+  elements.splice(idx !== -1 ? idx : 0, idx !== -1 ? 1 : 0, carbonCopy(viewSetting.originalXml));
+  updatedRoot.elements = elements;
 
   return { ...convertedXml, 'word/settings.xml': updatedSettings };
 };
