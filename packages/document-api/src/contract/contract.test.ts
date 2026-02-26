@@ -83,12 +83,30 @@ describe('document-api contract catalog', () => {
       additionalProperties?: boolean;
     };
 
-    // Simplified schema: target (optional) + text (required), no allOf constraints
+    // Simplified schema: target (optional) + value (required) + type (optional enum), no allOf constraints
     expect(insertInputSchema.type).toBe('object');
-    expect(Object.keys(insertInputSchema.properties!).sort()).toEqual(['target', 'text']);
-    expect(insertInputSchema.required).toEqual(['text']);
+    expect(Object.keys(insertInputSchema.properties!).sort()).toEqual(['target', 'type', 'value']);
+    expect(insertInputSchema.required).toEqual(['value']);
     expect(insertInputSchema.allOf).toBeUndefined();
     expect(insertInputSchema.additionalProperties).toBe(false);
+  });
+
+  it('declares UNSUPPORTED_ENVIRONMENT for insert metadata and generated failure schema', () => {
+    const schemas = buildInternalContractSchemas();
+    const insertFailureSchema = schemas.operations.insert.failure as {
+      properties?: {
+        failure?: {
+          properties?: {
+            code?: {
+              enum?: string[];
+            };
+          };
+        };
+      };
+    };
+
+    expect(COMMAND_CATALOG.insert.possibleFailureCodes).toContain('UNSUPPORTED_ENVIRONMENT');
+    expect(insertFailureSchema.properties?.failure?.properties?.code?.enum).toContain('UNSUPPORTED_ENVIRONMENT');
   });
 
   it('derives OPERATION_IDS from OPERATION_DEFINITIONS keys', () => {
