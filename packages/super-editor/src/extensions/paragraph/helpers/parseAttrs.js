@@ -2,15 +2,15 @@ const CSS_LENGTH_TO_PT = { pt: 1, px: 1 / 1.333, in: 72, cm: 28.3465, mm: 2.8346
 
 /**
  * Parse a CSS length value and return { points, unit }.
- * Returns null for empty, negative, or unrecognized-unit values.
- * Zero is allowed so explicit "0" can override style-engine defaults.
+ * Returns null for empty or unrecognized-unit values.
+ * Negative values are allowed (needed for text-indent hanging indents).
  */
 function parseCssLength(value) {
   if (!value) return null;
-  const match = value.match(/^([0-9]*\.?[0-9]+)\s*(%|[a-z]*)$/i);
+  const match = value.match(/^(-?[0-9]*\.?[0-9]+)\s*(%|[a-z]*)$/i);
   if (!match) return null;
   const num = parseFloat(match[1]);
-  if (isNaN(num) || num < 0) return null;
+  if (isNaN(num)) return null;
   const unit = match[2];
   if (!unit) return { points: num, unit: '' };
   if (unit === '%') return { points: num, unit: '%' };
@@ -71,10 +71,10 @@ export function parseAttrs(node) {
     }
 
     const mt = parseCssLength(node.style.marginTop);
-    if (mt && mt.unit !== '%') cssSpacing.before = Math.round(mt.points * 20);
+    if (mt && mt.unit !== '%' && mt.points >= 0) cssSpacing.before = Math.round(mt.points * 20);
 
     const mb = parseCssLength(node.style.marginBottom);
-    if (mb && mb.unit !== '%') cssSpacing.after = Math.round(mb.points * 20);
+    if (mb && mb.unit !== '%' && mb.points >= 0) cssSpacing.after = Math.round(mb.points * 20);
 
     if (Object.keys(cssSpacing).length > 0) {
       spacing = cssSpacing;
@@ -83,9 +83,22 @@ export function parseAttrs(node) {
 
   // CSS inline style fallback for indent (e.g. Google Docs paste)
   if (!indent && node.style) {
+    const cssIndent = {};
+
     const ml = parseCssLength(node.style.marginLeft);
-    if (ml && ml.unit !== '%') {
-      indent = { left: Math.round(ml.points * 20) };
+    if (ml && ml.unit !== '%' && ml.points >= 0) cssIndent.left = Math.round(ml.points * 20);
+
+    const ti = parseCssLength(node.style.textIndent);
+    if (ti && ti.unit !== '%') {
+      if (ti.points >= 0) {
+        cssIndent.firstLine = Math.round(ti.points * 20);
+      } else {
+        cssIndent.hanging = Math.round(Math.abs(ti.points) * 20);
+      }
+    }
+
+    if (Object.keys(cssIndent).length > 0) {
+      indent = cssIndent;
     }
   }
 

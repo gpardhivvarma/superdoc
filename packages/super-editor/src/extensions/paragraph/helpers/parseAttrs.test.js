@@ -206,6 +206,27 @@ describe('parseAttrs', () => {
       expect(result.paragraphProperties.indent).toBeUndefined();
     });
 
+    it('extracts positive text-indent as firstLine', () => {
+      const node = createMockNode({}, { textIndent: '36pt' });
+      const result = parseAttrs(node);
+      // 36pt * 20 = 720 twips
+      expect(result.paragraphProperties.indent.firstLine).toBe(720);
+    });
+
+    it('extracts negative text-indent as hanging', () => {
+      const node = createMockNode({}, { textIndent: '-18pt' });
+      const result = parseAttrs(node);
+      // 18pt * 20 = 360 twips
+      expect(result.paragraphProperties.indent.hanging).toBe(360);
+    });
+
+    it('combines marginLeft and text-indent into indent', () => {
+      const node = createMockNode({}, { marginLeft: '36pt', textIndent: '-18pt' });
+      const result = parseAttrs(node);
+      expect(result.paragraphProperties.indent.left).toBe(720);
+      expect(result.paragraphProperties.indent.hanging).toBe(360);
+    });
+
     it('returns no spacing/indent when node has no styles', () => {
       const node = createMockNode({}, {});
       const result = parseAttrs(node);
