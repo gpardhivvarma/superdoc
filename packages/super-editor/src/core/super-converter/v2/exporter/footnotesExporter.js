@@ -130,6 +130,26 @@ const applyFootnotePropertiesToSettings = (converter, convertedXml) => {
   return { ...convertedXml, 'word/settings.xml': updatedSettings };
 };
 
+const applyViewSettingToSettings = (converter, convertedXml) => {
+  const viewSetting = converter?.viewSetting;
+  if (!viewSetting?.originalXml) return convertedXml;
+
+  const settingsXml = convertedXml['word/settings.xml'];
+  const settingsRoot = settingsXml?.elements?.[0];
+  if (!settingsRoot) return convertedXml;
+
+  const updatedSettings = carbonCopy(settingsXml);
+  const updatedRoot = updatedSettings.elements?.[0];
+  if (!updatedRoot) return convertedXml;
+
+  const elements = Array.isArray(updatedRoot.elements) ? updatedRoot.elements : [];
+  const nextElements = elements.filter((el) => el?.name !== 'w:view');
+  nextElements.push(carbonCopy(viewSetting.originalXml));
+  updatedRoot.elements = nextElements;
+
+  return { ...convertedXml, 'word/settings.xml': updatedSettings };
+};
+
 const buildFootnotesRelsXml = (converter, convertedXml, relationships) => {
   if (!relationships.length) return null;
 
@@ -155,6 +175,7 @@ const buildFootnotesRelsXml = (converter, convertedXml, relationships) => {
 
 export const prepareFootnotesXmlForExport = ({ footnotes, editor, converter, convertedXml }) => {
   let updatedXml = applyFootnotePropertiesToSettings(converter, convertedXml);
+  updatedXml = applyViewSettingToSettings(converter, updatedXml);
 
   if (!footnotes || !Array.isArray(footnotes) || footnotes.length === 0) {
     return { updatedXml, relationships: [], media: {} };
