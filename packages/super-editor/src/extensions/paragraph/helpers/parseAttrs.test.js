@@ -121,6 +121,30 @@ describe('parseAttrs', () => {
       expect(result.paragraphProperties.indent.left).toBe(720);
     });
 
+    it('converts percentage lineHeight to multiplier', () => {
+      const node = createMockNode({}, { lineHeight: '115%' });
+      const result = parseAttrs(node);
+      // 115% → 1.15 multiplier → round((1.15 * 240) / 1.15) = 240
+      expect(result.paragraphProperties.spacing.line).toBe(Math.round(((115 / 100) * 240) / 1.15));
+      expect(result.paragraphProperties.spacing.lineRule).toBe('auto');
+    });
+
+    it('converts px lineHeight to exact twips', () => {
+      const node = createMockNode({}, { lineHeight: '24px' });
+      const result = parseAttrs(node);
+      // 24px / 1.333 ≈ 18pt, * 20 = 360 twips
+      expect(result.paragraphProperties.spacing.line).toBe(Math.round((24 / 1.333) * 20));
+      expect(result.paragraphProperties.spacing.lineRule).toBe('exact');
+    });
+
+    it('converts pt lineHeight to exact twips', () => {
+      const node = createMockNode({}, { lineHeight: '18pt' });
+      const result = parseAttrs(node);
+      // 18pt * 20 = 360 twips
+      expect(result.paragraphProperties.spacing.line).toBe(360);
+      expect(result.paragraphProperties.spacing.lineRule).toBe('exact');
+    });
+
     it('ignores zero or negative CSS values', () => {
       const node = createMockNode({}, { marginTop: '0pt', marginLeft: '-10pt', lineHeight: '0' });
       const result = parseAttrs(node);

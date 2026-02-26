@@ -48,8 +48,23 @@ export function parseAttrs(node) {
     if (lineHeight) {
       const lhNum = parseFloat(lineHeight);
       if (!isNaN(lhNum) && lhNum > 0) {
-        cssSpacing.line = Math.round((lhNum * 240) / 1.15);
-        cssSpacing.lineRule = 'auto';
+        if (lineHeight.endsWith('%')) {
+          // e.g. "115%" → 1.15 multiplier
+          cssSpacing.line = Math.round(((lhNum / 100) * 240) / 1.15);
+          cssSpacing.lineRule = 'auto';
+        } else if (lineHeight.endsWith('px')) {
+          // Absolute px → convert to points then twips, store as exact
+          cssSpacing.line = Math.round((lhNum / 1.333) * 20);
+          cssSpacing.lineRule = 'exact';
+        } else if (lineHeight.endsWith('pt')) {
+          // Absolute pt → twips, store as exact
+          cssSpacing.line = Math.round(lhNum * 20);
+          cssSpacing.lineRule = 'exact';
+        } else {
+          // Unitless multiplier (e.g. "1.5")
+          cssSpacing.line = Math.round((lhNum * 240) / 1.15);
+          cssSpacing.lineRule = 'auto';
+        }
       }
     }
 
