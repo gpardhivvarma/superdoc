@@ -145,6 +145,52 @@ describe('parseAttrs', () => {
       expect(result.paragraphProperties.spacing.lineRule).toBe('exact');
     });
 
+    it('converts inch margins to twips', () => {
+      const node = createMockNode({}, { marginLeft: '0.5in' });
+      const result = parseAttrs(node);
+      // 0.5in = 36pt → 720 twips
+      expect(result.paragraphProperties.indent.left).toBe(Math.round(0.5 * 72 * 20));
+    });
+
+    it('converts cm margins to twips', () => {
+      const node = createMockNode({}, { marginTop: '1cm' });
+      const result = parseAttrs(node);
+      // 1cm ≈ 28.3465pt → ~567 twips
+      expect(result.paragraphProperties.spacing.before).toBe(Math.round(1 * 28.3465 * 20));
+    });
+
+    it('converts mm margins to twips', () => {
+      const node = createMockNode({}, { marginBottom: '10mm' });
+      const result = parseAttrs(node);
+      // 10mm ≈ 28.3465pt → ~567 twips
+      expect(result.paragraphProperties.spacing.after).toBe(Math.round(10 * 2.83465 * 20));
+    });
+
+    it('ignores margins with unrecognized units', () => {
+      const node = createMockNode({}, { marginLeft: '5em', marginTop: '10rem' });
+      const result = parseAttrs(node);
+      expect(result.paragraphProperties.indent).toBeUndefined();
+      expect(result.paragraphProperties.spacing).toBeUndefined();
+    });
+
+    it('converts in/cm/mm lineHeight to exact twips', () => {
+      const nodeIn = createMockNode({}, { lineHeight: '0.5in' });
+      const resultIn = parseAttrs(nodeIn);
+      expect(resultIn.paragraphProperties.spacing.line).toBe(Math.round(0.5 * 72 * 20));
+      expect(resultIn.paragraphProperties.spacing.lineRule).toBe('exact');
+
+      const nodeCm = createMockNode({}, { lineHeight: '1cm' });
+      const resultCm = parseAttrs(nodeCm);
+      expect(resultCm.paragraphProperties.spacing.line).toBe(Math.round(1 * 28.3465 * 20));
+      expect(resultCm.paragraphProperties.spacing.lineRule).toBe('exact');
+    });
+
+    it('ignores lineHeight with unrecognized units', () => {
+      const node = createMockNode({}, { lineHeight: '2em' });
+      const result = parseAttrs(node);
+      expect(result.paragraphProperties.spacing).toBeUndefined();
+    });
+
     it('ignores zero or negative CSS values', () => {
       const node = createMockNode({}, { marginTop: '0pt', marginLeft: '-10pt', lineHeight: '0' });
       const result = parseAttrs(node);

@@ -1,9 +1,20 @@
-function parseCssToPoints(value) {
-  if (!value) return 0;
-  const num = parseFloat(value);
-  if (isNaN(num) || num <= 0) return 0;
-  if (value.endsWith('px')) return num / 1.333;
-  return num;
+const CSS_LENGTH_TO_PT = { pt: 1, px: 1 / 1.333, in: 72, cm: 28.3465, mm: 2.83465 };
+
+/**
+ * Parse a CSS length value and return { value, unit }.
+ * Returns null for empty, non-positive, or unrecognized-unit values.
+ */
+function parseCssLength(value) {
+  if (!value) return null;
+  const match = value.match(/^([0-9]*\.?[0-9]+)\s*(%|[a-z]*)$/i);
+  if (!match) return null;
+  const num = parseFloat(match[1]);
+  if (isNaN(num) || num <= 0) return null;
+  const unit = match[2];
+  if (!unit) return { points: num, unit: '' };
+  if (unit === '%') return { points: num, unit: '%' };
+  const factor = CSS_LENGTH_TO_PT[unit];
+  return factor != null ? { points: num * factor, unit } : null;
 }
 
 export function parseAttrs(node) {
@@ -44,39 +55,25 @@ export function parseAttrs(node) {
   if (!spacing && node.style) {
     const cssSpacing = {};
 
-    const lineHeight = node.style.lineHeight;
-    if (lineHeight) {
-      const lhNum = parseFloat(lineHeight);
-      if (!isNaN(lhNum) && lhNum > 0) {
-        if (lineHeight.endsWith('%')) {
-          // e.g. "115%" → 1.15 multiplier
-          cssSpacing.line = Math.round(((lhNum / 100) * 240) / 1.15);
-          cssSpacing.lineRule = 'auto';
-        } else if (lineHeight.endsWith('px')) {
-          // Absolute px → convert to points then twips, store as exact
-          cssSpacing.line = Math.round((lhNum / 1.333) * 20);
-          cssSpacing.lineRule = 'exact';
-        } else if (lineHeight.endsWith('pt')) {
-          // Absolute pt → twips, store as exact
-          cssSpacing.line = Math.round(lhNum * 20);
-          cssSpacing.lineRule = 'exact';
-        } else {
-          // Unitless multiplier (e.g. "1.5")
-          cssSpacing.line = Math.round((lhNum * 240) / 1.15);
-          cssSpacing.lineRule = 'auto';
-        }
+    const lh = parseCssLength(node.style.lineHeight);
+    if (lh) {
+      if (lh.unit === '' || lh.unit === '%') {
+        // Unitless (1.5) or percentage (115%) → auto multiplier
+        const multiplier = lh.unit === '%' ? lh.points / 100 : lh.points;
+        cssSpacing.line = Math.round((multiplier * 240) / 1.15);
+        cssSpacing.lineRule = 'auto';
+      } else {
+        // Absolute length (pt, px, in, cm, mm) → exact twips
+        cssSpacing.line = Math.round(lh.points * 20);
+        cssSpacing.lineRule = 'exact';
       }
     }
 
-    const marginTop = parseCssToPoints(node.style.marginTop);
-    if (marginTop > 0) {
-      cssSpacing.before = Math.round(marginTop * 20);
-    }
+    const mt = parseCssLength(node.style.marginTop);
+    if (mt && mt.unit !== '%') cssSpacing.before = Math.round(mt.points * 20);
 
-    const marginBottom = parseCssToPoints(node.style.marginBottom);
-    if (marginBottom > 0) {
-      cssSpacing.after = Math.round(marginBottom * 20);
-    }
+    const mb = parseCssLength(node.style.marginBottom);
+    if (mb && mb.unit !== '%') cssSpacing.after = Math.round(mb.points * 20);
 
     if (Object.keys(cssSpacing).length > 0) {
       spacing = cssSpacing;
@@ -85,9 +82,9 @@ export function parseAttrs(node) {
 
   // CSS inline style fallback for indent (e.g. Google Docs paste)
   if (!indent && node.style) {
-    const marginLeft = parseCssToPoints(node.style.marginLeft);
-    if (marginLeft > 0) {
-      indent = { left: Math.round(marginLeft * 20) };
+    const ml = parseCssLength(node.style.marginLeft);
+    if (ml && ml.unit !== '%') {
+      indent = { left: Math.round(ml.points * 20) };
     }
   }
 
