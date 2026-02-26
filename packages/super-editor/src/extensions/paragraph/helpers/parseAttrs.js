@@ -1,3 +1,11 @@
+function parseCssToPoints(value) {
+  if (!value) return 0;
+  const num = parseFloat(value);
+  if (isNaN(num) || num <= 0) return 0;
+  if (value.endsWith('px')) return num / 1.333;
+  return num;
+}
+
 export function parseAttrs(node) {
   const numberingProperties = {};
   let indent, spacing;
@@ -31,6 +39,42 @@ export function parseAttrs(node) {
     }
     return acc;
   }, {});
+
+  // CSS inline style fallback for spacing (e.g. Google Docs paste)
+  if (!spacing && node.style) {
+    const cssSpacing = {};
+
+    const lineHeight = node.style.lineHeight;
+    if (lineHeight) {
+      const lhNum = parseFloat(lineHeight);
+      if (!isNaN(lhNum) && lhNum > 0) {
+        cssSpacing.line = Math.round((lhNum * 240) / 1.15);
+        cssSpacing.lineRule = 'auto';
+      }
+    }
+
+    const marginTop = parseCssToPoints(node.style.marginTop);
+    if (marginTop > 0) {
+      cssSpacing.before = Math.round(marginTop * 20);
+    }
+
+    const marginBottom = parseCssToPoints(node.style.marginBottom);
+    if (marginBottom > 0) {
+      cssSpacing.after = Math.round(marginBottom * 20);
+    }
+
+    if (Object.keys(cssSpacing).length > 0) {
+      spacing = cssSpacing;
+    }
+  }
+
+  // CSS inline style fallback for indent (e.g. Google Docs paste)
+  if (!indent && node.style) {
+    const marginLeft = parseCssToPoints(node.style.marginLeft);
+    if (marginLeft > 0) {
+      indent = { left: Math.round(marginLeft * 20) };
+    }
+  }
 
   let attrs = {
     paragraphProperties: {
