@@ -191,8 +191,16 @@ describe('parseAttrs', () => {
       expect(result.paragraphProperties.spacing).toBeUndefined();
     });
 
-    it('ignores zero or negative CSS values', () => {
-      const node = createMockNode({}, { marginTop: '0pt', marginLeft: '-10pt', lineHeight: '0' });
+    it('preserves explicit zero margins to override style-engine defaults', () => {
+      const node = createMockNode({}, { marginTop: '0pt', marginBottom: '0pt', marginLeft: '0pt' });
+      const result = parseAttrs(node);
+      expect(result.paragraphProperties.spacing.before).toBe(0);
+      expect(result.paragraphProperties.spacing.after).toBe(0);
+      expect(result.paragraphProperties.indent.left).toBe(0);
+    });
+
+    it('ignores zero lineHeight and negative margins', () => {
+      const node = createMockNode({}, { marginLeft: '-10pt', lineHeight: '0' });
       const result = parseAttrs(node);
       expect(result.paragraphProperties.spacing).toBeUndefined();
       expect(result.paragraphProperties.indent).toBeUndefined();

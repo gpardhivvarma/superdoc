@@ -1,15 +1,16 @@
 const CSS_LENGTH_TO_PT = { pt: 1, px: 1 / 1.333, in: 72, cm: 28.3465, mm: 2.83465 };
 
 /**
- * Parse a CSS length value and return { value, unit }.
- * Returns null for empty, non-positive, or unrecognized-unit values.
+ * Parse a CSS length value and return { points, unit }.
+ * Returns null for empty, negative, or unrecognized-unit values.
+ * Zero is allowed so explicit "0" can override style-engine defaults.
  */
 function parseCssLength(value) {
   if (!value) return null;
   const match = value.match(/^([0-9]*\.?[0-9]+)\s*(%|[a-z]*)$/i);
   if (!match) return null;
   const num = parseFloat(match[1]);
-  if (isNaN(num) || num <= 0) return null;
+  if (isNaN(num) || num < 0) return null;
   const unit = match[2];
   if (!unit) return { points: num, unit: '' };
   if (unit === '%') return { points: num, unit: '%' };
@@ -56,7 +57,7 @@ export function parseAttrs(node) {
     const cssSpacing = {};
 
     const lh = parseCssLength(node.style.lineHeight);
-    if (lh) {
+    if (lh && lh.points > 0) {
       if (lh.unit === '' || lh.unit === '%') {
         // Unitless (1.5) or percentage (115%) → auto multiplier
         const multiplier = lh.unit === '%' ? lh.points / 100 : lh.points;
