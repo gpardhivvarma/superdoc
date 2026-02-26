@@ -433,6 +433,7 @@ function importFootnotePropertiesFromSettings(docx, converter) {
 
 function importViewSettingFromSettings(docx, converter) {
   if (!docx || !converter) return;
+  converter.viewSetting = null;
   const settings = docx['word/settings.xml'];
   const settingsRoot = settings?.elements?.[0];
   const elements = Array.isArray(settingsRoot?.elements) ? settingsRoot.elements : [];
