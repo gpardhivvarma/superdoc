@@ -104,6 +104,23 @@ export function parseAttrs(node) {
     }
   }
 
+  // CSS inline style fallback for text-align (e.g. Google Docs paste)
+  let justification;
+  if (node.style) {
+    const textAlign = node.style.textAlign;
+    const alignMap = {
+      left: 'left',
+      center: 'center',
+      right: 'right',
+      justify: 'justify',
+      start: 'left',
+      end: 'right',
+    };
+    if (textAlign && alignMap[textAlign]) {
+      justification = alignMap[textAlign];
+    }
+  }
+
   let attrs = {
     paragraphProperties: {
       styleId: styleId || null,
@@ -117,6 +134,10 @@ export function parseAttrs(node) {
 
   if (spacing && Object.keys(spacing).length > 0) {
     attrs.paragraphProperties.spacing = spacing;
+  }
+
+  if (justification) {
+    attrs.paragraphProperties.justification = justification;
   }
 
   if (Object.keys(numberingProperties).length > 0) {
