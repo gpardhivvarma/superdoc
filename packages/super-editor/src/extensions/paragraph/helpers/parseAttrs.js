@@ -1,4 +1,4 @@
-const CSS_LENGTH_TO_PT = { pt: 1, px: 1 / 1.333, in: 72, cm: 28.3465, mm: 2.83465 };
+const CSS_LENGTH_TO_PT = { pt: 1, px: 72 / 96, in: 72, cm: 28.3465, mm: 2.83465 };
 
 /**
  * Parse a CSS length value and return { points, unit }.
@@ -39,9 +39,9 @@ export function parseAttrs(node) {
     } else if (attr.name === 'data-spacing') {
       try {
         spacing = JSON.parse(attr.value);
-        // Ensure numeric values
+        // Ensure numeric values (skip lineRule which is a string like 'auto')
         Object.keys(spacing).forEach((key) => {
-          spacing[key] = Number(spacing[key]);
+          if (key !== 'lineRule') spacing[key] = Number(spacing[key]);
         });
       } catch {
         // ignore invalid spacing value
@@ -61,6 +61,8 @@ export function parseAttrs(node) {
       if (lh.unit === '' || lh.unit === '%') {
         // Unitless (1.5) or percentage (115%) → auto multiplier
         const multiplier = lh.unit === '%' ? lh.points / 100 : lh.points;
+        // Invert pm-adapter's normalizeLineValue (value * 1.15 / 240) so
+        // values round-trip correctly through import → render → export.
         cssSpacing.line = Math.round((multiplier * 240) / 1.15);
         cssSpacing.lineRule = 'auto';
       } else {
