@@ -16,6 +16,7 @@ import { getLiveInlineMarksInRange } from './getLiveInlineMarksInRange.js';
  */
 export const removeMarkStep = ({ state, step, newTr, doc, user, date }) => {
   const meta = {};
+  let sharedWid = null;
 
   doc.nodesBetween(step.from, step.to, (node, pos) => {
     if (!node.isInline || node.type.name === 'run') {
@@ -81,7 +82,7 @@ export const removeMarkStep = ({ state, step, newTr, doc, user, date }) => {
 
       if (after.length || before.length) {
         const newFormatMark = state.schema.marks[TrackFormatMarkName].create({
-          id: uuidv4(),
+          id: formatChangeMark ? formatChangeMark.attrs.id : (sharedWid ?? (sharedWid = uuidv4())),
           author: user.name,
           authorEmail: user.email,
           authorImage: user.image,
