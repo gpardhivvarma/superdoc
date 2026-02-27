@@ -18,6 +18,7 @@ import { getLiveInlineMarksInRange } from './getLiveInlineMarksInRange.js';
  */
 export const addMarkStep = ({ state, step, newTr, doc, user, date }) => {
   const meta = {};
+  let sharedWid = null;
 
   doc.nodesBetween(step.from, step.to, (node, pos) => {
     if (!node.isInline || node.type.name === 'run') {
@@ -38,7 +39,7 @@ export const addMarkStep = ({ state, step, newTr, doc, user, date }) => {
     const existingChangeMark = liveMarks.find((mark) =>
       [TrackDeleteMarkName, TrackFormatMarkName].includes(mark.type.name),
     );
-    const wid = existingChangeMark ? existingChangeMark.attrs.id : uuidv4();
+    const wid = existingChangeMark ? existingChangeMark.attrs.id : (sharedWid ?? (sharedWid = uuidv4()));
     newTr.addMark(Math.max(step.from, pos), Math.min(step.to, pos + node.nodeSize), step.mark);
 
     const allowedMarks = ['bold', 'italic', 'strike', 'underline', 'textStyle', 'highlight'];
