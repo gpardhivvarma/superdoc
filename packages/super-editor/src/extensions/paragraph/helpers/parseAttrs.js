@@ -105,16 +105,15 @@ export function parseAttrs(node) {
   }
 
   // CSS inline style fallback for text-align (e.g. Google Docs paste)
-  let justification;
+  // Skip 'left' — Google Docs sets text-align: left on every paragraph,
+  // and storing it would bake in unnecessary direct formatting on export.
   let justification;
   if (!justification && node.style) {
     const textAlign = node.style.textAlign;
     const alignMap = {
-      left: 'left',
       center: 'center',
       right: 'right',
       justify: 'justify',
-      start: 'left',
       end: 'right',
     };
     if (textAlign && alignMap[textAlign]) {

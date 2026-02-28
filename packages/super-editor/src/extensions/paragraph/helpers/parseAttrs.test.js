@@ -254,16 +254,16 @@ describe('parseAttrs', () => {
       expect(result.paragraphProperties.justification).toBe('justify');
     });
 
-    it('extracts text-align: left as justification', () => {
+    it('skips text-align: left (default, avoids unnecessary direct formatting)', () => {
       const node = createMockNode({}, { textAlign: 'left' });
       const result = parseAttrs(node);
-      expect(result.paragraphProperties.justification).toBe('left');
+      expect(result.paragraphProperties.justification).toBeUndefined();
     });
 
-    it('maps text-align: start to justification left', () => {
+    it('skips text-align: start (maps to left, which is default)', () => {
       const node = createMockNode({}, { textAlign: 'start' });
       const result = parseAttrs(node);
-      expect(result.paragraphProperties.justification).toBe('left');
+      expect(result.paragraphProperties.justification).toBeUndefined();
     });
 
     it('maps text-align: end to justification right', () => {
