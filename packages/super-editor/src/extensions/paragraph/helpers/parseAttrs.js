@@ -106,7 +106,8 @@ export function parseAttrs(node) {
 
   // CSS inline style fallback for text-align (e.g. Google Docs paste)
   let justification;
-  if (node.style) {
+  let justification;
+  if (!justification && node.style) {
     const textAlign = node.style.textAlign;
     const alignMap = {
       left: 'left',
