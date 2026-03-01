@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { EditorState, TextSelection } from 'prosemirror-state';
-import { AddMarkStep, RemoveMarkStep } from 'prosemirror-transform';
+import { AddMarkStep } from 'prosemirror-transform';
 import { trackedTransaction } from './index.js';
 import { TrackFormatMarkName } from '../constants.js';
 import { initTestEditor } from '@tests/helpers/helpers.js';
@@ -86,6 +86,9 @@ describe('trackChangesHelpers addMarkStep / removeMarkStep (track format)', () =
 
     const ids = new Set(tfMarks.map((m) => m.id));
     expect(ids.size).toBe(1);
+
+    // Ranges should be clamped to per-node boundaries (no overlap between marks)
+    expect(tfMarks[0].to).toBeLessThanOrEqual(tfMarks[1].from);
 
     // The "after" array should include bold
     for (const tf of tfMarks) {
