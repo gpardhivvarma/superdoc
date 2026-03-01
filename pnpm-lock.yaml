@@ -237,6 +237,9 @@ catalogs:
     semantic-release-linear-app:
       specifier: ^0.7.1
       version: 0.7.1
+    tiff:
+      specifier: ^6.1.1
+      version: 6.2.0
     tippy.js:
       specifier: ^6.3.7
       version: 6.3.7
@@ -255,9 +258,6 @@ catalogs:
     unified:
       specifier: 11.0.5
       version: 11.0.5
-    utif2:
-      specifier: ^4.1.0
-      version: 4.1.0
     uuid:
       specifier: ^9.0.1
       version: 9.0.1
@@ -1111,12 +1111,12 @@ importers:
       remark-stringify:
         specifier: 'catalog:'
         version: 11.0.0
+      tiff:
+        specifier: 'catalog:'
+        version: 6.2.0
       unified:
         specifier: 'catalog:'
         version: 11.0.5
-      utif2:
-        specifier: 'catalog:'
-        version: 4.1.0
       uuid:
         specifier: 'catalog:'
         version: 9.0.1
@@ -7001,6 +7001,9 @@ packages:
     resolution: {integrity: sha512-2dYz766i9HprMBasCMvHMuazJ7u4WzhJwo5kb3iPSiW/iRYV6uPari3zHoqZlnuaR7V1bEiNMxikhp37rdBXbw==}
     engines: {node: '>=12'}
 
+  iobuffer@5.4.0:
+    resolution: {integrity: sha512-DRebOWuqDvxunfkNJAlc3IzWIPD5xVxwUNbHr7xKB8E6aLJxIPfNX3CoMJghcFjpv6RWQsrcJbghtEwSPoJqMA==}
+
   ip-address@10.0.1:
     resolution: {integrity: sha512-NWv9YLW4PoW2B7xtzaS3NCot75m6nK7Icdv0o3lfMceJVRfSoQwqD4wEH5rLwoKJwUiZ/rfpiVBhnaF0FK4HoA==}
     engines: {node: '>= 12'}
@@ -8868,6 +8871,9 @@ packages:
   pako@1.0.11:
     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
 
+  pako@2.1.0:
+    resolution: {integrity: sha512-w+eufiZ1WuJYgPXbV/PO3NCMEc3xqylkKHzp8bxp1uW4qaSNQUkwmLLEc3kKsfz8lpV1F8Ht3U1Cm+9Srog2ug==}
+
   parent-module@1.0.1:
     resolution: {integrity: sha512-GQ2EWRpQV8/o+Aw8YqtfZZPfNRWZYkbidE9k5rpl/hC3vtHHBfGm2Ifi6qWV+coDGkrUKZAxE3Lot5kcsRlh+g==}
     engines: {node: '>=6'}
@@ -10371,6 +10377,9 @@ packages:
   through@2.3.8:
     resolution: {integrity: sha512-w89qg7PI8wAdvX60bMDP+bFoD5Dvhm9oLheFp5O4a2QF0cSBGsBX4qZmadPMvVqlLJBBci+WqGGOAPvcDeNSVg==}
 
+  tiff@6.2.0:
+    resolution: {integrity: sha512-2oqrUZd1SUmCl1DGoBCWtQb0gVq6A81SoIpuQX4Os/VRA2Waa7ovF1hWzFhVFZkjFSC2B7w24aq6gjqIl7TAVg==}
+
   time-span@5.1.0:
     resolution: {integrity: sha512-75voc/9G4rDIJleOo4jPvN4/YC4GRZrY8yy1uU4lwrB3XEQbWve8zXoO5No4eFrGcTAMYyoY67p8jRQdtA1HbA==}
     engines: {node: '>=12'}
@@ -10811,9 +10820,6 @@ packages:
     peerDependenciesMeta:
       '@types/react':
         optional: true
-
-  utif2@4.1.0:
-    resolution: {integrity: sha512-+oknB9FHrJ7oW7A2WZYajOcv4FcDR4CfoGB0dPNfxbi4GO05RRnFmt5oa23+9w32EanrYcSJWspUiJkLMs+37w==}
 
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
@@ -18643,6 +18649,8 @@ snapshots:
       from2: 2.3.0
       p-is-promise: 3.0.0
 
+  iobuffer@5.4.0: {}
+
   ip-address@10.0.1: {}
 
   ip-address@10.1.0: {}
@@ -20804,6 +20812,8 @@ snapshots:
 
   pako@1.0.11: {}
 
+  pako@2.1.0: {}
+
   parent-module@1.0.1:
     dependencies:
       callsites: 3.1.0
@@ -22890,6 +22900,11 @@ snapshots:
 
   through@2.3.8: {}
 
+  tiff@6.2.0:
+    dependencies:
+      iobuffer: 5.4.0
+      pako: 2.1.0
+
   time-span@5.1.0:
     dependencies:
       convert-hrtime: 5.0.0
@@ -23363,10 +23378,6 @@ snapshots:
       tslib: 2.8.1
     optionalDependencies:
       '@types/react': 19.2.11
-
-  utif2@4.1.0:
-    dependencies:
-      pako: 1.0.11
 
   util-deprecate@1.0.2: {}
 
