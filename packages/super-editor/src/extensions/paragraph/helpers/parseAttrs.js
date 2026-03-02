@@ -1,4 +1,5 @@
 const CSS_LENGTH_TO_PT = { pt: 1, px: 72 / 96, in: 72, cm: 28.3465, mm: 2.83465 };
+const CSS_ALIGN_TO_OOXML = { center: 'center', right: 'right', justify: 'justify', end: 'right' };
 
 /**
  * Parse a CSS length value and return { points, unit }.
@@ -110,14 +111,8 @@ export function parseAttrs(node) {
   let justification;
   if (!justification && node.style) {
     const textAlign = node.style.textAlign;
-    const alignMap = {
-      center: 'center',
-      right: 'right',
-      justify: 'justify',
-      end: 'right',
-    };
-    if (textAlign && alignMap[textAlign]) {
-      justification = alignMap[textAlign];
+    if (textAlign && CSS_ALIGN_TO_OOXML[textAlign]) {
+      justification = CSS_ALIGN_TO_OOXML[textAlign];
     }
   }
 

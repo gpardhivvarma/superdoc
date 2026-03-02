@@ -780,7 +780,7 @@ function createFixture(page: Page, editor: Locator, modKey: string) {
       throw new Error(`assertTextMarkAttrs only supports "link" and "textStyle" via document-api; got "${markName}".`);
     },
 
-    async assertTextAlignment(text: string, expectedAlignment: string, occurrence = 0) {
+    async assertTextAlignment(text: string, expectedAlignment: string | null, occurrence = 0) {
       await expect
         .poll(() =>
           page.evaluate(

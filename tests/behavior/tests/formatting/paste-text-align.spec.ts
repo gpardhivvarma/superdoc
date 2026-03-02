@@ -39,5 +39,5 @@ test('pasted left-aligned paragraph does not store alignment (default)', async (
   await superdoc.waitForStable();
 
   // left is the default — parseAttrs skips it to avoid baking in direct formatting
-  await superdoc.assertTextAlignment('Left text', null as any);
+  await superdoc.assertTextAlignment('Left text', null);
 });
