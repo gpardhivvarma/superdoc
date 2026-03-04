@@ -96,21 +96,18 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = context.issue.number;
+            const login = context.payload.pull_request.user.login;
 
-            // author_association was removed from PR event payloads (Oct 2025).
-            // Fetch it from the REST API instead.
-            const { data: pr } = await github.rest.pulls.get({
-              owner,
-              repo,
-              pull_number: prNumber,
-            });
-
-            const assoc = pr.author_association;
-            core.info(`DEBUG: author_association=${assoc}, user=${pr.user.login}, type=${pr.user.type}`);
-            core.info(`DEBUG: event author_association=${context.payload.pull_request.author_association}`);
-            if (assoc === 'MEMBER' || assoc === 'OWNER' || assoc === 'COLLABORATOR') {
-              core.info(`Skipping community label — author is ${assoc}`);
+            // GITHUB_TOKEN lacks org-read scope, so author_association from the
+            // REST API downgrades org members to CONTRIBUTOR.  Check the repo
+            // collaborators list instead — it works with repo-scoped tokens.
+            try {
+              await github.rest.repos.checkCollaborator({ owner, repo, username: login });
+              core.info(`Skipping community label — ${login} is a repo collaborator`);
               return;
+            } catch (err) {
+              if (err.status !== 404) throw err;
+              // 404 = not a collaborator, continue to add label
             }
 
             const label = { name: 'community', color: '7057ff' };
