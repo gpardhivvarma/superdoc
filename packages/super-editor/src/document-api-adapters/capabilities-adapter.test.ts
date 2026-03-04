@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Editor } from '../core/Editor.js';
-import { INLINE_PROPERTY_REGISTRY, OPERATION_IDS } from '@superdoc/document-api';
+import { INLINE_PROPERTY_REGISTRY, OPERATION_IDS, PUBLIC_MUTATION_STEP_OP_IDS } from '@superdoc/document-api';
 import { TrackFormatMarkName } from '../extensions/track-changes/constants.js';
 import { getDocumentApiCapabilities } from './capabilities-adapter.js';
 
@@ -9,12 +9,7 @@ function makeEditor(overrides: Partial<Editor> = {}): Editor {
     insertParagraphAt: vi.fn(() => true),
     insertHeadingAt: vi.fn(() => true),
     insertListItemAt: vi.fn(() => true),
-    setListTypeAt: vi.fn(() => true),
     setTextSelection: vi.fn(() => true),
-    increaseListIndent: vi.fn(() => true),
-    decreaseListIndent: vi.fn(() => true),
-    restartNumbering: vi.fn(() => true),
-    exitListItemAt: vi.fn(() => true),
     addComment: vi.fn(() => true),
     editComment: vi.fn(() => true),
     addCommentReply: vi.fn(() => true),
@@ -82,11 +77,17 @@ describe('getDocumentApiCapabilities', () => {
     expect(operationKeys).toEqual([...OPERATION_IDS].sort());
   });
 
+  it('reports planEngine step-op support from the canonical mutation step catalog', () => {
+    const capabilities = getDocumentApiCapabilities(makeEditor());
+    expect(capabilities.planEngine.supportedStepOps).toEqual(PUBLIC_MUTATION_STEP_OP_IDS);
+    expect(capabilities.planEngine.supportedStepOps).not.toContain('domain.command');
+  });
+
   it('marks namespaces as unavailable when required commands are missing', () => {
     const editor = makeEditor({
       commands: {
         addComment: undefined,
-        setListTypeAt: undefined,
+        insertListItemAt: undefined,
         insertTrackedChange: undefined,
       } as unknown as Editor['commands'],
       schema: {
@@ -104,7 +105,7 @@ describe('getDocumentApiCapabilities', () => {
     expect(capabilities.global.trackChanges.enabled).toBe(false);
     expect(capabilities.global.history.enabled).toBe(false);
     expect(capabilities.operations['comments.create'].available).toBe(false);
-    expect(capabilities.operations['lists.setType'].available).toBe(false);
+    expect(capabilities.operations['lists.insert'].available).toBe(false);
     expect(capabilities.operations.insert.tracked).toBe(false);
     expect(capabilities.operations['format.apply'].available).toBe(false);
   });
@@ -135,8 +136,8 @@ describe('getDocumentApiCapabilities', () => {
 
     expect(capabilities.operations.insert.tracked).toBe(true);
     expect(capabilities.operations.insert.dryRun).toBe(true);
-    expect(capabilities.operations['lists.setType'].tracked).toBe(false);
-    expect(capabilities.operations['lists.setType'].dryRun).toBe(true);
+    expect(capabilities.operations['lists.create'].tracked).toBe(false);
+    expect(capabilities.operations['lists.create'].dryRun).toBe(true);
     expect(capabilities.operations['trackChanges.decide'].dryRun).toBe(false);
     expect(capabilities.operations['create.paragraph'].dryRun).toBe(true);
     expect(capabilities.operations['create.heading'].available).toBe(true);
@@ -148,11 +149,18 @@ describe('getDocumentApiCapabilities', () => {
     const capabilities = getDocumentApiCapabilities(makeEditor());
     const listMutations = [
       'lists.insert',
-      'lists.setType',
       'lists.indent',
       'lists.outdent',
-      'lists.restart',
-      'lists.exit',
+      'lists.create',
+      'lists.attach',
+      'lists.detach',
+      'lists.join',
+      'lists.separate',
+      'lists.setLevel',
+      'lists.setValue',
+      'lists.continuePrevious',
+      'lists.setLevelRestart',
+      'lists.convertToText',
     ] as const;
 
     for (const operationId of listMutations) {
@@ -206,11 +214,11 @@ describe('getDocumentApiCapabilities', () => {
 
   it('does not emit unavailable reasons for modes that are unsupported by design', () => {
     const capabilities = getDocumentApiCapabilities(makeEditor());
-    const setTypeReasons = capabilities.operations['lists.setType'].reasons ?? [];
+    const createReasons = capabilities.operations['lists.create'].reasons ?? [];
     const trackChangesDecideReasons = capabilities.operations['trackChanges.decide'].reasons ?? [];
 
-    expect(setTypeReasons).not.toContain('TRACKED_MODE_UNAVAILABLE');
-    expect(setTypeReasons).not.toContain('DRY_RUN_UNAVAILABLE');
+    expect(createReasons).not.toContain('TRACKED_MODE_UNAVAILABLE');
+    expect(createReasons).not.toContain('DRY_RUN_UNAVAILABLE');
     expect(trackChangesDecideReasons).not.toContain('DRY_RUN_UNAVAILABLE');
   });
 
