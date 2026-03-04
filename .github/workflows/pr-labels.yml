@@ -56,12 +56,16 @@ jobs:
               try {
                 await github.rest.issues.getLabel({ owner, repo, name: label.name });
               } catch {
-                await github.rest.issues.createLabel({
-                  owner,
-                  repo,
-                  name: label.name,
-                  color: label.color,
-                });
+                try {
+                  await github.rest.issues.createLabel({
+                    owner,
+                    repo,
+                    name: label.name,
+                    color: label.color,
+                  });
+                } catch (e) {
+                  if (e.status !== 422) throw e;
+                }
               }
             }
 
@@ -126,7 +130,11 @@ jobs:
             try {
               await github.rest.issues.getLabel({ owner, repo, name: label.name });
             } catch {
-              await github.rest.issues.createLabel({ owner, repo, ...label });
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...label });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
             }
 
             await github.rest.issues.addLabels({
