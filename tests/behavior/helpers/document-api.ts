@@ -6,11 +6,44 @@ import type {
   CommentsListResult,
   TrackChangesListResult,
   TextMutationReceipt,
+  ListsListQuery,
+  ListsSetTypeInput,
+  ListsSetValueInput,
+  ListsContinuePreviousInput,
+  ListsSeparateInput,
+  ListsMutateItemResult,
+  ListsSeparateResult,
+  ListsListResult,
 } from '@superdoc/document-api';
-import type { ListsListResult } from '@superdoc/document-api';
 
 export type { TextAddress, TextMutationReceipt, TrackChangeType };
 export type ChangeMode = 'direct' | 'tracked';
+type MutationOptions = { changeMode?: ChangeMode; dryRun?: boolean; expectedRevision?: number };
+type ListMutationName = 'setValue' | 'continuePrevious' | 'setType' | 'separate';
+
+async function invokeListMutation<TInput>(
+  page: Page,
+  operation: ListMutationName,
+  input: TInput,
+  options: MutationOptions = {},
+): Promise<ListsMutateItemResult> {
+  return page.evaluate(
+    ({ op, payload, opts }) => {
+      const listApi = (window as any).editor?.doc?.lists;
+      if (!listApi) {
+        throw new Error('Document API is unavailable: expected editor.doc.lists.');
+      }
+
+      const operationFn = listApi[op];
+      if (typeof operationFn !== 'function') {
+        throw new Error(`Document API is unavailable: expected editor.doc.lists.${op}().`);
+      }
+
+      return operationFn.call(listApi, payload, opts);
+    },
+    { op: operation, payload: input, opts: options },
+  ) as Promise<ListsMutateItemResult>;
+}
 
 export async function assertDocumentApiReady(page: Page): Promise<void> {
   await page.evaluate(() => {
@@ -278,8 +311,40 @@ export async function listTrackChanges(
   }, query) as Promise<TrackChangesListResult>;
 }
 
-export async function listItems(page: Page): Promise<ListsListResult> {
-  return page.evaluate(() => (window as any).editor.doc.lists.list({}));
+export async function listItems(page: Page, query: ListsListQuery = {}): Promise<ListsListResult> {
+  return page.evaluate((input) => (window as any).editor.doc.lists.list(input), query);
+}
+
+export async function listSetValue(
+  page: Page,
+  input: ListsSetValueInput,
+  options: MutationOptions = {},
+): Promise<ListsMutateItemResult> {
+  return invokeListMutation(page, 'setValue', input, options);
+}
+
+export async function listContinuePrevious(
+  page: Page,
+  input: ListsContinuePreviousInput,
+  options: MutationOptions = {},
+): Promise<ListsMutateItemResult> {
+  return invokeListMutation(page, 'continuePrevious', input, options);
+}
+
+export async function listSetType(
+  page: Page,
+  input: ListsSetTypeInput,
+  options: MutationOptions = {},
+): Promise<ListsMutateItemResult> {
+  return invokeListMutation(page, 'setType', input, options);
+}
+
+export async function listSeparate(
+  page: Page,
+  input: ListsSeparateInput,
+  options: MutationOptions = {},
+): Promise<ListsSeparateResult> {
+  return invokeListMutation(page, 'separate', input, options) as Promise<ListsSeparateResult>;
 }
 
 export async function acceptTrackChange(page: Page, input: { id: string }): Promise<void> {
