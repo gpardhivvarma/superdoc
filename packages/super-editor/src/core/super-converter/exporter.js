@@ -191,6 +191,7 @@ export function exportSchemaToJson(params) {
     contentBlock: pictTranslator,
     vectorShape: translateVectorShape,
     shapeGroup: translateShapeGroup,
+    chart: wDrawingNodeTranslator,
     structuredContent: wSdtNodeTranslator,
     structuredContentBlock: wSdtNodeTranslator,
     documentPartObject: wSdtNodeTranslator,
