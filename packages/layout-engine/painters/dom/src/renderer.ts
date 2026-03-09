@@ -6543,6 +6543,8 @@ const deriveBlockVersion = (block: FlowBlock): string => {
           textRun.strike ? 1 : 0,
           textRun.highlight ?? '',
           textRun.letterSpacing != null ? textRun.letterSpacing : '',
+          textRun.vertAlign ?? '',
+          textRun.baselineShift != null ? textRun.baselineShift : '',
           // Note: pmStart/pmEnd intentionally excluded to prevent O(n) change detection
           textRun.token ?? '',
           // Tracked changes - force re-render when added or removed tracked change
@@ -6784,6 +6786,8 @@ const deriveBlockVersion = (block: FlowBlock): string => {
               hash = hashString(hash, getRunUnderlineStyle(run));
               hash = hashString(hash, getRunUnderlineColor(run));
               hash = hashString(hash, getRunBooleanProp(run, 'strike') ? '1' : '');
+              hash = hashString(hash, getRunStringProp(run, 'vertAlign'));
+              hash = hashNumber(hash, getRunNumberProp(run, 'baselineShift'));
             }
           }
         }

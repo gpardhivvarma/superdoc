@@ -17,6 +17,7 @@ import type { PMNode } from '../types.js';
 import type { ResolvedRunProperties } from '@superdoc/word-layout';
 import { computeWordParagraphLayout } from '@superdoc/word-layout';
 import { pickNumber, twipsToPx, isFiniteNumber, ptToPx } from '../utilities.js';
+import { SUBSCRIPT_SUPERSCRIPT_SCALE } from '../constants.js';
 import { normalizeAlignment, normalizeParagraphSpacing } from './spacing-indent.js';
 import { normalizeOoxmlTabs } from './tabs.js';
 import { normalizeParagraphBorders, normalizeParagraphShading } from './borders.js';
@@ -325,7 +326,7 @@ export const computeRunAttrs = (
 
   // Scale font size for superscript/subscript when no custom position override
   if (!hasPosition && (vertAlign === 'superscript' || vertAlign === 'subscript')) {
-    fontSize *= 0.65;
+    fontSize *= SUBSCRIPT_SUPERSCRIPT_SCALE;
   }
 
   return {
