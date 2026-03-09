@@ -93,6 +93,17 @@ import {
   type SdtBoundaryOptions,
 } from './utils/sdt-helpers.js';
 import { SdtGroupedHover } from './utils/sdt-hover.js';
+import {
+  computeBetweenBorderFlags,
+  getFragmentParagraphBorders,
+  getFragmentHeight,
+  createParagraphDecorationLayers,
+  applyParagraphBorderStyles,
+  applyParagraphShadingStyles,
+  getParagraphBorderBox,
+  stampBetweenBorderDataset,
+  type BetweenBorderInfo,
+} from './features/paragraph-borders/index.js';
 
 /**
  * Minimal type for WordParagraphLayoutOutput marker data used in rendering.
@@ -332,20 +343,9 @@ type PainterOptions = {
   ruler?: RulerOptions;
 };
 
-type BlockLookupEntry = {
-  block: FlowBlock;
-  measure: Measure;
-  version: string;
-};
-
-/**
- * Map of block IDs to their corresponding block data and measurements.
- * Used by the renderer to efficiently look up block information during fragment rendering.
- * Each entry contains the block definition, its layout measurements, and a version string for cache invalidation.
- *
- * @typedef {Map<string, BlockLookupEntry>} BlockLookup
- */
-export type BlockLookup = Map<string, BlockLookupEntry>;
+// BlockLookup lives in the shared types module (single source of truth)
+import type { BlockLookupEntry, BlockLookup } from './features/paragraph-borders/types.js';
+export type { BlockLookup, BlockLookupEntry };
 
 type FragmentDomState = {
   key: string;
@@ -1972,10 +1972,11 @@ export class DomPainter {
     };
 
     const sdtBoundaries = computeSdtBoundaries(page.fragments, this.blockLookup, this.sdtLabelsRendered);
+    const betweenBorderFlags = computeBetweenBorderFlags(page.fragments, this.blockLookup);
 
     page.fragments.forEach((fragment, index) => {
       const sdtBoundary = sdtBoundaries.get(index);
-      el.appendChild(this.renderFragment(fragment, contextBase, sdtBoundary));
+      el.appendChild(this.renderFragment(fragment, contextBase, sdtBoundary, betweenBorderFlags.get(index)));
     });
     this.renderDecorationsForPage(el, page, pageIndex);
     return el;
@@ -2156,22 +2157,27 @@ export class DomPainter {
       pageIndex,
     };
 
+    // Compute between-border flags for header/footer paragraph fragments
+    const betweenBorderFlags = computeBetweenBorderFlags(data.fragments, this.blockLookup);
+
     // Separate behindDoc fragments from normal fragments.
     // Prefer explicit fragment.behindDoc when present. Keep zIndex===0 as a
     // compatibility fallback for older layouts that predate explicit metadata.
-    const behindDocFragments: typeof data.fragments = [];
-    const normalFragments: typeof data.fragments = [];
+    // Track original index for between-border flag lookup.
+    const behindDocFragments: { fragment: (typeof data.fragments)[number]; originalIndex: number }[] = [];
+    const normalFragments: { fragment: (typeof data.fragments)[number]; originalIndex: number }[] = [];
 
-    for (const fragment of data.fragments) {
+    for (let fi = 0; fi < data.fragments.length; fi += 1) {
+      const fragment = data.fragments[fi];
       let isBehindDoc = false;
       if (fragment.kind === 'image' || fragment.kind === 'drawing') {
         isBehindDoc =
           fragment.behindDoc === true || (fragment.behindDoc == null && 'zIndex' in fragment && fragment.zIndex === 0);
       }
       if (isBehindDoc) {
-        behindDocFragments.push(fragment);
+        behindDocFragments.push({ fragment, originalIndex: fi });
       } else {
-        normalFragments.push(fragment);
+        normalFragments.push({ fragment, originalIndex: fi });
       }
     }
 
@@ -2186,8 +2192,8 @@ export class DomPainter {
     // We can't use z-index: -1 because that goes behind the page's white background.
     // By inserting at the beginning and using z-index: 0, they render below body content
     // which also has z-index values but comes later in DOM order.
-    behindDocFragments.forEach((fragment) => {
-      const fragEl = this.renderFragment(fragment, context);
+    behindDocFragments.forEach(({ fragment, originalIndex }) => {
+      const fragEl = this.renderFragment(fragment, context, undefined, betweenBorderFlags.get(originalIndex));
       const isPageRelativeVertical = this.isPageRelativeVerticalAnchorFragment(fragment);
       // Page-relative anchors already carry absolute page Y coordinates. Adding decoration
       // container offsets would shift them twice and can push header art into body content.
@@ -2203,8 +2209,8 @@ export class DomPainter {
     });
 
     // Render normal fragments in the header/footer container
-    normalFragments.forEach((fragment) => {
-      const fragEl = this.renderFragment(fragment, context);
+    normalFragments.forEach(({ fragment, originalIndex }) => {
+      const fragEl = this.renderFragment(fragment, context, undefined, betweenBorderFlags.get(originalIndex));
       const isPageRelativeVertical = this.isPageRelativeVerticalAnchorFragment(fragment);
       if (isPageRelativeVertical) {
         // Convert absolute page Y back to decoration-container local coordinates.
@@ -2315,6 +2321,7 @@ export class DomPainter {
     const existing = new Map(state.fragments.map((frag) => [frag.key, frag]));
     const nextFragments: FragmentDomState[] = [];
     const sdtBoundaries = computeSdtBoundaries(page.fragments, this.blockLookup, this.sdtLabelsRendered);
+    const betweenBorderFlags = computeBetweenBorderFlags(page.fragments, this.blockLookup);
 
     const contextBase: FragmentRenderContext = {
       pageNumber: page.number,
@@ -2328,10 +2335,16 @@ export class DomPainter {
       const key = fragmentKey(fragment);
       const current = existing.get(key);
       const sdtBoundary = sdtBoundaries.get(index);
+      const betweenInfo = betweenBorderFlags.get(index);
 
       if (current) {
         existing.delete(key);
         const sdtBoundaryMismatch = shouldRebuildForSdtBoundary(current.element, sdtBoundary);
+        // Detect mismatch in any between-border property
+        const betweenBorderMismatch =
+          (current.element.dataset.betweenBorder === 'true') !== (betweenInfo?.showBetweenBorder ?? false) ||
+          (current.element.dataset.suppressTopBorder === 'true') !== (betweenInfo?.suppressTopBorder ?? false) ||
+          (current.element.dataset.gapBelow ?? '') !== (betweenInfo?.gapBelow ? String(betweenInfo.gapBelow) : '');
         // Verify the position mapping is reliable: if mapping the old pmStart doesn't produce
         // the expected new pmStart, the mapping is degenerate (e.g. full-document paste) and
         // we must rebuild to get correct span position attributes.
@@ -2345,10 +2358,11 @@ export class DomPainter {
           this.changedBlocks.has(fragment.blockId) ||
           current.signature !== fragmentSignature(fragment, this.blockLookup) ||
           sdtBoundaryMismatch ||
+          betweenBorderMismatch ||
           mappingUnreliable;
 
         if (needsRebuild) {
-          const replacement = this.renderFragment(fragment, contextBase, sdtBoundary);
+          const replacement = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo);
           pageEl.replaceChild(replacement, current.element);
           current.element = replacement;
           current.signature = fragmentSignature(fragment, this.blockLookup);
@@ -2369,7 +2383,7 @@ export class DomPainter {
         return;
       }
 
-      const fresh = this.renderFragment(fragment, contextBase, sdtBoundary);
+      const fresh = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo);
       pageEl.insertBefore(fresh, pageEl.children[index] ?? null);
       nextFragments.push({
         key,
@@ -2464,9 +2478,10 @@ export class DomPainter {
     };
 
     const sdtBoundaries = computeSdtBoundaries(page.fragments, this.blockLookup, this.sdtLabelsRendered);
+    const betweenBorderFlags = computeBetweenBorderFlags(page.fragments, this.blockLookup);
     const fragmentStates: FragmentDomState[] = page.fragments.map((fragment, index) => {
       const sdtBoundary = sdtBoundaries.get(index);
-      const fragmentEl = this.renderFragment(fragment, contextBase, sdtBoundary);
+      const fragmentEl = this.renderFragment(fragment, contextBase, sdtBoundary, betweenBorderFlags.get(index));
       el.appendChild(fragmentEl);
       return {
         key: fragmentKey(fragment),
@@ -2512,12 +2527,13 @@ export class DomPainter {
     fragment: Fragment,
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
+    betweenInfo?: BetweenBorderInfo,
   ): HTMLElement {
     if (fragment.kind === 'para') {
-      return this.renderParagraphFragment(fragment, context, sdtBoundary);
+      return this.renderParagraphFragment(fragment, context, sdtBoundary, betweenInfo);
     }
     if (fragment.kind === 'list-item') {
-      return this.renderListItemFragment(fragment, context, sdtBoundary);
+      return this.renderListItemFragment(fragment, context, sdtBoundary, betweenInfo);
     }
     if (fragment.kind === 'image') {
       return this.renderImageFragment(fragment, context);
@@ -2544,6 +2560,7 @@ export class DomPainter {
     fragment: ParaFragment,
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
+    betweenInfo?: BetweenBorderInfo,
   ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
@@ -2599,13 +2616,19 @@ export class DomPainter {
       // Otherwise, fall back to slicing from the original measure.
       const lines = fragment.lines ?? measure.lines.slice(fragment.fromLine, fragment.toLine);
       applyParagraphBlockStyles(fragmentEl, block.attrs);
-      const { shadingLayer, borderLayer } = createParagraphDecorationLayers(this.doc, fragment.width, block.attrs);
+      const { shadingLayer, borderLayer } = createParagraphDecorationLayers(
+        this.doc,
+        fragment.width,
+        block.attrs,
+        betweenInfo,
+      );
       if (shadingLayer) {
         fragmentEl.appendChild(shadingLayer);
       }
       if (borderLayer) {
         fragmentEl.appendChild(borderLayer);
       }
+      stampBetweenBorderDataset(fragmentEl, betweenInfo);
       if (block.attrs?.styleId) {
         fragmentEl.dataset.styleId = block.attrs.styleId;
         fragmentEl.setAttribute('styleid', block.attrs.styleId);
@@ -3001,6 +3024,7 @@ export class DomPainter {
     fragment: ListItemFragment,
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
+    betweenInfo?: BetweenBorderInfo,
   ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
@@ -3092,13 +3116,19 @@ export class DomPainter {
       // Track B: preserve indent for wordLayout-based lists to show hierarchy
       const contentAttrs = wordLayout ? item.paragraph.attrs : stripListIndent(item.paragraph.attrs);
       applyParagraphBlockStyles(contentEl, contentAttrs);
-      const { shadingLayer, borderLayer } = createParagraphDecorationLayers(this.doc, fragment.width, contentAttrs);
+      const { shadingLayer, borderLayer } = createParagraphDecorationLayers(
+        this.doc,
+        fragment.width,
+        contentAttrs,
+        betweenInfo,
+      );
       if (shadingLayer) {
         contentEl.appendChild(shadingLayer);
       }
       if (borderLayer) {
         contentEl.appendChild(borderLayer);
       }
+      stampBetweenBorderDataset(fragmentEl, betweenInfo);
       // INTENTIONAL DIVERGENCE: Force list content to left alignment
       // Microsoft Word DOES justify list paragraphs when alignment is 'justify',
       // but we intentionally keep lists left-aligned to match user expectations
@@ -6182,41 +6212,6 @@ const getFragmentSdtContainerKey = (fragment: Fragment, blockLookup: BlockLookup
   return null;
 };
 
-const getFragmentHeight = (fragment: Fragment, blockLookup: BlockLookup): number => {
-  if (fragment.kind === 'table' || fragment.kind === 'image' || fragment.kind === 'drawing') {
-    return fragment.height;
-  }
-
-  const lookup = blockLookup.get(fragment.blockId);
-  if (!lookup) return 0;
-
-  if (fragment.kind === 'para' && lookup.measure.kind === 'paragraph') {
-    const measure = lookup.measure;
-    const lines = fragment.lines ?? measure.lines.slice(fragment.fromLine, fragment.toLine);
-    if (lines.length === 0) return 0;
-    let totalHeight = 0;
-    for (const line of lines) {
-      totalHeight += line.lineHeight ?? 0;
-    }
-    return totalHeight;
-  }
-
-  if (fragment.kind === 'list-item' && lookup.measure.kind === 'list') {
-    const listMeasure = lookup.measure as ListMeasure;
-    const item = listMeasure.items.find((it) => it.itemId === fragment.itemId);
-    if (!item) return 0;
-    const lines = item.paragraph.lines.slice(fragment.fromLine, fragment.toLine);
-    if (lines.length === 0) return 0;
-    let totalHeight = 0;
-    for (const line of lines) {
-      totalHeight += line.lineHeight ?? 0;
-    }
-    return totalHeight;
-  }
-
-  return 0;
-};
-
 const computeSdtBoundaries = (
   fragments: readonly Fragment[],
   blockLookup: BlockLookup,
@@ -6279,6 +6274,8 @@ const computeSdtBoundaries = (
 
   return boundaries;
 };
+
+// getFragmentParagraphBorders, computeBetweenBorderFlags — moved to features/paragraph-borders/
 
 const fragmentKey = (fragment: Fragment): string => {
   if (fragment.kind === 'para') {
@@ -7028,119 +7025,8 @@ const applyParagraphBlockStyles = (element: HTMLElement, attrs?: ParagraphAttrs)
   }
 };
 
-const getParagraphBorderBox = (
-  fragmentWidth: number,
-  indent?: ParagraphAttrs['indent'],
-): { leftInset: number; width: number } => {
-  const indentLeft = Number.isFinite(indent?.left) ? indent!.left! : 0;
-  const indentRight = Number.isFinite(indent?.right) ? indent!.right! : 0;
-  const firstLine = Number.isFinite(indent?.firstLine) ? indent!.firstLine! : 0;
-  const hanging = Number.isFinite(indent?.hanging) ? indent!.hanging! : 0;
-  const firstLineOffset = firstLine - hanging;
-  const minLeftInset = Math.min(indentLeft, indentLeft + firstLineOffset);
-  const leftInset = Math.max(0, minLeftInset);
-  const rightInset = Math.max(0, indentRight);
-  return {
-    leftInset,
-    width: Math.max(0, fragmentWidth - leftInset - rightInset),
-  };
-};
-
-/**
- * Builds overlay elements for paragraph shading and borders with indent-aware sizing.
- * Returns layers in the order they should be appended (shading below borders).
- */
-const createParagraphDecorationLayers = (
-  doc: Document,
-  fragmentWidth: number,
-  attrs?: ParagraphAttrs,
-): { shadingLayer?: HTMLElement; borderLayer?: HTMLElement } => {
-  if (!attrs?.borders && !attrs?.shading) return {};
-  const borderBox = getParagraphBorderBox(fragmentWidth, attrs.indent);
-  const baseStyles = {
-    position: 'absolute',
-    top: '0px',
-    bottom: '0px',
-    left: `${borderBox.leftInset}px`,
-    width: `${borderBox.width}px`,
-    pointerEvents: 'none',
-    boxSizing: 'border-box',
-  } as const;
-
-  let shadingLayer: HTMLElement | undefined;
-  if (attrs.shading) {
-    shadingLayer = doc.createElement('div');
-    shadingLayer.classList.add('superdoc-paragraph-shading');
-    Object.assign(shadingLayer.style, baseStyles);
-    applyParagraphShadingStyles(shadingLayer, attrs.shading);
-  }
-
-  let borderLayer: HTMLElement | undefined;
-  if (attrs.borders) {
-    borderLayer = doc.createElement('div');
-    borderLayer.classList.add('superdoc-paragraph-border');
-    Object.assign(borderLayer.style, baseStyles);
-    borderLayer.style.zIndex = '1';
-    applyParagraphBorderStyles(borderLayer, attrs.borders);
-  }
-
-  return { shadingLayer, borderLayer };
-};
-
-type BorderSide = keyof NonNullable<ParagraphAttrs['borders']>;
-const BORDER_SIDES: BorderSide[] = ['top', 'right', 'bottom', 'left'];
-
-/**
- * Applies paragraph border styles to an HTML element.
- * Sets CSS border properties (width, style, color) for each side specified in the borders object.
- *
- * @param {HTMLElement} element - The HTML element to apply border styles to
- * @param {ParagraphAttrs['borders']} borders - Optional borders object containing border definitions for top, right, bottom, and left sides
- *
- * @remarks
- * - Sets box-sizing to 'border-box' to ensure borders are included in element dimensions
- * - Each side's border is processed independently - only specified sides receive border styles
- * - Border width defaults to 1px if not specified, and negative widths are clamped to 0px
- * - Border style defaults to 'solid' if not specified or if style is not 'none'
- * - Border color defaults to '#000' (black) if not specified
- * - Border style 'none' is handled specially to ensure no visible border
- *
- * @example
- * ```typescript
- * applyParagraphBorderStyles(paraElement, {
- *   top: { width: 2, style: 'solid', color: '#FF0000' },
- *   bottom: { width: 1, style: 'dashed', color: '#0000FF' }
- * });
- * ```
- */
-export const applyParagraphBorderStyles = (element: HTMLElement, borders?: ParagraphAttrs['borders']): void => {
-  if (!borders) return;
-  element.style.boxSizing = 'border-box';
-  BORDER_SIDES.forEach((side) => {
-    const border = borders[side];
-    if (!border) return;
-    setBorderSideStyle(element, side, border);
-  });
-};
-
-const setBorderSideStyle = (element: HTMLElement, side: BorderSide, border: ParagraphBorder): void => {
-  const cssSide = side;
-  const resolvedStyle =
-    border.style && border.style !== 'none' ? border.style : border.style === 'none' ? 'none' : 'solid';
-  if (resolvedStyle === 'none') {
-    element.style.setProperty(`border-${cssSide}-style`, 'none');
-    element.style.setProperty(`border-${cssSide}-width`, '0px');
-    if (border.color) {
-      element.style.setProperty(`border-${cssSide}-color`, border.color);
-    }
-    return;
-  }
-
-  const width = border.width != null ? Math.max(0, border.width) : undefined;
-  element.style.setProperty(`border-${cssSide}-style`, resolvedStyle);
-  element.style.setProperty(`border-${cssSide}-width`, `${width ?? 1}px`);
-  element.style.setProperty(`border-${cssSide}-color`, border.color ?? '#000');
-};
+// getParagraphBorderBox, createParagraphDecorationLayers, applyParagraphBorderStyles,
+// setBorderSideStyle, applyParagraphShadingStyles — moved to features/paragraph-borders/
 
 const stripListIndent = (attrs?: ParagraphAttrs): ParagraphAttrs | undefined => {
   if (!attrs?.indent || attrs.indent.left == null) {
@@ -7155,30 +7041,7 @@ const stripListIndent = (attrs?: ParagraphAttrs): ParagraphAttrs | undefined => 
   };
 };
 
-/**
- * Applies paragraph shading (background color) styles to an HTML element.
- * Sets the CSS background-color property based on the shading fill value.
- *
- * @param {HTMLElement} element - The HTML element to apply shading styles to
- * @param {ParagraphAttrs['shading']} shading - Optional shading object containing fill color definition
- *
- * @remarks
- * - Only applies background color if shading.fill is defined
- * - Currently only supports the `fill` property for solid color backgrounds
- * - Theme-based shading properties (themeColor, themeTint, themeShade) are not yet supported
- * - The fill value should be a valid CSS color string (hex, rgb, named color, etc.)
- *
- * @example
- * ```typescript
- * applyParagraphShadingStyles(paraElement, {
- *   fill: '#FFFF00'
- * });
- * ```
- */
-export const applyParagraphShadingStyles = (element: HTMLElement, shading?: ParagraphAttrs['shading']): void => {
-  if (!shading?.fill) return;
-  element.style.backgroundColor = shading.fill;
-};
+// applyParagraphShadingStyles — moved to features/paragraph-borders/border-layer.ts
 
 /**
  * Extracts and slices text runs that belong to a specific line within a paragraph block.
