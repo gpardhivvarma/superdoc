@@ -319,9 +319,18 @@ export const computeRunAttrs = (
     fontFamily =
       runProps.fontFamily?.ascii || runProps.fontFamily?.hAnsi || runProps.fontFamily?.eastAsia || defaultFontFamily;
   }
+  const vertAlign = runProps.vertAlign as 'superscript' | 'subscript' | 'baseline' | undefined;
+  const hasPosition = runProps.position != null && Number.isFinite(runProps.position);
+  let fontSize = runProps.fontSize ? ptToPx(runProps.fontSize / 2)! : defaultFontSizePx;
+
+  // Scale font size for superscript/subscript when no custom position override
+  if (!hasPosition && (vertAlign === 'superscript' || vertAlign === 'subscript')) {
+    fontSize *= 0.65;
+  }
+
   return {
     fontFamily: toCssFontFamily(fontFamily)!,
-    fontSize: runProps.fontSize ? ptToPx(runProps.fontSize / 2)! : defaultFontSizePx,
+    fontSize,
     bold: runProps.bold,
     italic: runProps.italic,
     underline:
@@ -339,5 +348,7 @@ export const computeRunAttrs = (
     letterSpacing: runProps.letterSpacing ? twipsToPx(runProps.letterSpacing) : undefined,
     lang: runProps.lang?.val || undefined,
     vanish: runProps.vanish,
+    vertAlign,
+    baselineShift: hasPosition ? runProps.position! / 2 : undefined,
   };
 };

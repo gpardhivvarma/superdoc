@@ -48,6 +48,7 @@ export type ResolvedRunProperties = {
   smallCaps?: boolean;
   allCaps?: boolean;
   baselineShift?: number;
+  vertAlign?: 'superscript' | 'subscript' | 'baseline';
   letterSpacing?: number;
   scale?: number;
   lang?: string;

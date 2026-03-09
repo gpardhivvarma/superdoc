@@ -6885,6 +6885,17 @@ const applyRunStyles = (element: HTMLElement, run: Run, _isLink = false): void =
   if (decorations.length > 0) {
     element.style.textDecorationLine = decorations.join(' ');
   }
+
+  // Vertical alignment: custom baseline offset takes precedence over vertAlign
+  if (run.baselineShift != null && Number.isFinite(run.baselineShift)) {
+    element.style.verticalAlign = `${run.baselineShift}pt`;
+  } else if (run.vertAlign === 'superscript') {
+    element.style.verticalAlign = 'super';
+  } else if (run.vertAlign === 'subscript') {
+    element.style.verticalAlign = 'sub';
+  } else if (run.vertAlign === 'baseline') {
+    element.style.verticalAlign = 'baseline';
+  }
 };
 
 interface CommentHighlightResult {

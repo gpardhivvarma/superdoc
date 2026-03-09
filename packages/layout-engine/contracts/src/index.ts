@@ -180,6 +180,10 @@ export type RunMarks = {
   highlight?: string;
   /** Text transformation (case modification). */
   textTransform?: 'uppercase' | 'lowercase' | 'capitalize' | 'none';
+  /** Vertical alignment for superscript/subscript text. */
+  vertAlign?: 'superscript' | 'subscript' | 'baseline';
+  /** Custom baseline shift in points (positive = raise, negative = lower). Takes precedence over vertAlign for positioning. */
+  baselineShift?: number;
 };
 
 export type TextRun = RunMarks & {
