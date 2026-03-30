@@ -284,3 +284,84 @@ describe('m:bar converter', () => {
     expect(mo?.textContent).toBe('\u203E');
   });
 });
+
+describe('m:sSup converter', () => {
+  it('converts m:sSup to <msup> with base and superscript', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSup',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] }],
+            },
+            {
+              name: 'm:sup',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '2' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msup = result!.querySelector('msup');
+    expect(msup).not.toBeNull();
+    expect(msup!.children.length).toBe(2);
+    expect(msup!.children[0]!.textContent).toBe('x');
+    expect(msup!.children[1]!.textContent).toBe('2');
+  });
+
+  it('ignores m:sSupPr properties element', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSup',
+          elements: [
+            { name: 'm:sSupPr', elements: [{ name: 'm:ctrlPr' }] },
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'a' }] }] }],
+            },
+            {
+              name: 'm:sup',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'b' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msup = result!.querySelector('msup');
+    expect(msup).not.toBeNull();
+    expect(msup!.children.length).toBe(2);
+    expect(msup!.children[0]!.textContent).toBe('a');
+    expect(msup!.children[1]!.textContent).toBe('b');
+  });
+
+  it('handles missing m:sup gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSup',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msup = result!.querySelector('msup');
+    expect(msup).not.toBeNull();
+    expect(msup!.children[0]!.textContent).toBe('x');
+  });
+});

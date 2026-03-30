@@ -10,7 +10,7 @@
  */
 
 import type { OmmlJsonNode, MathObjectConverter } from './types.js';
-import { convertMathRun, convertFraction, convertBar } from './converters/index.js';
+import { convertMathRun, convertFraction, convertBar, convertSuperscript } from './converters/index.js';
 
 export const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
 
@@ -32,6 +32,7 @@ const MATH_OBJECT_REGISTRY: Record<string, MathObjectConverter | null> = {
   'm:r': convertMathRun,
   'm:bar': convertBar, // Bar (overbar/underbar)
   'm:f': convertFraction, // Fraction (numerator/denominator)
+  'm:sSup': convertSuperscript, // Superscript
 
   // ── Not yet implemented (community contributions welcome) ────────────────
   'm:acc': null, // Accent (diacritical mark above base)
@@ -50,7 +51,6 @@ const MATH_OBJECT_REGISTRY: Record<string, MathObjectConverter | null> = {
   'm:sPre': null, // Pre-sub-superscript (left of base)
   'm:sSub': null, // Subscript
   'm:sSubSup': null, // Sub-superscript (both)
-  'm:sSup': null, // Superscript
 };
 
 /** OMML argument/container elements that wrap children in <mrow>. */

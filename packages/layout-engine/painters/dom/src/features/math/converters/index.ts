@@ -9,3 +9,4 @@
 export { convertMathRun } from './math-run.js';
 export { convertFraction } from './fraction.js';
 export { convertBar } from './bar.js';
+export { convertSuperscript } from './superscript.js';
