@@ -284,3 +284,84 @@ describe('m:bar converter', () => {
     expect(mo?.textContent).toBe('\u203E');
   });
 });
+
+describe('m:sSub converter', () => {
+  it('converts m:sSub to <msub> with base and subscript', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSub',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'a' }] }] }],
+            },
+            {
+              name: 'm:sub',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '1' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msub = result!.querySelector('msub');
+    expect(msub).not.toBeNull();
+    expect(msub!.children.length).toBe(2);
+    expect(msub!.children[0]!.textContent).toBe('a');
+    expect(msub!.children[1]!.textContent).toBe('1');
+  });
+
+  it('ignores m:sSubPr properties element', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSub',
+          elements: [
+            { name: 'm:sSubPr', elements: [{ name: 'm:ctrlPr' }] },
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] }],
+            },
+            {
+              name: 'm:sub',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'n' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msub = result!.querySelector('msub');
+    expect(msub).not.toBeNull();
+    expect(msub!.children.length).toBe(2);
+    expect(msub!.children[0]!.textContent).toBe('x');
+    expect(msub!.children[1]!.textContent).toBe('n');
+  });
+
+  it('handles missing m:sub gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSub',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'a' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msub = result!.querySelector('msub');
+    expect(msub).not.toBeNull();
+    expect(msub!.children[0]!.textContent).toBe('a');
+  });
+});
