@@ -19,8 +19,14 @@ export const convertSubscript: MathObjectConverter = (node, doc, convertChildren
   const sub = elements.find((e) => e.name === 'm:sub');
 
   const msub = doc.createElementNS(MATHML_NS, 'msub');
-  msub.appendChild(convertChildren(base?.elements ?? []));
-  msub.appendChild(convertChildren(sub?.elements ?? []));
+
+  const baseRow = doc.createElementNS(MATHML_NS, 'mrow');
+  baseRow.appendChild(convertChildren(base?.elements ?? []));
+  msub.appendChild(baseRow);
+
+  const subRow = doc.createElementNS(MATHML_NS, 'mrow');
+  subRow.appendChild(convertChildren(sub?.elements ?? []));
+  msub.appendChild(subRow);
 
   return msub;
 };
