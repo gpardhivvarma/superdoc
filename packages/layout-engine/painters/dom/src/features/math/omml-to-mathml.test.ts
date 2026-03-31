@@ -119,8 +119,45 @@ describe('convertOmmlToMathml', () => {
     expect(result!.textContent).toBe('z');
   });
 
-  it('handles unimplemented math objects by extracting child content', () => {
-    // m:f (fraction) is not yet implemented — should fall back to rendering children
+  it('wraps multi-part fraction operands in <mrow> for valid arity', () => {
+    // (a+b)/(c+d) — both numerator and denominator have multiple runs
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:f',
+          elements: [
+            {
+              name: 'm:num',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'a' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '+' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'b' }] }] },
+              ],
+            },
+            {
+              name: 'm:den',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'c' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '+' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'd' }] }] },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mfrac = result!.querySelector('mfrac');
+    expect(mfrac).not.toBeNull();
+    // <mfrac> must have exactly 2 children (num + den), each wrapped in <mrow>
+    expect(mfrac!.children.length).toBe(2);
+    expect(mfrac!.children[0]!.textContent).toBe('a+b');
+    expect(mfrac!.children[1]!.textContent).toBe('c+d');
+  });
+
+  it('converts m:f (fraction) to <mfrac> with numerator and denominator', () => {
     const omml = {
       name: 'm:oMath',
       elements: [
@@ -341,6 +378,40 @@ describe('m:sSup converter', () => {
     expect(msup!.children.length).toBe(2);
     expect(msup!.children[0]!.textContent).toBe('a');
     expect(msup!.children[1]!.textContent).toBe('b');
+  });
+
+  it('wraps multi-part base and superscript in <mrow> for valid arity', () => {
+    // (x+1)^2 — base has 3 runs that must be grouped
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:sSup',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '+' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '1' }] }] },
+              ],
+            },
+            {
+              name: 'm:sup',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '2' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const msup = result!.querySelector('msup');
+    expect(msup).not.toBeNull();
+    // <msup> must have exactly 2 children (base + superscript), each wrapped in <mrow>
+    expect(msup!.children.length).toBe(2);
+    expect(msup!.children[0]!.textContent).toBe('x+1');
+    expect(msup!.children[1]!.textContent).toBe('2');
   });
 
   it('handles missing m:sup gracefully', () => {

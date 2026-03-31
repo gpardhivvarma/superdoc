@@ -19,8 +19,14 @@ export const convertSuperscript: MathObjectConverter = (node, doc, convertChildr
   const sup = elements.find((e) => e.name === 'm:sup');
 
   const msup = doc.createElementNS(MATHML_NS, 'msup');
-  msup.appendChild(convertChildren(base?.elements ?? []));
-  msup.appendChild(convertChildren(sup?.elements ?? []));
+
+  const baseRow = doc.createElementNS(MATHML_NS, 'mrow');
+  baseRow.appendChild(convertChildren(base?.elements ?? []));
+  msup.appendChild(baseRow);
+
+  const supRow = doc.createElementNS(MATHML_NS, 'mrow');
+  supRow.appendChild(convertChildren(sup?.elements ?? []));
+  msup.appendChild(supRow);
 
   return msup;
 };
