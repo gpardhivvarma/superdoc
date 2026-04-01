@@ -11,3 +11,4 @@ export { convertFraction } from './fraction.js';
 export { convertBar } from './bar.js';
 export { convertSubscript } from './subscript.js';
 export { convertSuperscript } from './superscript.js';
+export { convertSubSuperscript } from './sub-superscript.js';
