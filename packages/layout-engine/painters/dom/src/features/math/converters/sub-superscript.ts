@@ -11,7 +11,7 @@ const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
  * MathML output:
  *   <msubsup> <mrow>base</mrow> <mrow>sub</mrow> <mrow>sup</mrow> </msubsup>
  *
- * @spec ECMA-376 §22.1.2.104
+ * @spec ECMA-376 §22.1.2.103
  */
 export const convertSubSuperscript: MathObjectConverter = (node, doc, convertChildren) => {
   const elements = node.elements ?? [];
