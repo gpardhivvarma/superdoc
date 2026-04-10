@@ -20,6 +20,8 @@ import {
   convertSuperscript,
   convertSubSuperscript,
   convertRadical,
+  convertLowerLimit,
+  convertUpperLimit,
 } from './converters/index.js';
 
 export const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
@@ -44,6 +46,9 @@ const MATH_OBJECT_REGISTRY: Record<string, MathObjectConverter | null> = {
   'm:d': convertDelimiter, // Delimiter (parentheses, brackets, braces)
   'm:f': convertFraction, // Fraction (numerator/denominator)
   'm:func': convertFunction, // Function apply (sin, cos, log, etc.)
+  'm:limLow': convertLowerLimit, // Lower limit (e.g., lim)
+  'm:limUpp': convertUpperLimit, // Upper limit
+  'm:rad': convertRadical, // Radical (square root, nth root)
   'm:sSub': convertSubscript, // Subscript
   'm:sSup': convertSuperscript, // Superscript
   'm:sSubSup': convertSubSuperscript, // Sub-superscript (both)
@@ -54,12 +59,9 @@ const MATH_OBJECT_REGISTRY: Record<string, MathObjectConverter | null> = {
   'm:box': null, // Box (invisible grouping container)
   'm:eqArr': null, // Equation array (vertical array of equations)
   'm:groupChr': null, // Group character (overbrace, underbrace)
-  'm:limLow': null, // Lower limit (e.g., lim)
-  'm:limUpp': null, // Upper limit
   'm:m': null, // Matrix (grid of elements)
   'm:nary': null, // N-ary operator (integral, summation, product)
   'm:phant': null, // Phantom (invisible spacing placeholder)
-  'm:rad': convertRadical, // Radical (square root, nth root)
   'm:sPre': null, // Pre-sub-superscript (left of base)
 };
 

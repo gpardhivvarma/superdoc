@@ -1642,3 +1642,290 @@ describe('m:rad converter', () => {
     expect(msqrt!.textContent).toBe('');
   });
 });
+
+describe('m:limLow converter', () => {
+  it('converts m:limLow to <munder> with base and lower limit', () => {
+    // lim_{n→∞}
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limLow',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'lim' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'n' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '\u2192' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '\u221E' }] }] },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const munder = result!.querySelector('munder');
+    expect(munder).not.toBeNull();
+    expect(munder!.children.length).toBe(2);
+    expect(munder!.children[0]!.textContent).toBe('lim');
+    expect(munder!.children[1]!.textContent).toBe('n\u2192\u221E');
+  });
+
+  it('ignores m:limLowPr properties element', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limLow',
+          elements: [
+            { name: 'm:limLowPr', elements: [{ name: 'm:ctrlPr' }] },
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'inf' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const munder = result!.querySelector('munder');
+    expect(munder).not.toBeNull();
+    expect(munder!.children.length).toBe(2);
+    expect(munder!.children[0]!.textContent).toBe('inf');
+    expect(munder!.children[1]!.textContent).toBe('x');
+  });
+
+  it('wraps multi-part base and limit in <mrow> for valid arity', () => {
+    // lim_{n→∞} — limit has 3 runs that must be grouped
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limLow',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'lim' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'n' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '\u2192' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '\u221E' }] }] },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const munder = result!.querySelector('munder');
+    expect(munder).not.toBeNull();
+    // <munder> must have exactly 2 children (base + limit), each wrapped in <mrow>
+    expect(munder!.children.length).toBe(2);
+    expect(munder!.children[0]!.textContent).toBe('lim');
+    expect(munder!.children[1]!.textContent).toBe('n\u2192\u221E');
+  });
+
+  it('handles missing m:lim gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limLow',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'lim' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const munder = result!.querySelector('munder');
+    expect(munder).not.toBeNull();
+    expect(munder!.children[0]!.textContent).toBe('lim');
+  });
+
+  it('handles missing m:e gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limLow',
+          elements: [
+            {
+              name: 'm:lim',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'k' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const munder = result!.querySelector('munder');
+    expect(munder).not.toBeNull();
+    expect(munder!.children[1]!.textContent).toBe('k');
+  });
+});
+
+describe('m:limUpp converter', () => {
+  it('converts m:limUpp to <mover> with base and upper limit', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limUpp',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'max' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'x' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mover = result!.querySelector('mover');
+    expect(mover).not.toBeNull();
+    expect(mover!.children.length).toBe(2);
+    expect(mover!.children[0]!.textContent).toBe('max');
+    expect(mover!.children[1]!.textContent).toBe('x');
+  });
+
+  it('ignores m:limUppPr properties element', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limUpp',
+          elements: [
+            { name: 'm:limUppPr', elements: [{ name: 'm:ctrlPr' }] },
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '=' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'def' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mover = result!.querySelector('mover');
+    expect(mover).not.toBeNull();
+    expect(mover!.children.length).toBe(2);
+    expect(mover!.children[0]!.textContent).toBe('=');
+    expect(mover!.children[1]!.textContent).toBe('def');
+  });
+
+  it('wraps multi-part base and limit in <mrow> for valid arity', () => {
+    // A^{i+1} — limit has 3 runs that must be grouped
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limUpp',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'A' }] }] }],
+            },
+            {
+              name: 'm:lim',
+              elements: [
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'i' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '+' }] }] },
+                { name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: '1' }] }] },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mover = result!.querySelector('mover');
+    expect(mover).not.toBeNull();
+    // <mover> must have exactly 2 children (base + limit), each wrapped in <mrow>
+    expect(mover!.children.length).toBe(2);
+    expect(mover!.children[0]!.textContent).toBe('A');
+    expect(mover!.children[1]!.textContent).toBe('i+1');
+  });
+
+  it('handles missing m:lim gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limUpp',
+          elements: [
+            {
+              name: 'm:e',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'sup' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mover = result!.querySelector('mover');
+    expect(mover).not.toBeNull();
+    expect(mover!.children[0]!.textContent).toBe('sup');
+  });
+
+  it('handles missing m:e gracefully', () => {
+    const omml = {
+      name: 'm:oMath',
+      elements: [
+        {
+          name: 'm:limUpp',
+          elements: [
+            {
+              name: 'm:lim',
+              elements: [{ name: 'm:r', elements: [{ name: 'm:t', elements: [{ type: 'text', text: 'n' }] }] }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = convertOmmlToMathml(omml, doc);
+    expect(result).not.toBeNull();
+    const mover = result!.querySelector('mover');
+    expect(mover).not.toBeNull();
+    expect(mover!.children[1]!.textContent).toBe('n');
+  });
+});
