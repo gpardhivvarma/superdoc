@@ -55,10 +55,78 @@ describe('ooxml - resolveStyleChain', () => {
     expect(result).toEqual({ fontSize: 24, bold: true, italic: true });
   });
 
-  it('returns empty object when styleId is missing from definitions', () => {
+  it('returns empty object when styleId is missing from definitions and not a built-in', () => {
     const params = buildParams();
     const result = resolveStyleChain('runProperties', params, 'MissingStyle');
     expect(result).toEqual({});
+  });
+
+  it('resolves built-in Heading1 run properties when not defined in document', () => {
+    const params = buildParams();
+    const result = resolveStyleChain('runProperties', params, 'Heading1');
+    expect(result.fontSize).toBe(40);
+    expect(result.fontSizeCs).toBe(40);
+    expect(result.color).toEqual({ val: '0F4761', themeColor: 'accent1', themeShade: 'BF' });
+  });
+
+  it('resolves built-in Heading1 paragraph properties when not defined in document', () => {
+    const params = buildParams();
+    const result = resolveStyleChain('paragraphProperties', params, 'Heading1');
+    expect(result.keepNext).toBe(true);
+    expect(result.keepLines).toBe(true);
+    expect(result.outlineLvl).toBe(0);
+    expect(result.spacing).toEqual({ before: 360, after: 80 });
+  });
+
+  it('explicit style definition takes precedence over built-in default', () => {
+    const params = buildParams({
+      translatedLinkedStyles: {
+        ...emptyStyles,
+        styles: {
+          Heading1: { runProperties: { fontSize: 48 } },
+        },
+      },
+    });
+    const result = resolveStyleChain('runProperties', params, 'Heading1');
+    expect(result.fontSize).toBe(48);
+  });
+
+  it('built-in heading inherits from document Normal style via basedOn', () => {
+    const params = buildParams({
+      translatedLinkedStyles: {
+        ...emptyStyles,
+        styles: {
+          Normal: { paragraphProperties: { widowControl: true } },
+        },
+      },
+    });
+    const result = resolveStyleChain('paragraphProperties', params, 'Heading1');
+    expect(result.keepNext).toBe(true);
+    expect(result.widowControl).toBe(true);
+  });
+
+  it('resolves built-in Heading2 through Heading6 with correct outline levels', () => {
+    const params = buildParams();
+    for (let level = 2; level <= 6; level++) {
+      const result = resolveStyleChain('paragraphProperties', params, `Heading${level}`);
+      expect(result.outlineLvl).toBe(level - 1);
+    }
+  });
+
+  it('basedOn chain resolves built-in styles for intermediate parents', () => {
+    const params = buildParams({
+      translatedLinkedStyles: {
+        ...emptyStyles,
+        styles: {
+          CustomHeading: { basedOn: 'Heading1', paragraphProperties: { spacing: { before: 500 } } },
+        },
+      },
+    });
+    const result = resolveStyleChain('paragraphProperties', params, 'CustomHeading');
+    // spacing.before overridden by CustomHeading, but keepNext inherited from built-in Heading1
+    expect(result.spacing?.before).toBe(500);
+    expect(result.keepNext).toBe(true);
+    expect(result.outlineLvl).toBe(0);
   });
 });
 
@@ -256,6 +324,14 @@ describe('ooxml - resolveRunProperties', () => {
     const result = resolveRunProperties(params, { italic: true }, { runProperties: { bold: true } });
     expect(result).toEqual({ italic: true });
   });
+
+  it('resolves built-in heading run properties via paragraph styleId', () => {
+    const params = buildParams();
+    const result = resolveRunProperties(params, {}, { styleId: 'Heading1' });
+    expect(result.fontSize).toBe(40);
+    expect(result.fontSizeCs).toBe(40);
+    expect(result.color).toEqual({ val: '0F4761', themeColor: 'accent1', themeShade: 'BF' });
+  });
 });
 
 describe('ooxml - resolveParagraphProperties', () => {
@@ -388,6 +464,16 @@ describe('ooxml - resolveParagraphProperties', () => {
     const result = resolveParagraphProperties(params, {}, tableInfo);
     expect(result.spacing).toEqual({ before: 120, after: 240 });
     expect(result.keepNext).toBe(true);
+  });
+
+  it('resolves paragraph with built-in Heading1 styleId when not defined in document', () => {
+    const params = buildParams();
+    const result = resolveParagraphProperties(params, { styleId: 'Heading1' });
+    expect(result.keepNext).toBe(true);
+    expect(result.keepLines).toBe(true);
+    expect(result.outlineLvl).toBe(0);
+    expect(result.spacing).toEqual({ before: 360, after: 80 });
+    expect(result.styleId).toBe('Heading1');
   });
 });
 

@@ -9,6 +9,7 @@ import { combineIndentProperties, combineProperties, combineRunProperties } from
 import type { PropertyObject } from '../cascade.js';
 import type { ParagraphConditionalFormatting, ParagraphProperties, ParagraphTabStop, RunProperties } from './types.ts';
 import type { NumberingProperties } from './numbering-types.ts';
+import { BUILTIN_STYLE_DEFAULTS } from './builtin-styles.js';
 import type {
   StyleDefinition,
   StylesDocumentProperties,
@@ -280,7 +281,7 @@ export function resolveStyleChain<T extends PropertyObject>(
 ): T {
   if (!styleId) return {} as T;
 
-  const styleDef = params.translatedLinkedStyles?.styles?.[styleId];
+  const styleDef = params.translatedLinkedStyles?.styles?.[styleId] ?? BUILTIN_STYLE_DEFAULTS[styleId];
   if (!styleDef) return {} as T;
 
   const styleProps = (styleDef[propertyType as keyof typeof styleDef] ?? {}) as T;
@@ -294,7 +295,7 @@ export function resolveStyleChain<T extends PropertyObject>(
       break;
     }
     seenStyles.add(nextBasedOn as string);
-    const basedOnStyleDef = params.translatedLinkedStyles?.styles?.[nextBasedOn];
+    const basedOnStyleDef = params.translatedLinkedStyles?.styles?.[nextBasedOn] ?? BUILTIN_STYLE_DEFAULTS[nextBasedOn];
     const basedOnProps = basedOnStyleDef?.[propertyType as keyof typeof basedOnStyleDef] as T;
 
     if (basedOnProps && Object.keys(basedOnProps).length) {
