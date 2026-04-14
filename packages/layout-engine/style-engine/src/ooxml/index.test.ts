@@ -105,9 +105,9 @@ describe('ooxml - resolveStyleChain', () => {
     expect(result.widowControl).toBe(true);
   });
 
-  it('resolves built-in Heading2 through Heading6 with correct outline levels', () => {
+  it('resolves built-in Heading2 through Heading9 with correct outline levels', () => {
     const params = buildParams();
-    for (let level = 2; level <= 6; level++) {
+    for (let level = 2; level <= 9; level++) {
       const result = resolveStyleChain('paragraphProperties', params, `Heading${level}`);
       expect(result.outlineLvl).toBe(level - 1);
     }

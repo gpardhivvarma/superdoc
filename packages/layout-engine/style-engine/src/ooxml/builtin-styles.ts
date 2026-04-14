@@ -11,6 +11,9 @@ import type { StyleDefinition } from './styles-types.js';
  * Values match Word's defaults per ECMA-376 §17.7.4.9. Font sizes are in
  * half-points (OOXML convention), spacing in twips (twentieths of a point).
  *
+ * Heading7–9 use a muted text color (595959) instead of the accent color
+ * used by Heading1–6, matching Word's visual hierarchy.
+ *
  * All headings inherit from 'Normal' via basedOn, so any document-level Normal
  * style properties (font family, line spacing, etc.) cascade correctly.
  */
@@ -170,6 +173,83 @@ export const BUILTIN_STYLE_DEFAULTS: Record<string, StyleDefinition> = {
       color: { val: '0F4761', themeColor: 'accent1', themeShade: 'BF' },
       fontSize: 22,
       fontSizeCs: 22,
+    },
+  },
+
+  Heading7: {
+    type: 'paragraph',
+    styleId: 'Heading7',
+    name: 'heading 7',
+    basedOn: 'Normal',
+    next: 'Normal',
+    qFormat: true,
+    uiPriority: 9,
+    paragraphProperties: {
+      keepNext: true,
+      keepLines: true,
+      spacing: { before: 80, after: 40 },
+      outlineLvl: 6,
+    },
+    runProperties: {
+      fontFamily: {
+        eastAsiaTheme: 'majorEastAsia',
+        cstheme: 'majorBidi',
+      },
+      color: { val: '595959', themeColor: 'text1', themeTint: 'A6' },
+      fontSize: 22,
+      fontSizeCs: 22,
+    },
+  },
+
+  Heading8: {
+    type: 'paragraph',
+    styleId: 'Heading8',
+    name: 'heading 8',
+    basedOn: 'Normal',
+    next: 'Normal',
+    qFormat: true,
+    uiPriority: 9,
+    paragraphProperties: {
+      keepNext: true,
+      keepLines: true,
+      spacing: { before: 80, after: 40 },
+      outlineLvl: 7,
+    },
+    runProperties: {
+      fontFamily: {
+        eastAsiaTheme: 'majorEastAsia',
+        cstheme: 'majorBidi',
+      },
+      italic: true,
+      iCs: true,
+      color: { val: '595959', themeColor: 'text1', themeTint: 'A6' },
+      fontSize: 22,
+      fontSizeCs: 22,
+    },
+  },
+
+  Heading9: {
+    type: 'paragraph',
+    styleId: 'Heading9',
+    name: 'heading 9',
+    basedOn: 'Normal',
+    next: 'Normal',
+    qFormat: true,
+    uiPriority: 9,
+    paragraphProperties: {
+      keepNext: true,
+      keepLines: true,
+      spacing: { before: 80, after: 40 },
+      outlineLvl: 8,
+    },
+    runProperties: {
+      fontFamily: {
+        eastAsiaTheme: 'majorEastAsia',
+        cstheme: 'majorBidi',
+      },
+      color: { val: '595959', themeColor: 'text1', themeTint: 'A6' },
+      fontSize: 21,
+      fontSizeCs: 21,
     },
   },
 };
