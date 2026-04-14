@@ -528,6 +528,13 @@ export type LayoutOptions = {
    * behavior for paragraph-free overlays.
    */
   allowSectionBreakOnlyPageFallback?: boolean;
+  /**
+   * Whether the document has odd/even header/footer differentiation enabled.
+   * Corresponds to the w:evenAndOddHeaders element in OOXML settings.xml.
+   * When true, odd pages use the 'odd' variant and even pages use the 'even' variant.
+   * When false or omitted, all pages use the 'default' variant.
+   */
+  alternateHeaders?: boolean;
 };
 
 export type HeaderFooterConstraints = {
@@ -669,13 +676,15 @@ export function layoutDocument(blocks: FlowBlock[], measures: Measure[], options
   /**
    * Determines the header/footer variant type for a given page based on section settings.
    *
-   * @param sectionPageNumber - The page number within the current section (1-indexed)
+   * @param sectionPageNumber - The page number within the current section (1-indexed), used for titlePg
+   * @param documentPageNumber - The absolute document page number (1-indexed), used for even/odd
    * @param titlePgEnabled - Whether the section has "different first page" enabled
-   * @param alternateHeaders - Whether the section has odd/even differentiation enabled
+   * @param alternateHeaders - Whether the document has odd/even differentiation enabled
    * @returns The variant type: 'first', 'even', 'odd', or 'default'
    */
   const getVariantTypeForPage = (
     sectionPageNumber: number,
+    documentPageNumber: number,
     titlePgEnabled: boolean,
     alternateHeaders: boolean,
   ): 'default' | 'first' | 'even' | 'odd' => {
@@ -683,9 +692,10 @@ export function layoutDocument(blocks: FlowBlock[], measures: Measure[], options
     if (sectionPageNumber === 1 && titlePgEnabled) {
       return 'first';
     }
-    // Alternate headers (even/odd differentiation)
+    // Alternate headers: even/odd based on document page number, matching
+    // the rendering side (getHeaderFooterTypeForSection in headerFooterUtils.ts)
     if (alternateHeaders) {
-      return sectionPageNumber % 2 === 0 ? 'even' : 'odd';
+      return documentPageNumber % 2 === 0 ? 'even' : 'odd';
     }
     return 'default';
   };
@@ -1295,11 +1305,10 @@ export function layoutDocument(blocks: FlowBlock[], measures: Measure[], options
         // Get section metadata for titlePg setting
         const sectionMetadata = sectionMetadataList[activeSectionIndex];
         const titlePgEnabled = sectionMetadata?.titlePg ?? false;
-        // TODO: Support alternateHeaders (odd/even) when needed
-        const alternateHeaders = false;
+        const alternateHeaders = options.alternateHeaders ?? false;
 
         // Determine which header/footer variant applies to this page
-        const variantType = getVariantTypeForPage(sectionPageNumber, titlePgEnabled, alternateHeaders);
+        const variantType = getVariantTypeForPage(sectionPageNumber, newPageNumber, titlePgEnabled, alternateHeaders);
 
         // Resolve header/footer refs for margin calculation using OOXML inheritance model.
         // This must match the rendering logic in PresentationEditor to ensure margins

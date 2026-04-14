@@ -5587,3 +5587,136 @@ describe('requirePageBoundary edge cases', () => {
     });
   });
 });
+
+describe('alternateHeaders (odd/even header differentiation)', () => {
+  // Two tall paragraphs (400px each) that force a 2-page layout.
+  const tallBlock = (id: string): FlowBlock => ({
+    kind: 'paragraph',
+    id,
+    runs: [],
+  });
+  const tallMeasure = makeMeasure([400]);
+
+  it('selects even/odd header heights when alternateHeaders is true', () => {
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      alternateHeaders: true,
+      headerContentHeights: {
+        odd: 80, // Odd pages: header pushes body start down
+        even: 40, // Even pages: smaller header
+      },
+    };
+
+    const layout = layoutDocument([tallBlock('p1'), tallBlock('p2')], [tallMeasure, tallMeasure], options);
+
+    expect(layout.pages).toHaveLength(2);
+
+    // Page 1 is odd (documentPageNumber=1) → uses 'odd' header height (80px)
+    // Body should start at max(margin.top, margin.header + headerContentHeight) = max(50, 30+80) = 110
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    expect(p1Fragment).toBeDefined();
+    expect(p1Fragment!.y).toBeCloseTo(110, 0);
+
+    // Page 2 is even (documentPageNumber=2) → uses 'even' header height (40px)
+    // Body should start at max(margin.top, margin.header + headerContentHeight) = max(50, 30+40) = 70
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p2Fragment).toBeDefined();
+    expect(p2Fragment!.y).toBeCloseTo(70, 0);
+  });
+
+  it('uses default header height for all pages when alternateHeaders is false', () => {
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      alternateHeaders: false,
+      headerContentHeights: {
+        default: 60,
+        odd: 80,
+        even: 40,
+      },
+    };
+
+    const layout = layoutDocument([tallBlock('p1'), tallBlock('p2')], [tallMeasure, tallMeasure], options);
+
+    expect(layout.pages).toHaveLength(2);
+
+    // Both pages use 'default' header height (60px)
+    // Body start = max(50, 30+60) = 90
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p1Fragment!.y).toBeCloseTo(90, 0);
+    expect(p2Fragment!.y).toBeCloseTo(90, 0);
+  });
+
+  it('defaults to false when alternateHeaders is omitted', () => {
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      // alternateHeaders not set
+      headerContentHeights: {
+        default: 60,
+        odd: 80,
+        even: 40,
+      },
+    };
+
+    const layout = layoutDocument([tallBlock('p1'), tallBlock('p2')], [tallMeasure, tallMeasure], options);
+
+    expect(layout.pages).toHaveLength(2);
+
+    // Both pages should use 'default' (60px), not odd/even
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p1Fragment!.y).toBeCloseTo(90, 0);
+    expect(p2Fragment!.y).toBeCloseTo(90, 0);
+  });
+
+  it('first page uses first variant when titlePg is enabled with alternateHeaders', () => {
+    const sectionBreak: SectionBreakBlock = {
+      kind: 'sectionBreak',
+      id: 'sb',
+      attrs: { isFirstSection: true, source: 'sectPr', sectionIndex: 0 },
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+    };
+
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      alternateHeaders: true,
+      sectionMetadata: [{ sectionIndex: 0, titlePg: true }],
+      headerContentHeights: {
+        first: 100, // First page: tallest header
+        odd: 80,
+        even: 40,
+      },
+    };
+
+    const layout = layoutDocument(
+      [sectionBreak, tallBlock('p1'), tallBlock('p2'), tallBlock('p3')],
+      [{ kind: 'sectionBreak' }, tallMeasure, tallMeasure, tallMeasure],
+      options,
+    );
+
+    expect(layout.pages.length).toBeGreaterThanOrEqual(3);
+
+    // Page 1 (first page of section, titlePg=true) → 'first' variant → 100px
+    // Body start = max(50, 30+100) = 130
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    expect(p1Fragment).toBeDefined();
+    expect(p1Fragment!.y).toBeCloseTo(130, 0);
+
+    // Page 2 (documentPageNumber=2, even) → 'even' variant → 40px
+    // Body start = max(50, 30+40) = 70
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p2Fragment).toBeDefined();
+    expect(p2Fragment!.y).toBeCloseTo(70, 0);
+
+    // Page 3 (documentPageNumber=3, odd) → 'odd' variant → 80px
+    // Body start = max(50, 30+80) = 110
+    const p3Fragment = layout.pages[2].fragments.find((f) => f.blockId === 'p3');
+    expect(p3Fragment).toBeDefined();
+    expect(p3Fragment!.y).toBeCloseTo(110, 0);
+  });
+});

@@ -4238,10 +4238,12 @@ export class PresentationEditor extends EventEmitter {
         ? buildSemanticFootnoteBlocks(footnotesLayoutInput, this.#layoutOptions.semanticOptions?.footnotesMode)
         : [];
       const blocksForLayout = semanticFootnoteBlocks.length > 0 ? [...blocks, ...semanticFootnoteBlocks] : blocks;
-      const layoutOptions =
-        !isSemanticFlow && footnotesLayoutInput
+      const layoutOptions = {
+        ...(!isSemanticFlow && footnotesLayoutInput
           ? { ...baseLayoutOptions, footnotes: footnotesLayoutInput }
-          : baseLayoutOptions;
+          : baseLayoutOptions),
+        alternateHeaders: Boolean((this.#editor as EditorWithConverter).converter?.pageStyles?.alternateHeaders),
+      };
       const previousBlocks = this.#layoutState.blocks;
       const previousLayout = this.#layoutState.layout;
       const previousMeasures = this.#layoutState.measures;
