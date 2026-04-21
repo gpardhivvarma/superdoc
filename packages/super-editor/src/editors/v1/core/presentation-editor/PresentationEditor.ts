@@ -4238,16 +4238,10 @@ export class PresentationEditor extends EventEmitter {
         ? buildSemanticFootnoteBlocks(footnotesLayoutInput, this.#layoutOptions.semanticOptions?.footnotesMode)
         : [];
       const blocksForLayout = semanticFootnoteBlocks.length > 0 ? [...blocks, ...semanticFootnoteBlocks] : blocks;
-      const layoutOptions = {
-        ...(!isSemanticFlow && footnotesLayoutInput
+      const layoutOptions =
+        !isSemanticFlow && footnotesLayoutInput
           ? { ...baseLayoutOptions, footnotes: footnotesLayoutInput }
-          : baseLayoutOptions),
-        ...(isSemanticFlow
-          ? {}
-          : {
-              alternateHeaders: Boolean((this.#editor as EditorWithConverter).converter?.pageStyles?.alternateHeaders),
-            }),
-      };
+          : baseLayoutOptions;
       const previousBlocks = this.#layoutState.blocks;
       const previousLayout = this.#layoutState.layout;
       const previousMeasures = this.#layoutState.measures;
@@ -5416,12 +5410,17 @@ export class PresentationEditor extends EventEmitter {
 
     this.#hiddenHost.style.width = `${pageSize.w}px`;
 
+    const alternateHeaders = Boolean(
+      (this.#editor as EditorWithConverter | undefined)?.converter?.pageStyles?.alternateHeaders,
+    );
+
     return {
       flowMode: 'paginated',
       pageSize,
       margins: resolvedMargins,
       ...(columns ? { columns } : {}),
       sectionMetadata,
+      alternateHeaders,
     };
   }
 
