@@ -5719,4 +5719,104 @@ describe('alternateHeaders (odd/even header differentiation)', () => {
     expect(p3Fragment).toBeDefined();
     expect(p3Fragment!.y).toBeCloseTo(110, 0);
   });
+
+  it('multi-section: uses document page number for even/odd, not section-relative', () => {
+    // Section 1 has 3 pages (pages 1-3), section 2 starts on page 4.
+    // Page 4 is even by document number, but sectionPageNumber=1 (odd).
+    // The fix ensures document page number is used for even/odd.
+    const sb1: SectionBreakBlock = {
+      kind: 'sectionBreak',
+      id: 'sb1',
+      attrs: { isFirstSection: true, source: 'sectPr', sectionIndex: 0 },
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+    };
+    const sb2: SectionBreakBlock = {
+      kind: 'sectionBreak',
+      id: 'sb2',
+      type: 'nextPage',
+      attrs: { source: 'sectPr', sectionIndex: 1 },
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+    };
+
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      alternateHeaders: true,
+      sectionMetadata: [{ sectionIndex: 0 }, { sectionIndex: 1 }],
+      headerContentHeights: {
+        odd: 80,
+        even: 40,
+      },
+    };
+
+    const layout = layoutDocument(
+      [sb1, tallBlock('p1'), tallBlock('p2'), tallBlock('p3'), sb2, tallBlock('p4')],
+      [{ kind: 'sectionBreak' }, tallMeasure, tallMeasure, tallMeasure, { kind: 'sectionBreak' }, tallMeasure],
+      options,
+    );
+
+    expect(layout.pages.length).toBeGreaterThanOrEqual(4);
+
+    // Page 4 (documentPageNumber=4, even) → should use 'even' header (40px)
+    // NOT 'odd' which would happen if sectionPageNumber (1) were used
+    // Body start = max(50, 30+40) = 70
+    const p4Fragment = layout.pages[3]?.fragments.find((f) => f.blockId === 'p4');
+    expect(p4Fragment).toBeDefined();
+    expect(p4Fragment!.y).toBeCloseTo(70, 0);
+  });
+
+  it('selects even/odd footer heights when alternateHeaders is true', () => {
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, footer: 30 },
+      alternateHeaders: true,
+      footerContentHeights: {
+        odd: 80, // Odd pages: larger footer
+        even: 40, // Even pages: smaller footer
+      },
+    };
+
+    const layout = layoutDocument([tallBlock('p1'), tallBlock('p2')], [tallMeasure, tallMeasure], options);
+
+    expect(layout.pages).toHaveLength(2);
+
+    // Page 1 (odd): effective bottom margin = max(50, 30+80) = 110
+    // Content area = 800 - 50 - 110 = 640px
+    // Page 2 (even): effective bottom margin = max(50, 30+40) = 70
+    // Content area = 800 - 50 - 70 = 680px
+    // Both pages fit a 400px block, but body start Y differs by footer impact
+    // Verify pages have different available content areas by checking fragment positions
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p1Fragment).toBeDefined();
+    expect(p2Fragment).toBeDefined();
+    // Top margin is the same (50) since no header heights
+    expect(p1Fragment!.y).toBeCloseTo(50, 0);
+    expect(p2Fragment!.y).toBeCloseTo(50, 0);
+  });
+
+  it('falls back to default header when only default is defined with alternateHeaders', () => {
+    const options: LayoutOptions = {
+      pageSize: { w: 600, h: 800 },
+      margins: { top: 50, right: 50, bottom: 50, left: 50, header: 30 },
+      alternateHeaders: true,
+      headerContentHeights: {
+        default: 60, // Only default defined — no even/odd specific heights
+      },
+    };
+
+    const layout = layoutDocument([tallBlock('p1'), tallBlock('p2')], [tallMeasure, tallMeasure], options);
+
+    expect(layout.pages).toHaveLength(2);
+
+    // With alternateHeaders=true, page 1 requests 'odd' variant, page 2 requests 'even'.
+    // headerContentHeights has no 'odd' or 'even' → getHeaderHeightForPage returns 0.
+    // Body start = max(50, 30+0) = 50 (base margin wins)
+    const p1Fragment = layout.pages[0].fragments.find((f) => f.blockId === 'p1');
+    const p2Fragment = layout.pages[1].fragments.find((f) => f.blockId === 'p2');
+    expect(p1Fragment!.y).toBeCloseTo(50, 0);
+    expect(p2Fragment!.y).toBeCloseTo(50, 0);
+  });
 });

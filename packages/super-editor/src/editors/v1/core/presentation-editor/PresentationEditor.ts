@@ -4242,7 +4242,11 @@ export class PresentationEditor extends EventEmitter {
         ...(!isSemanticFlow && footnotesLayoutInput
           ? { ...baseLayoutOptions, footnotes: footnotesLayoutInput }
           : baseLayoutOptions),
-        alternateHeaders: Boolean((this.#editor as EditorWithConverter).converter?.pageStyles?.alternateHeaders),
+        ...(isSemanticFlow
+          ? {}
+          : {
+              alternateHeaders: Boolean((this.#editor as EditorWithConverter).converter?.pageStyles?.alternateHeaders),
+            }),
       };
       const previousBlocks = this.#layoutState.blocks;
       const previousLayout = this.#layoutState.layout;
