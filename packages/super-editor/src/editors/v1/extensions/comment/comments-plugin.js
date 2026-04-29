@@ -449,11 +449,6 @@ export const CommentsPlugin = Extension.create({
           const highlightColors = editor.options.comments?.highlightColors || {};
           return {
             activeThreadId: null,
-            // When a comment is activated via explicit user action (e.g., sidebar click),
-            // this flag prevents position-based detection from overriding it on subsequent
-            // DOM-sync selection transactions. Cleared when the cursor moves outside the
-            // comment range, allowing natural deactivation on user navigation.
-            explicitlySetThreadId: null,
             externalColor: highlightColors.external ?? '#B1124B',
             internalColor: highlightColors.internal ?? '#078383',
             decorations: DecorationSet.empty,
@@ -488,7 +483,6 @@ export const CommentsPlugin = Extension.create({
             return {
               ...pluginState,
               activeThreadId: newActiveThreadId,
-              explicitlySetThreadId: newActiveThreadId,
             };
           }
 
@@ -515,26 +509,6 @@ export const CommentsPlugin = Extension.create({
           // Check for changes in the actively selected comment
           if (!tr.docChanged && tr.selectionSet) {
             const { selection } = tr;
-
-            // If the active comment was explicitly set (e.g., sidebar click) and the
-            // cursor is still within that comment's range, preserve it. This prevents
-            // DOM-sync selection transactions from overriding the explicit activation
-            // via position-based detection — which can fail inside tracked changes
-            // or structured content, causing a flicker loop.
-            if (
-              pluginState.explicitlySetThreadId &&
-              pluginState.explicitlySetThreadId === pluginState.activeThreadId &&
-              selectionContainsThread(newEditorState.doc, selection, pluginState.explicitlySetThreadId)
-            ) {
-              // Selection is still inside the explicitly activated comment — skip detection.
-              return { ...pluginState };
-            }
-
-            // Cursor moved outside the explicitly set comment — clear the flag
-            // and allow position-based detection to take over.
-            pluginState = pluginState.explicitlySetThreadId
-              ? { ...pluginState, explicitlySetThreadId: null }
-              : pluginState;
 
             let currentActiveThread = getActiveCommentId(newEditorState.doc, selection);
             if (
@@ -571,13 +545,6 @@ export const CommentsPlugin = Extension.create({
               editor.emit('commentsUpdate', update);
             }
           }
-
-          // Clear explicit flag on document changes — the user is editing,
-          // so position-based detection should resume.
-          pluginState =
-            tr.docChanged && pluginState.explicitlySetThreadId
-              ? { ...pluginState, explicitlySetThreadId: null }
-              : pluginState;
 
           return { ...pluginState };
         },
