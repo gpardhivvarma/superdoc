@@ -532,9 +532,9 @@ export const CommentsPlugin = Extension.create({
 
             // Cursor moved outside the explicitly set comment — clear the flag
             // and allow position-based detection to take over.
-            if (pluginState.explicitlySetThreadId) {
-              pluginState.explicitlySetThreadId = null;
-            }
+            pluginState = pluginState.explicitlySetThreadId
+              ? { ...pluginState, explicitlySetThreadId: null }
+              : pluginState;
 
             let currentActiveThread = getActiveCommentId(newEditorState.doc, selection);
             if (
@@ -574,9 +574,10 @@ export const CommentsPlugin = Extension.create({
 
           // Clear explicit flag on document changes — the user is editing,
           // so position-based detection should resume.
-          if (tr.docChanged && pluginState.explicitlySetThreadId) {
-            pluginState.explicitlySetThreadId = null;
-          }
+          pluginState =
+            tr.docChanged && pluginState.explicitlySetThreadId
+              ? { ...pluginState, explicitlySetThreadId: null }
+              : pluginState;
 
           return { ...pluginState };
         },
