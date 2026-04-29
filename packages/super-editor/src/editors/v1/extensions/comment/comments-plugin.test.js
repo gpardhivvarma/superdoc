@@ -742,6 +742,155 @@ describe('CommentsPlugin state', () => {
     const pluginState = CommentsPluginKey.getState(view.state);
     expect(pluginState.activeThreadId).toBe('tracked-1');
   });
+
+  it('sets explicitlySetThreadId when setActiveComment meta is dispatched', () => {
+    const { view } = createPluginStateEnvironment();
+
+    const tr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+
+    view.dispatch(tr);
+
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.activeThreadId).toBe('thread-1');
+    expect(pluginState.explicitlySetThreadId).toBe('thread-1');
+  });
+
+  it('preserves explicitly set comment on selection-only transaction when cursor stays inside comment', () => {
+    const schema = createCommentSchema();
+    const commentMark = schema.marks[CommentMarkName].create({ commentId: 'thread-1', internal: true });
+    // "Hello" at positions 1-6, all covered by comment mark
+    const paragraph = schema.node('paragraph', null, [schema.text('Hello', [commentMark])]);
+    const doc = schema.node('doc', null, [paragraph]);
+    const { view, editor } = createPluginStateEnvironment({ schema, doc });
+
+    // Step 1: Explicitly activate the comment
+    const setActiveTr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+    view.dispatch(setActiveTr);
+    expect(CommentsPluginKey.getState(view.state).activeThreadId).toBe('thread-1');
+
+    // Step 2: Simulate a DOM-sync selection-only transaction within the same comment range
+    const selectionTr = view.state.tr.setSelection(TextSelection.create(view.state.doc, 3));
+    view.dispatch(selectionTr);
+
+    // Active comment should be preserved — no commentsUpdate emitted
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.activeThreadId).toBe('thread-1');
+    expect(pluginState.explicitlySetThreadId).toBe('thread-1');
+  });
+
+  it('clears explicitlySetThreadId when cursor moves outside comment range', () => {
+    const schema = createCommentSchema();
+    const commentMark = schema.marks[CommentMarkName].create({ commentId: 'thread-1', internal: true });
+    // "Hello World" — only "Hello" (pos 1-6) has the comment, " World" (pos 6-12) does not
+    const paragraph = schema.node('paragraph', null, [schema.text('Hello', [commentMark]), schema.text(' World')]);
+    const doc = schema.node('doc', null, [paragraph]);
+    const { view } = createPluginStateEnvironment({ schema, doc });
+
+    // Step 1: Explicitly activate the comment
+    const setActiveTr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+    view.dispatch(setActiveTr);
+    expect(CommentsPluginKey.getState(view.state).explicitlySetThreadId).toBe('thread-1');
+
+    // Step 2: Move cursor outside the comment range
+    const selectionTr = view.state.tr.setSelection(TextSelection.create(view.state.doc, 8));
+    view.dispatch(selectionTr);
+
+    // Flag should be cleared, position-based detection takes over
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.explicitlySetThreadId).toBeNull();
+  });
+
+  it('preserves explicitly set comment when text has both comment and tracked-change marks', () => {
+    const schema = createCommentSchema();
+    const commentMark = schema.marks[CommentMarkName].create({ commentId: 'thread-1', internal: true });
+    const trackedMark = schema.marks[TrackInsertMarkName].create({ id: 'tc-1' });
+    // Text has both comment and tracked-change marks — the triggering scenario for the flicker bug
+    const paragraph = schema.node('paragraph', null, [schema.text('Hello', [commentMark, trackedMark])]);
+    const doc = schema.node('doc', null, [paragraph]);
+    const { view, editor } = createPluginStateEnvironment({ schema, doc });
+
+    // Step 1: Explicitly activate the comment (simulates sidebar click)
+    const setActiveTr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+    view.dispatch(setActiveTr);
+    expect(CommentsPluginKey.getState(view.state).activeThreadId).toBe('thread-1');
+
+    // Step 2: Simulate DOM-sync selection transaction (the one that caused flicker)
+    editor.emit.mockClear();
+    const selectionTr = view.state.tr.setSelection(TextSelection.create(view.state.doc, 2));
+    view.dispatch(selectionTr);
+
+    // Active comment should be preserved — NOT overridden by position-based detection
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.activeThreadId).toBe('thread-1');
+    expect(pluginState.explicitlySetThreadId).toBe('thread-1');
+  });
+
+  it('allows position-based detection for range selections even when flag is set', () => {
+    const schema = createCommentSchema();
+    const commentMark = schema.marks[CommentMarkName].create({ commentId: 'thread-1', internal: true });
+    const paragraph = schema.node('paragraph', null, [schema.text('Hello', [commentMark])]);
+    const doc = schema.node('doc', null, [paragraph]);
+    const { view } = createPluginStateEnvironment({ schema, doc });
+
+    // Step 1: Explicitly activate the comment
+    const setActiveTr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+    view.dispatch(setActiveTr);
+
+    // Step 2: Create a range selection (non-collapsed) within the comment
+    // selectionContainsThread returns false for range selections ($from !== $to),
+    // so the guard should NOT fire and position-based detection should run
+    const rangeTr = view.state.tr.setSelection(TextSelection.create(view.state.doc, 1, 4));
+    view.dispatch(rangeTr);
+
+    // The flag should be cleared since selectionContainsThread returns false for ranges
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.explicitlySetThreadId).toBeNull();
+  });
+
+  it('clears explicitlySetThreadId on document change', () => {
+    const schema = createCommentSchema();
+    const commentMark = schema.marks[CommentMarkName].create({ commentId: 'thread-1', internal: true });
+    const paragraph = schema.node('paragraph', null, [schema.text('Hello', [commentMark])]);
+    const doc = schema.node('doc', null, [paragraph]);
+    const { view } = createPluginStateEnvironment({ schema, doc });
+
+    // Step 1: Explicitly activate the comment
+    const setActiveTr = view.state.tr.setMeta(CommentsPluginKey, {
+      type: 'setActiveComment',
+      activeThreadId: 'thread-1',
+      forceUpdate: true,
+    });
+    view.dispatch(setActiveTr);
+    expect(CommentsPluginKey.getState(view.state).explicitlySetThreadId).toBe('thread-1');
+
+    // Step 2: Edit the document (insert text)
+    const editTr = view.state.tr.insertText('!', 3);
+    view.dispatch(editTr);
+
+    // Flag should be cleared — user is editing, position-based detection resumes
+    const pluginState = CommentsPluginKey.getState(view.state);
+    expect(pluginState.explicitlySetThreadId).toBeNull();
+  });
 });
 
 describe('normalizeCommentEventPayload', () => {
