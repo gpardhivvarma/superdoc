@@ -546,7 +546,20 @@ export const CommentsPlugin = Extension.create({
             }
 
             const previousSelectionId = pluginState.activeThreadId;
-            if (previousSelectionId !== currentActiveThread) {
+            // getActiveCommentId returns undefined for any non-collapsed selection
+            // (its first line is `if ($from.pos !== $to.pos) return;`), and that
+            // undefined gets coerced to null below, which would emit
+            // commentsUpdate({activeCommentId: null}) and clear an active comment.
+            // For tracked-change comments, presentation.navigateTo dispatches a
+            // collapsed cursor placement immediately followed by a non-collapsed
+            // NodeSelection on the SDT wrapper. That second tx would otherwise
+            // overwrite the just-activated comment, the host's commentsUpdate
+            // listener would re-assert it, and the loop would flicker forever
+            // (issue #2861). Treat "undefined from non-collapsed" as "no
+            // information" rather than "no active comment".
+            const isNonCollapsedClear =
+              currentActiveThread == null && selection && selection.$from.pos !== selection.$to.pos;
+            if (previousSelectionId !== currentActiveThread && !isNonCollapsedClear) {
               // Update both the plugin state and the local variable
               pluginState.activeThreadId = currentActiveThread;
               const update = {
