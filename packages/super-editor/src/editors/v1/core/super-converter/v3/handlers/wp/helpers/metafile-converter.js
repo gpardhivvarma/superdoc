@@ -1,9 +1,14 @@
 /**
- * EMF/WMF to SVG Converter
+ * EMF/WMF to browser-renderable image converter.
  *
- * Converts Windows Enhanced Metafile (EMF) and Windows Metafile (WMF) images
- * to SVG format. The converted SVG is returned as a data URI that can be used
- * as an image source.
+ * Converts Windows Enhanced Metafile (EMF/EMF+) and Windows Metafile (WMF) images
+ * into a format browsers can render, returned as a data URI plus short format tag.
+ * Strategy, in order of preference:
+ *   1. Embedded bitmap fast paths (no rasterization required):
+ *      - Classic EMR_STRETCHDIBITS DIB → BMP
+ *      - EmfPlusObject(Image) compressed bitmap → original PNG/JPEG/GIF
+ *   2. Vector rasterization via the rtf.js renderer → SVG (classic EMF/WMF only)
+ *   3. Placeholder SVG when an EMF+ payload uses GDI+ records we can't render
  *
  * EMF/WMF rendering code extracted from rtf.js (MIT License)
  * Original: https://github.com/nicktf/rtf.js
@@ -74,6 +79,21 @@ const MM_ANISOTROPIC = 8;
 const EMF_SIGNATURE = 0x464d4520; // ' EMF'
 const EMF_PLUS_SIGNATURE = 0x2b464d45; // 'EMF+' inside EMR_COMMENT
 
+// Classic EMR record type for comments (MS-EMF § 2.3.3.1)
+const EMR_COMMENT = 70;
+
+// EMF+ record types (MS-EMFPLUS § 2.1.1.1)
+const EMF_PLUS_OBJECT = 0x4008;
+
+// EMF+ object types encoded in EmfPlusObject Flags bits 8–14 (MS-EMFPLUS § 2.1.1.21)
+const EMF_PLUS_OBJECT_TYPE_IMAGE = 5;
+
+// EmfPlusImage Type field (MS-EMFPLUS § 2.2.1.4)
+const EMF_PLUS_IMAGE_TYPE_BITMAP = 1;
+
+// EmfPlusBitmap Type field (MS-EMFPLUS § 2.2.2.2)
+const EMF_PLUS_BITMAP_TYPE_COMPRESSED = 1;
+
 // Re-export for local use — shared implementation lives in ../../../../helpers.js
 const base64ToArrayBuffer = dataUriToArrayBuffer;
 
@@ -93,6 +113,218 @@ function uint8ToBase64(bytes) {
   }
 
   return btoa(binary);
+}
+
+/**
+ * Detect a compressed image format (PNG/JPEG/GIF) from its leading bytes and return
+ * the matching MIME type and short extension.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {{ mime: string, format: string } | null}
+ */
+function detectCompressedImageFormat(bytes) {
+  if (!bytes || bytes.length < 4) return null;
+
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return { mime: 'image/png', format: 'png' };
+  }
+
+  // JPEG: FF D8 FF
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { mime: 'image/jpeg', format: 'jpeg' };
+  }
+
+  // GIF: 'GIF8'
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+    return { mime: 'image/gif', format: 'gif' };
+  }
+
+  return null;
+}
+
+/**
+ * Concatenate a list of Uint8Arrays into a single Uint8Array.
+ *
+ * @param {Uint8Array[]} parts
+ * @returns {Uint8Array}
+ */
+function concatBytes(parts) {
+  let totalLength = 0;
+  for (const part of parts) totalLength += part.byteLength;
+
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result;
+}
+
+/**
+ * Parse the body of an EmfPlusObject(Image) record and, if it carries a compressed
+ * bitmap (PNG/JPEG/GIF), return it as a data URI. Pure-pixel and metafile image
+ * variants are rejected because they require a full GDI+ rasterizer.
+ *
+ * Layout (MS-EMFPLUS § 2.2.1.4 EmfPlusImage + § 2.2.2.2 EmfPlusBitmap):
+ *   0:  Version          (4 bytes, ignored)
+ *   4:  Type             (4 bytes) — 1 = Bitmap, 2 = Metafile
+ *   For Bitmap:
+ *     8:  Width          (4 bytes, ignored)
+ *     12: Height         (4 bytes, ignored)
+ *     16: Stride         (4 bytes, ignored)
+ *     20: PixelFormat    (4 bytes, ignored)
+ *     24: Type           (4 bytes) — 1 = Compressed
+ *     28: BitmapData     — encoded PNG/JPEG/GIF bytes when Type = Compressed
+ *
+ * @param {Uint8Array} bytes - EmfPlusImage object data
+ * @returns {{ dataUri: string, format: string } | null}
+ */
+function parseEmfPlusImageObject(bytes) {
+  if (!bytes || bytes.byteLength < 28) return null;
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const imageType = view.getUint32(4, true);
+  if (imageType !== EMF_PLUS_IMAGE_TYPE_BITMAP) return null;
+
+  const bitmapType = view.getUint32(24, true);
+  if (bitmapType !== EMF_PLUS_BITMAP_TYPE_COMPRESSED) return null;
+
+  const compressed = bytes.subarray(28);
+  const formatInfo = detectCompressedImageFormat(compressed);
+  if (!formatInfo) return null;
+
+  return {
+    dataUri: `data:${formatInfo.mime};base64,${uint8ToBase64(compressed)}`,
+    format: formatInfo.format,
+  };
+}
+
+/**
+ * Some EMF files (notably PowerPoint cover slides and Office charts) carry their visual
+ * payload as a compressed bitmap embedded inside an EmfPlusObject(Image) record rather
+ * than as classic GDI records. Extract that bitmap so it can be rendered without
+ * implementing a full GDI+ renderer.
+ *
+ * Walks the outer EMF stream looking for EMR_COMMENT records carrying EMF+ data, then
+ * walks the inner EMF+ records for EmfPlusObject(Image) entries. Continued objects
+ * (Flags.ContinueBit set) are reassembled by ObjectId. Per MS-EMFPLUS § 2.3.5.1:
+ *   - When ContinueBit=1, the record header is 16 bytes and includes a TotalObjectSize
+ *     field at offset 8 between Size and DataSize. ObjectData starts at offset 16.
+ *   - When ContinueBit=0, the record header is the standard 12 bytes. ObjectData
+ *     starts at offset 12, and this record is either standalone or the final chunk
+ *     of a continuation series (in which case the buffered chunks are reassembled).
+ *
+ * @param {ArrayBuffer} buffer
+ * @returns {{ dataUri: string, format: string } | null}
+ */
+function extractBitmapFromEmfPlus(buffer) {
+  const view = new DataView(buffer);
+  if (view.byteLength < 108) return null;
+
+  const type = view.getUint32(0, true);
+  const headerSize = view.getUint32(4, true);
+  const signature = view.getUint32(40, true);
+  if (type !== 1 || signature !== EMF_SIGNATURE) return null;
+  if (headerSize <= 0 || headerSize >= view.byteLength) return null;
+
+  const pendingByObjectId = new Map();
+
+  let offset = headerSize;
+  while (offset + 8 <= view.byteLength) {
+    const recordType = view.getUint32(offset, true);
+    const recordSize = view.getUint32(offset + 4, true);
+    if (recordSize < 8 || offset + recordSize > view.byteLength) break;
+
+    if (recordType === EMR_COMMENT && recordSize >= 16) {
+      const dataSize = view.getUint32(offset + 8, true);
+      // EMR_COMMENT layout: Type (4) | Size (4) | DataSize (4) | Data (DataSize bytes).
+      // The CommentIdentifier is the first 4 bytes of Data; EMF+ records follow it.
+      if (dataSize >= 4 && dataSize <= recordSize - 12) {
+        const identifier = view.getUint32(offset + 12, true);
+        if (identifier === EMF_PLUS_SIGNATURE) {
+          const emfPlusStart = offset + 16;
+          const emfPlusEnd = offset + 12 + dataSize;
+
+          let pos = emfPlusStart;
+          while (pos + 12 <= emfPlusEnd) {
+            const epType = view.getUint16(pos, true);
+            const epFlags = view.getUint16(pos + 2, true);
+            const epSize = view.getUint32(pos + 4, true);
+            if (epSize < 12 || pos + epSize > emfPlusEnd) break;
+
+            if (epType === EMF_PLUS_OBJECT) {
+              const objectId = epFlags & 0x00ff;
+              const objectType = (epFlags >> 8) & 0x7f;
+              const continueBit = (epFlags & 0x8000) !== 0;
+
+              // ContinueBit=1: Type(2) Flags(2) Size(4) TotalObjectSize(4) DataSize(4) ObjectData
+              // ContinueBit=0: Type(2) Flags(2) Size(4)                    DataSize(4) ObjectData
+              const headerBytes = continueBit ? 16 : 12;
+              if (epSize < headerBytes) break;
+              const totalObjectSize = continueBit ? view.getUint32(pos + 8, true) : 0;
+              const dataSize = view.getUint32(pos + (continueBit ? 12 : 8), true);
+              const dataStart = pos + headerBytes;
+              if (dataSize > epSize - headerBytes || dataStart + dataSize > emfPlusEnd) break;
+
+              if (objectType === EMF_PLUS_OBJECT_TYPE_IMAGE) {
+                let result = null;
+
+                if (continueBit) {
+                  let entry = pendingByObjectId.get(objectId);
+                  if (!entry) {
+                    entry = { totalSize: totalObjectSize, parts: [], collected: 0 };
+                    pendingByObjectId.set(objectId, entry);
+                  } else if (entry.totalSize === 0 && totalObjectSize > 0) {
+                    entry.totalSize = totalObjectSize;
+                  }
+                  const chunk = new Uint8Array(buffer, dataStart, dataSize);
+                  entry.parts.push(chunk);
+                  entry.collected += chunk.byteLength;
+
+                  // The strict spec terminates the series with a ContinueBit=0 record,
+                  // but flush early once TotalObjectSize is satisfied so an off-spec
+                  // encoder that leaves ContinueBit=1 on the final record still resolves.
+                  if (entry.totalSize > 0 && entry.collected >= entry.totalSize) {
+                    result = parseEmfPlusImageObject(concatBytes(entry.parts));
+                    pendingByObjectId.delete(objectId);
+                  }
+                } else {
+                  const pending = pendingByObjectId.get(objectId);
+                  if (pending) {
+                    pending.parts.push(new Uint8Array(buffer, dataStart, dataSize));
+                    result = parseEmfPlusImageObject(concatBytes(pending.parts));
+                    pendingByObjectId.delete(objectId);
+                  } else {
+                    result = parseEmfPlusImageObject(new Uint8Array(buffer, dataStart, dataSize));
+                  }
+                }
+
+                if (result) return result;
+              }
+            }
+
+            pos += epSize;
+          }
+        }
+      }
+    }
+
+    offset += recordSize;
+  }
+
+  return null;
 }
 
 /**
@@ -235,7 +467,7 @@ function isEmfPlus(buffer) {
     const recordSize = view.getUint32(offset + 4, true);
     if (recordSize < 8 || offset + recordSize > view.byteLength) break;
 
-    if (recordType === 70 /* EMR_COMMENT */ && recordSize >= 20) {
+    if (recordType === EMR_COMMENT && recordSize >= 20) {
       // EMR_COMMENT layout: Type (4) | Size (4) | DataSize (4) | CommentIdentifier (4) | Data...
       const identifier = view.getUint32(offset + 12, true);
       if (identifier === EMF_PLUS_SIGNATURE) return true;
@@ -353,6 +585,13 @@ export function convertEmfToSvg(data, size = {}) {
     const dimensions = getEmfDimensions(buffer);
 
     if (isEmfPlus(buffer)) {
+      // EMF+ payloads use GDI+ drawing records that rtf.js does not implement.
+      // Many real-world EMF+ files (Office cover slides, charts) embed a complete
+      // PNG/JPEG inside an EmfPlusObject(Image) record — extract that for a
+      // pixel-perfect render before falling back to the placeholder.
+      const embedded = extractBitmapFromEmfPlus(buffer);
+      if (embedded) return embedded;
+
       return createPlaceholder({
         width: size.width || dimensions.width,
         height: size.height || dimensions.height,
