@@ -411,35 +411,256 @@ describe('metafile-converter', () => {
       expect(decoded).toContain('Unable to render EMF+ image');
     });
 
-    it('rejects pixel-format (uncompressed) EmfPlusBitmap instead of misreporting it', () => {
-      // Build an EmfPlusObject(Image) with Bitmap.Type = 0 (Pixel) instead of 1 (Compressed).
-      const dummyPixels = new Uint8Array(16);
-      const recBody = new Uint8Array(28 + dummyPixels.length);
+    /**
+     * Build a standalone EmfPlusObject(Image) record with `Bitmap.Type = 0` (Pixel) and
+     * the given raw pixel buffer. Height sign and stride sign are passed through to
+     * exercise both row directions.
+     */
+    function writeStandalonePixelImageRecord({ width, height, stride, pixelFormat, pixels }, objectId = 0) {
+      const recBody = new Uint8Array(28 + pixels.length);
       const dv = new DataView(recBody.buffer);
-      dv.setUint32(0, 0xdbc01001, true);
-      dv.setUint32(4, 1, true); // Bitmap
-      dv.setUint32(8, 2, true);
-      dv.setUint32(12, 2, true);
-      dv.setUint32(16, 8, true);
-      dv.setUint32(20, 0x0026200a, true);
-      dv.setUint32(24, 0, true); // Pixel, not Compressed
-      recBody.set(dummyPixels, 28);
+      dv.setUint32(0, 0xdbc01001, true); // Version
+      dv.setUint32(4, 1, true); // Image Type = Bitmap
+      dv.setInt32(8, width, true);
+      dv.setInt32(12, height, true);
+      dv.setInt32(16, stride, true);
+      dv.setUint32(20, pixelFormat, true);
+      dv.setUint32(24, 0, true); // Bitmap Type = Pixel
+      recBody.set(pixels, 28);
 
       const recordSize = alignTo4(12 + recBody.length);
       const rec = new Uint8Array(recordSize);
       const rv = new DataView(rec.buffer);
       rv.setUint16(0, 0x4008, true);
-      rv.setUint16(2, (5 << 8) | 0, true);
+      rv.setUint16(2, ((5 & 0x7f) << 8) | (objectId & 0xff), true);
       rv.setUint32(4, recordSize, true);
       rv.setUint32(8, recBody.length, true);
       rec.set(recBody, 12);
+      return rec;
+    }
 
-      const buffer = buildEmfBuffer([writeEmrComment(rec)]);
+    /**
+     * Install a mock canvas on the JSDOM document so the pixel-bitmap path can run
+     * end-to-end in Node. Returns a spy plus a getter for the most recently written
+     * ImageData buffer so tests can assert the RGBA conversion result directly.
+     */
+    function installCanvasMock(toDataUriResult) {
+      let lastImageData = null;
+      const mockCanvas = {
+        width: 0,
+        height: 0,
+        getContext: () => ({
+          createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+          putImageData: (imageData) => {
+            lastImageData = imageData;
+          },
+        }),
+        toDataURL: () => toDataUriResult,
+      };
+      const spy = vi.spyOn(dom.window.document, 'createElement').mockImplementation((tag) => {
+        if (tag === 'canvas') return mockCanvas;
+        return dom.window.document.createElement.wrappedMethod
+          ? dom.window.document.createElement.wrappedMethod.call(dom.window.document, tag)
+          : null;
+      });
+      return { spy, getLastImageData: () => lastImageData, mockCanvas };
+    }
+
+    it('renders a raw-pixel 32bppARGB bitmap via canvas and returns a PNG data URI', () => {
+      // 2x2 32bppARGB stored top-down. Bytes per pixel in EMF+ memory order: B, G, R, A.
+      // prettier-ignore
+      const pixels = new Uint8Array([
+        // row 0: red(opaque),                green(opaque)
+        0x00, 0x00, 0xff, 0xff,  0x00, 0xff, 0x00, 0xff,
+        // row 1: blue(opaque),               transparent
+        0xff, 0x00, 0x00, 0xff,  0x00, 0x00, 0x00, 0x00,
+      ]);
+
+      const { getLastImageData, spy } = installCanvasMock('data:image/png;base64,iVBORw0KGgo=');
+
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 2,
+            height: -2, // negative = top-down
+            stride: 8,
+            pixelFormat: 0x0026200a, // 32bppARGB
+            pixels,
+          }),
+        ),
+      ]);
 
       const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
-      // Pixel bitmaps require a full GDI+ rasterizer — fall back to the placeholder.
-      expect(result?.format).toBe('svg');
-      expect(decodeDataUri(result.dataUri)).toContain('Unable to render EMF+ image');
+
+      try {
+        expect(result?.format).toBe('png');
+        expect(result.dataUri).toBe('data:image/png;base64,iVBORw0KGgo=');
+
+        const img = getLastImageData();
+        expect(img.width).toBe(2);
+        expect(img.height).toBe(2);
+        // After BGRA → RGBA: row 0 should be red then green; row 1 blue then transparent.
+        expect(Array.from(img.data)).toEqual([
+          0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        ]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('flips bottom-up rows when height is positive', () => {
+      // 1x2, 32bppARGB. Memory order has the bottom row first; the canvas should
+      // receive rows in render order (top first).
+      // prettier-ignore
+      const pixels = new Uint8Array([
+        // row stored first = bottom row: blue
+        0xff, 0x00, 0x00, 0xff,
+        // row stored second = top row: red
+        0x00, 0x00, 0xff, 0xff,
+      ]);
+
+      const { getLastImageData, spy } = installCanvasMock('data:image/png;base64,xxx=');
+
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 1,
+            height: 2, // positive = bottom-up
+            stride: 4,
+            pixelFormat: 0x0026200a,
+            pixels,
+          }),
+        ),
+      ]);
+
+      const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
+
+      try {
+        expect(result?.format).toBe('png');
+        const img = getLastImageData();
+        // Top row should be red, bottom row blue (rows reversed from storage order).
+        expect(Array.from(img.data)).toEqual([0xff, 0, 0, 0xff, 0, 0, 0xff, 0xff]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('decodes 24bppRGB raw pixels', () => {
+      // 1x1 24bppRGB. EMF+ stores 24bpp as B,G,R; expected RGBA output is R,G,B,255.
+      const pixels = new Uint8Array([0x33, 0x66, 0x99]); // B=0x33, G=0x66, R=0x99
+
+      const { getLastImageData, spy } = installCanvasMock('data:image/png;base64,yyy=');
+
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 1,
+            height: -1,
+            stride: 3,
+            pixelFormat: 0x00021808, // 24bppRGB
+            pixels,
+          }),
+        ),
+      ]);
+
+      const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
+
+      try {
+        expect(result?.format).toBe('png');
+        expect(Array.from(getLastImageData().data)).toEqual([0x99, 0x66, 0x33, 0xff]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('un-premultiplies alpha for 32bppPARGB raw pixels', () => {
+      // PARGB stores premultiplied channels. With alpha=128 and stored R=64, the
+      // recovered straight-alpha R should be ~128 (64 * 255 / 128).
+      const pixels = new Uint8Array([0x40, 0x40, 0x40, 0x80]); // B=0x40, G=0x40, R=0x40, A=0x80
+
+      const { getLastImageData, spy } = installCanvasMock('data:image/png;base64,zzz=');
+
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 1,
+            height: -1,
+            stride: 4,
+            pixelFormat: 0x000e200b, // 32bppPARGB
+            pixels,
+          }),
+        ),
+      ]);
+
+      const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
+
+      try {
+        expect(result?.format).toBe('png');
+        const data = getLastImageData().data;
+        // 0x40 * 255 / 0x80 = 127.5 → Uint8ClampedArray rounds to 128.
+        expect(data[0]).toBe(128);
+        expect(data[1]).toBe(128);
+        expect(data[2]).toBe(128);
+        expect(data[3]).toBe(0x80);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('falls back to the placeholder when no DOM canvas is available for raw pixels', () => {
+      // Simulate an environment without canvas by stubbing the 2D context to null;
+      // the renderer should give up and let the EMF+ placeholder take over.
+      const spy = vi.spyOn(dom.window.document, 'createElement').mockImplementation((tag) => {
+        if (tag === 'canvas') {
+          return { width: 0, height: 0, getContext: () => null, toDataURL: () => 'data:,' };
+        }
+        return null;
+      });
+
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 1,
+            height: -1,
+            stride: 4,
+            pixelFormat: 0x0026200a,
+            pixels: new Uint8Array([0, 0, 0, 0xff]),
+          }),
+        ),
+      ]);
+
+      try {
+        const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
+        expect(result?.format).toBe('svg');
+        expect(decodeDataUri(result.dataUri)).toContain('Unable to render EMF+ image');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('falls back to the placeholder for indexed pixel formats', () => {
+      // Indexed formats need a palette lookup we don't implement; falling back to
+      // the placeholder is preferable to misreporting indices as raw RGBA bytes.
+      const { spy } = installCanvasMock('data:image/png;base64,unused=');
+      const buffer = buildEmfBuffer([
+        writeEmrComment(
+          writeStandalonePixelImageRecord({
+            width: 2,
+            height: -2,
+            stride: 2,
+            pixelFormat: 0x00030803, // 8bppIndexed (has the indexed flag set)
+            pixels: new Uint8Array([0, 1, 2, 3]),
+          }),
+        ),
+      ]);
+
+      try {
+        const result = convertMetafileToSvg(asEmfDataUri(buffer), 'emf');
+        expect(result?.format).toBe('svg');
+        expect(decodeDataUri(result.dataUri)).toContain('Unable to render EMF+ image');
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 });

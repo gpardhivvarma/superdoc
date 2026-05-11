@@ -7,8 +7,9 @@
  *   1. Embedded bitmap fast paths (no rasterization required):
  *      - Classic EMR_STRETCHDIBITS DIB → BMP
  *      - EmfPlusObject(Image) compressed bitmap → original PNG/JPEG/GIF
- *   2. Vector rasterization via the rtf.js renderer → SVG (classic EMF/WMF only)
- *   3. Placeholder SVG when an EMF+ payload uses GDI+ records we can't render
+ *   2. Raw-pixel EmfPlusObject(Image) → PNG via canvas
+ *   3. Vector rasterization via the rtf.js renderer → SVG (classic EMF/WMF only)
+ *   4. Placeholder SVG when an EMF+ payload uses GDI+ vector records we can't render
  *
  * EMF/WMF rendering code extracted from rtf.js (MIT License)
  * Original: https://github.com/nicktf/rtf.js
@@ -92,7 +93,20 @@ const EMF_PLUS_OBJECT_TYPE_IMAGE = 5;
 const EMF_PLUS_IMAGE_TYPE_BITMAP = 1;
 
 // EmfPlusBitmap Type field (MS-EMFPLUS § 2.2.2.2)
+const EMF_PLUS_BITMAP_TYPE_PIXEL = 0;
 const EMF_PLUS_BITMAP_TYPE_COMPRESSED = 1;
+
+// EmfPlusPixelFormat enumeration (MS-EMFPLUS § 2.1.1.25). The high byte of the
+// low word holds format flags; PixelFormatIndexed (0x00010000) signals palette use.
+const EMF_PLUS_PIXEL_FORMAT_INDEXED_FLAG = 0x00010000;
+const EMF_PLUS_PIXEL_FORMAT_24BPP_RGB = 0x00021808;
+const EMF_PLUS_PIXEL_FORMAT_32BPP_RGB = 0x00022009;
+const EMF_PLUS_PIXEL_FORMAT_32BPP_ARGB = 0x0026200a;
+const EMF_PLUS_PIXEL_FORMAT_32BPP_PARGB = 0x000e200b;
+
+// Cap canvas allocations so a malformed/oversized bitmap can't exhaust memory.
+// 100M pixels ≈ 400 MB of RGBA — well above any realistic document image.
+const MAX_PIXEL_BITMAP_PIXELS = 100_000_000;
 
 // Re-export for local use — shared implementation lives in ../../../../helpers.js
 const base64ToArrayBuffer = dataUriToArrayBuffer;
@@ -173,20 +187,157 @@ function concatBytes(parts) {
 }
 
 /**
- * Parse the body of an EmfPlusObject(Image) record and, if it carries a compressed
- * bitmap (PNG/JPEG/GIF), return it as a data URI. Pure-pixel and metafile image
- * variants are rejected because they require a full GDI+ rasterizer.
+ * Resolve an HTMLCanvasElement from the active DOM environment, preferring the one
+ * provided via setMetafileDomEnvironment so callers running in Node with node-canvas
+ * (or similar) aren't bypassed by a partial global document. Mirrors tiff-converter.
+ *
+ * @returns {HTMLCanvasElement|null}
+ */
+function createCanvasFromEnv() {
+  const env = domEnvironment || {};
+  const doc = env.document || env.mockDocument || env.window?.document || env.mockWindow?.document || null;
+  if (doc) {
+    return doc.createElement('canvas');
+  }
+  if (typeof document !== 'undefined') {
+    return document.createElement('canvas');
+  }
+  return null;
+}
+
+/**
+ * Convert a row of EMF+ pixel data into Canvas RGBA bytes.
+ * EMF+ stores 24/32bpp pixels as little-endian DWORDs, which read byte-by-byte
+ * gives B, G, R (and A for 32bpp formats) — the reverse of Canvas ImageData order.
+ *
+ * 32bppPARGB carries premultiplied alpha; Canvas ImageData expects straight alpha,
+ * so divide each channel by alpha/255 to recover the original color.
+ *
+ * @param {Uint8Array} src - row of pixel data
+ * @param {number} srcOffset - byte offset of the row within src
+ * @param {Uint8ClampedArray} dst - destination RGBA buffer
+ * @param {number} dstOffset - byte offset in dst
+ * @param {number} width
+ * @param {number} pixelFormat - one of the EMF_PLUS_PIXEL_FORMAT_* constants
+ * @returns {boolean} true on success, false on bounds violation
+ */
+function convertEmfPlusPixelRow(src, srcOffset, dst, dstOffset, width, pixelFormat) {
+  const bytesPerPixel = pixelFormat === EMF_PLUS_PIXEL_FORMAT_24BPP_RGB ? 3 : 4;
+  if (srcOffset + width * bytesPerPixel > src.byteLength) return false;
+
+  let s = srcOffset;
+  let d = dstOffset;
+  for (let x = 0; x < width; x++) {
+    const b = src[s];
+    const g = src[s + 1];
+    const r = src[s + 2];
+
+    if (pixelFormat === EMF_PLUS_PIXEL_FORMAT_24BPP_RGB) {
+      dst[d] = r;
+      dst[d + 1] = g;
+      dst[d + 2] = b;
+      dst[d + 3] = 255;
+      s += 3;
+    } else if (pixelFormat === EMF_PLUS_PIXEL_FORMAT_32BPP_PARGB) {
+      const a = src[s + 3];
+      if (a === 0) {
+        dst[d] = 0;
+        dst[d + 1] = 0;
+        dst[d + 2] = 0;
+        dst[d + 3] = 0;
+      } else {
+        const scale = 255 / a;
+        dst[d] = r * scale;
+        dst[d + 1] = g * scale;
+        dst[d + 2] = b * scale;
+        dst[d + 3] = a;
+      }
+      s += 4;
+    } else {
+      // 32bppARGB or 32bppRGB
+      dst[d] = r;
+      dst[d + 1] = g;
+      dst[d + 2] = b;
+      dst[d + 3] = pixelFormat === EMF_PLUS_PIXEL_FORMAT_32BPP_ARGB ? src[s + 3] : 255;
+      s += 4;
+    }
+    d += 4;
+  }
+  return true;
+}
+
+/**
+ * Render a raw-pixel EmfPlusBitmap onto a canvas and return it as a PNG data URI.
+ * Returns null when the pixel format is unsupported, the dimensions are out of
+ * bounds, or no canvas is available (e.g. Node without node-canvas).
+ *
+ * Per MS-EMFPLUS § 2.2.2.2, Height is signed: negative means top-down (rows stored
+ * in render order), positive means bottom-up (last row first, classic Windows DIB).
+ * Stride may also be negative; |stride| is the row span in bytes.
+ *
+ * @param {{ width: number, height: number, stride: number, pixelFormat: number, pixels: Uint8Array }} bitmap
+ * @returns {{ dataUri: string, format: string } | null}
+ */
+function renderEmfPlusPixelBitmap({ width, height, stride, pixelFormat, pixels }) {
+  if (width <= 0 || height === 0) return null;
+  const absHeight = Math.abs(height);
+  const absStride = Math.abs(stride);
+  if (absStride === 0) return null;
+  if (width * absHeight > MAX_PIXEL_BITMAP_PIXELS) return null;
+
+  if ((pixelFormat & EMF_PLUS_PIXEL_FORMAT_INDEXED_FLAG) !== 0) return null;
+  if (
+    pixelFormat !== EMF_PLUS_PIXEL_FORMAT_24BPP_RGB &&
+    pixelFormat !== EMF_PLUS_PIXEL_FORMAT_32BPP_RGB &&
+    pixelFormat !== EMF_PLUS_PIXEL_FORMAT_32BPP_ARGB &&
+    pixelFormat !== EMF_PLUS_PIXEL_FORMAT_32BPP_PARGB
+  ) {
+    return null;
+  }
+
+  if (absStride * absHeight > pixels.byteLength) return null;
+
+  const rgba = new Uint8ClampedArray(width * absHeight * 4);
+  const topDown = height < 0;
+  for (let y = 0; y < absHeight; y++) {
+    const srcRow = topDown ? y : absHeight - 1 - y;
+    if (!convertEmfPlusPixelRow(pixels, srcRow * absStride, rgba, y * width * 4, width, pixelFormat)) {
+      return null;
+    }
+  }
+
+  const canvas = createCanvasFromEnv();
+  if (!canvas) return null;
+  canvas.width = width;
+  canvas.height = absHeight;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const imageData = ctx.createImageData(width, absHeight);
+  imageData.data.set(rgba);
+  ctx.putImageData(imageData, 0, 0);
+
+  const dataUri = canvas.toDataURL('image/png');
+  if (!dataUri || dataUri === 'data:,') return null;
+  return { dataUri, format: 'png' };
+}
+
+/**
+ * Parse the body of an EmfPlusObject(Image) record and return it as a data URI.
+ * Compressed bitmaps (PNG/JPEG/GIF) are extracted verbatim; raw-pixel bitmaps are
+ * rendered onto a canvas and exported as PNG. Metafile-typed images are rejected
+ * because they would require a full GDI+ rasterizer.
  *
  * Layout (MS-EMFPLUS § 2.2.1.4 EmfPlusImage + § 2.2.2.2 EmfPlusBitmap):
  *   0:  Version          (4 bytes, ignored)
  *   4:  Type             (4 bytes) — 1 = Bitmap, 2 = Metafile
  *   For Bitmap:
- *     8:  Width          (4 bytes, ignored)
- *     12: Height         (4 bytes, ignored)
- *     16: Stride         (4 bytes, ignored)
- *     20: PixelFormat    (4 bytes, ignored)
- *     24: Type           (4 bytes) — 1 = Compressed
- *     28: BitmapData     — encoded PNG/JPEG/GIF bytes when Type = Compressed
+ *     8:  Width          (4 bytes, signed)
+ *     12: Height         (4 bytes, signed — sign indicates row direction)
+ *     16: Stride         (4 bytes, signed)
+ *     20: PixelFormat    (4 bytes)
+ *     24: Type           (4 bytes) — 0 = Pixel, 1 = Compressed
+ *     28: BitmapData     — encoded PNG/JPEG/GIF when Compressed, raw pixels when Pixel
  *
  * @param {Uint8Array} bytes - EmfPlusImage object data
  * @returns {{ dataUri: string, format: string } | null}
@@ -199,23 +350,37 @@ function parseEmfPlusImageObject(bytes) {
   if (imageType !== EMF_PLUS_IMAGE_TYPE_BITMAP) return null;
 
   const bitmapType = view.getUint32(24, true);
-  if (bitmapType !== EMF_PLUS_BITMAP_TYPE_COMPRESSED) return null;
 
-  const compressed = bytes.subarray(28);
-  const formatInfo = detectCompressedImageFormat(compressed);
-  if (!formatInfo) return null;
+  if (bitmapType === EMF_PLUS_BITMAP_TYPE_COMPRESSED) {
+    const compressed = bytes.subarray(28);
+    const formatInfo = detectCompressedImageFormat(compressed);
+    if (!formatInfo) return null;
 
-  return {
-    dataUri: `data:${formatInfo.mime};base64,${uint8ToBase64(compressed)}`,
-    format: formatInfo.format,
-  };
+    return {
+      dataUri: `data:${formatInfo.mime};base64,${uint8ToBase64(compressed)}`,
+      format: formatInfo.format,
+    };
+  }
+
+  if (bitmapType === EMF_PLUS_BITMAP_TYPE_PIXEL) {
+    return renderEmfPlusPixelBitmap({
+      width: view.getInt32(8, true),
+      height: view.getInt32(12, true),
+      stride: view.getInt32(16, true),
+      pixelFormat: view.getUint32(20, true),
+      pixels: bytes.subarray(28),
+    });
+  }
+
+  return null;
 }
 
 /**
  * Some EMF files (notably PowerPoint cover slides and Office charts) carry their visual
- * payload as a compressed bitmap embedded inside an EmfPlusObject(Image) record rather
- * than as classic GDI records. Extract that bitmap so it can be rendered without
- * implementing a full GDI+ renderer.
+ * payload as a bitmap embedded inside an EmfPlusObject(Image) record rather than as
+ * classic GDI records. Extract and decode that bitmap — compressed PNG/JPEG/GIF are
+ * returned verbatim; raw pixels are rendered onto a canvas — so the image can render
+ * without a full GDI+ renderer.
  *
  * Walks the outer EMF stream looking for EMR_COMMENT records carrying EMF+ data, then
  * walks the inner EMF+ records for EmfPlusObject(Image) entries. Continued objects
@@ -247,7 +412,7 @@ function extractBitmapFromEmfPlus(buffer) {
     const recordSize = view.getUint32(offset + 4, true);
     if (recordSize < 8 || offset + recordSize > view.byteLength) break;
 
-    if (recordType === EMR_COMMENT && recordSize >= 16) {
+    if (recordType === EMR_COMMENT && recordSize >= 20) {
       const dataSize = view.getUint32(offset + 8, true);
       // EMR_COMMENT layout: Type (4) | Size (4) | DataSize (4) | Data (DataSize bytes).
       // The CommentIdentifier is the first 4 bytes of Data; EMF+ records follow it.
@@ -296,15 +461,19 @@ function extractBitmapFromEmfPlus(buffer) {
                   // The strict spec terminates the series with a ContinueBit=0 record,
                   // but flush early once TotalObjectSize is satisfied so an off-spec
                   // encoder that leaves ContinueBit=1 on the final record still resolves.
+                  // Slice to totalSize so a writer that overshoots its declared size
+                  // doesn't tack trailing bytes onto the data URI.
                   if (entry.totalSize > 0 && entry.collected >= entry.totalSize) {
-                    result = parseEmfPlusImageObject(concatBytes(entry.parts));
+                    result = parseEmfPlusImageObject(concatBytes(entry.parts).subarray(0, entry.totalSize));
                     pendingByObjectId.delete(objectId);
                   }
                 } else {
                   const pending = pendingByObjectId.get(objectId);
                   if (pending) {
                     pending.parts.push(new Uint8Array(buffer, dataStart, dataSize));
-                    result = parseEmfPlusImageObject(concatBytes(pending.parts));
+                    const combined = concatBytes(pending.parts);
+                    const trimmed = pending.totalSize > 0 ? combined.subarray(0, pending.totalSize) : combined;
+                    result = parseEmfPlusImageObject(trimmed);
                     pendingByObjectId.delete(objectId);
                   } else {
                     result = parseEmfPlusImageObject(new Uint8Array(buffer, dataStart, dataSize));
