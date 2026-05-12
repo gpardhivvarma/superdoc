@@ -271,9 +271,13 @@ function convertEmfPlusPixelRow(src, srcOffset, dst, dstOffset, width, pixelForm
  * Returns null when the pixel format is unsupported, the dimensions are out of
  * bounds, or no canvas is available (e.g. Node without node-canvas).
  *
- * Per MS-EMFPLUS § 2.2.2.2, Height is signed: negative means top-down (rows stored
- * in render order), positive means bottom-up (last row first, classic Windows DIB).
- * Stride may also be negative; |stride| is the row span in bytes.
+ * Row order: MS-EMFPLUS § 2.2.2.2 is silent on what Height/Stride sign means for
+ * storage direction. Empirically, GDI+ (the producer for every Office-generated
+ * EMF+) lays out pixel memory top-down regardless of Height sign — its Bitmap
+ * class stores row 0 at Scan0 and walks down by +Stride. The classic Windows DIB
+ * convention (positive Height = bottom-up) does not carry over to EMF+. Treat
+ * storage row 0 as the visual top in all cases.
+ * Stride may be negative; |stride| is the row span in bytes.
  *
  * @param {{ width: number, height: number, stride: number, pixelFormat: number, pixels: Uint8Array }} bitmap
  * @returns {{ dataUri: string, format: string } | null}
@@ -298,10 +302,8 @@ function renderEmfPlusPixelBitmap({ width, height, stride, pixelFormat, pixels }
   if (absStride * absHeight > pixels.byteLength) return null;
 
   const rgba = new Uint8ClampedArray(width * absHeight * 4);
-  const topDown = height < 0;
   for (let y = 0; y < absHeight; y++) {
-    const srcRow = topDown ? y : absHeight - 1 - y;
-    if (!convertEmfPlusPixelRow(pixels, srcRow * absStride, rgba, y * width * 4, width, pixelFormat)) {
+    if (!convertEmfPlusPixelRow(pixels, y * absStride, rgba, y * width * 4, width, pixelFormat)) {
       return null;
     }
   }
@@ -333,7 +335,7 @@ function renderEmfPlusPixelBitmap({ width, height, stride, pixelFormat, pixels }
  *   4:  Type             (4 bytes) — 1 = Bitmap, 2 = Metafile
  *   For Bitmap:
  *     8:  Width          (4 bytes, signed)
- *     12: Height         (4 bytes, signed — sign indicates row direction)
+ *     12: Height         (4 bytes, signed — see renderEmfPlusPixelBitmap for row order)
  *     16: Stride         (4 bytes, signed)
  *     20: PixelFormat    (4 bytes)
  *     24: Type           (4 bytes) — 0 = Pixel, 1 = Compressed

@@ -508,15 +508,18 @@ describe('metafile-converter', () => {
       }
     });
 
-    it('flips bottom-up rows when height is positive', () => {
-      // 1x2, 32bppARGB. Memory order has the bottom row first; the canvas should
-      // receive rows in render order (top first).
+    it('preserves storage order for positive height (GDI+ writes top-down regardless of sign)', () => {
+      // 1x2, 32bppARGB. MS-EMFPLUS § 2.2.2.2 is silent on what Height sign means
+      // for row direction. Empirically GDI+ writes top-down whether Height is
+      // positive or negative — every Office-produced EMF+ does the same. The
+      // earlier "positive Height = bottom-up" reading borrowed from the classic
+      // Windows DIB convention and rendered real cover images upside down.
       // prettier-ignore
       const pixels = new Uint8Array([
-        // row stored first = bottom row: blue
-        0xff, 0x00, 0x00, 0xff,
-        // row stored second = top row: red
+        // storage row 0 = visual top row: red
         0x00, 0x00, 0xff, 0xff,
+        // storage row 1 = visual bottom row: blue
+        0xff, 0x00, 0x00, 0xff,
       ]);
 
       const { getLastImageData, spy } = installCanvasMock('data:image/png;base64,xxx=');
@@ -525,7 +528,7 @@ describe('metafile-converter', () => {
         writeEmrComment(
           writeStandalonePixelImageRecord({
             width: 1,
-            height: 2, // positive = bottom-up
+            height: 2, // positive height — still top-down per GDI+
             stride: 4,
             pixelFormat: 0x0026200a,
             pixels,
@@ -538,7 +541,7 @@ describe('metafile-converter', () => {
       try {
         expect(result?.format).toBe('png');
         const img = getLastImageData();
-        // Top row should be red, bottom row blue (rows reversed from storage order).
+        // Storage row 0 (red) stays at the visual top; row 1 (blue) at the bottom.
         expect(Array.from(img.data)).toEqual([0xff, 0, 0, 0xff, 0, 0, 0xff, 0xff]);
       } finally {
         spy.mockRestore();
