@@ -22,6 +22,7 @@ export type PageStyles = {
   boxShadow?: string;
   border?: string;
   margin?: string;
+  color?: string;
 };
 
 export const DEFAULT_PAGE_STYLES: Required<PageStyles> = {
@@ -29,6 +30,12 @@ export const DEFAULT_PAGE_STYLES: Required<PageStyles> = {
   boxShadow: 'var(--sd-layout-page-shadow, 0 4px 20px rgba(15, 23, 42, 0.08))',
   border: '1px solid rgba(15, 23, 42, 0.08)',
   margin: '0 auto',
+  // Without an explicit color, document text inherits the browser default
+  // `canvastext` system color, which resolves to white on dark-themed OSes —
+  // so auto-numbered list markers and any other run without an explicit
+  // `<w:color>` render invisible on the white page (SD-3456 / IT-1102).
+  // Default to black; consumers can override via --sd-layout-page-text.
+  color: 'var(--sd-layout-page-text, #000)',
 };
 
 export const containerStyles: Partial<CSSStyleDeclaration> = {
@@ -75,6 +82,7 @@ export const pageStyles = (width: number, height: number, overrides?: PageStyles
     minHeight: `${height}px`,
     flexShrink: '0',
     background: merged.background,
+    color: merged.color,
     boxShadow: merged.boxShadow,
     border: merged.border,
     margin: merged.margin,

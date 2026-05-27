@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ensureSdtContainerStyles, ensureTrackChangeStyles, lineStyles } from './styles.js';
+import {
+  DEFAULT_PAGE_STYLES,
+  ensureSdtContainerStyles,
+  ensureTrackChangeStyles,
+  lineStyles,
+  pageStyles,
+} from './styles.js';
 
 describe('lineStyles', () => {
   it('sets height and lineHeight from the argument', () => {
@@ -11,6 +17,27 @@ describe('lineStyles', () => {
   it('sets fontSize to 0 to eliminate the CSS strut', () => {
     const styles = lineStyles(20);
     expect(styles.fontSize).toBe('0');
+  });
+});
+
+describe('pageStyles', () => {
+  // SD-3456 / IT-1102: auto-numbered list markers (and any other text that
+  // inherits its color rather than carrying an explicit `<w:color>`) render
+  // invisible on dark-themed OSes because the browser default `canvastext`
+  // system color resolves to white on the white page. The page element must
+  // therefore set an explicit text color floor.
+  it('sets an explicit color on the page so document text does not inherit the OS canvastext system color', () => {
+    const styles = pageStyles(816, 1056);
+    expect(styles.color).toBe('var(--sd-layout-page-text, #000)');
+  });
+
+  it('lets consumers override the page color via the pageStyles option', () => {
+    const styles = pageStyles(816, 1056, { color: '#222' });
+    expect(styles.color).toBe('#222');
+  });
+
+  it('exposes the color default through DEFAULT_PAGE_STYLES so consumers and themes can read it', () => {
+    expect(DEFAULT_PAGE_STYLES.color).toBe('var(--sd-layout-page-text, #000)');
   });
 });
 

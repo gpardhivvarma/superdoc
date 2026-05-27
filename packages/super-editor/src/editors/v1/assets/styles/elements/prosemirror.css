@@ -19,6 +19,14 @@
   font-variant-ligatures: none;
   font-feature-settings: 'liga' 0; /* the above doesn't seem to work in Edge */
   z-index: 0; /* Needed to place images behind text with lower z-index */
+  /* SD-3456: `.sd-editor-scoped` applies `all: revert` to its descendants
+   * (see isolation.css), which reverts text color to the browser default
+   * `canvastext` system color. On dark-themed OSes that resolves to white,
+   * making any document text without an explicit <w:color> (e.g. auto-numbered
+   * list markers, untyped runs) invisible on the white page. Set an explicit
+   * color floor that mirrors the layout-engine page; consumers can override
+   * via --sd-layout-page-text. */
+  color: var(--sd-layout-page-text, #000);
 }
 
 .sd-editor-scoped .ProseMirror pre {
