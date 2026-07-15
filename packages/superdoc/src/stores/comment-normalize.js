@@ -16,6 +16,17 @@ export const getRichTextSupportedNodeNames = (extensions = []) =>
   );
 
 /**
+ * Visible whitespace-only leaf nodes that the reduced rich-text schema can't
+ * represent. Rather than dropping them (which would silently join surrounding
+ * words), map them to text so the separation survives in the rendered HTML.
+ */
+const VISIBLE_LEAF_NODE_TEXT = {
+  lineBreak: '\n',
+  hardBreak: '\n',
+  tab: '\t',
+};
+
+/**
  * Normalize imported DOCX comment JSON into content the reduced rich-text schema can
  * load. Unwraps `run` nodes, strips font attrs from `textStyle` marks, and drops any
  * node the rich-text schema does not register (e.g. `bookmarkStart`/`bookmarkEnd`),
@@ -42,17 +53,20 @@ export const normalizeCommentForEditor = (node, supportedNodeNames) => {
 
   // Drop invisible bookmark boundary nodes and any node absent from the rich-text
   // schema used to render comment HTML, preserving inline content they wrap so the
-  // visible text survives. Falls back to stripping only bookmark boundary nodes when
-  // the supported-node set can't be determined (size 0). (#3828)
+  // visible text survives. Visible whitespace leaves (line breaks, tabs) are mapped
+  // to text so the separation is not lost. Falls back to stripping only bookmark
+  // boundary nodes when the supported-node set can't be determined (size 0). (#3828)
   const isBoundaryNode = node.type === 'bookmarkStart' || node.type === 'bookmarkEnd';
   const isUnsupported = supportedNodeNames && supportedNodeNames.size > 0 && !supportedNodeNames.has(node.type);
   if (isBoundaryNode || isUnsupported) {
-    return Array.isArray(node.content)
-      ? node.content
-          .map((child) => normalizeCommentForEditor(child, supportedNodeNames))
-          .flat()
-          .filter(Boolean)
-      : null;
+    if (Array.isArray(node.content)) {
+      return node.content
+        .map((child) => normalizeCommentForEditor(child, supportedNodeNames))
+        .flat()
+        .filter(Boolean);
+    }
+    const visibleText = VISIBLE_LEAF_NODE_TEXT[node.type];
+    return visibleText !== undefined ? { type: 'text', text: visibleText } : null;
   }
 
   const stripTextStyleAttrs = (attrs) => {

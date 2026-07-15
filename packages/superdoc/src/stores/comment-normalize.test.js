@@ -103,6 +103,23 @@ describe('normalizeCommentForEditor', () => {
     ]);
   });
 
+  it('maps unsupported visible whitespace leaves (line breaks, tabs) to text', () => {
+    const node = {
+      type: 'paragraph',
+      content: [
+        { type: 'text', text: 'One' },
+        { type: 'lineBreak' },
+        { type: 'text', text: 'Two' },
+        { type: 'tab' },
+        { type: 'text', text: 'Three' },
+      ],
+    };
+    const [paragraph] = normalizeCommentForEditor([node], supported);
+    expect(collectTypes(paragraph)).not.toContain('lineBreak');
+    expect(collectTypes(paragraph)).not.toContain('tab');
+    expect(paragraph.content.map((n) => n.text).join('')).toBe('One\nTwo\tThree');
+  });
+
   it('passes supported nodes through and strips font attrs from textStyle marks', () => {
     const node = {
       type: 'paragraph',

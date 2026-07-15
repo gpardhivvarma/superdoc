@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createPinia, setActivePinia, defineStore } from 'pinia';
 import { ref, reactive } from 'vue';
 
@@ -103,6 +103,10 @@ describe('processLoadedDocxComments — bookmark nodes (#3828)', () => {
     setActivePinia(createPinia());
     store = useCommentsStore();
     __mockSuperdoc.documents.value = [{ id: 'doc-1', type: 'docx' }];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('imports a comment containing bookmark boundary nodes instead of dropping it', () => {
