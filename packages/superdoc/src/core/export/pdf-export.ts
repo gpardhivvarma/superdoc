@@ -387,6 +387,7 @@ function drawSvgVector(
   const vb = (svg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
   if (vb.length !== 4 || !vb[2] || !vb[3]) return false;
   const vw = vb[2];
+  const vh = vb[3];
   const sr = svg.getBoundingClientRect();
   const drawables = Array.from(svg.querySelectorAll('path, rect, line, polygon, polyline'));
   if (
@@ -395,7 +396,14 @@ function drawSvgVector(
   ) {
     return false;
   }
-  const scale = (sr.width / vw) * PT;
+  // `drawSvgPath` supports only a single uniform scale. If the viewBox→screen
+  // scale differs on x vs y (e.g. a footnote separator: 100×100 viewBox rendered
+  // 312×1), a uniform scale would distort the path — fall back to rasterizing,
+  // which reproduces the element at its exact rendered size.
+  const scaleX = sr.width / vw;
+  const scaleY = sr.height / vh;
+  if (Math.abs(scaleX - scaleY) > 0.02 * Math.max(scaleX, scaleY)) return false;
+  const scale = scaleX * PT;
   const originXpt = toX(sr.left);
   const originYpt = toY(sr.top);
   for (const el of drawables) {

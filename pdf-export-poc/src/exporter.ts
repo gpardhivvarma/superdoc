@@ -284,8 +284,15 @@ function drawSvgVector(
   ) {
     return false; // contains circle/ellipse we don't vectorize → raster whole thing
   }
+  // `drawSvgPath` supports only a single uniform scale. If the viewBox→screen
+  // scale differs on x vs y (e.g. a footnote separator: 100×100 viewBox rendered
+  // 312×1), a uniform scale would distort the path — fall back to rasterizing,
+  // which reproduces the element at its exact rendered size.
+  const scaleX = sr.width / vw;
+  const scaleY = sr.height / vh;
+  if (Math.abs(scaleX - scaleY) > 0.02 * Math.max(scaleX, scaleY)) return false;
   // viewBox units -> PDF points; drawSvgPath multiplies path coords by `scale`.
-  const scale = (sr.width / vw) * PT;
+  const scale = scaleX * PT;
   const originXpt = toX(sr.left);
   const originYpt = toY(sr.top);
   for (const el of drawables) {
