@@ -546,38 +546,63 @@ function hasRtl(str: string): boolean {
   return false;
 }
 
-/**
- * Reorder a logical-order string to VISUAL order for an RTL base line, so it can
- * be drawn left-to-right by pdf-lib and still read correctly. This is a level-1
- * bidi reorder (sufficient for footer fields like "עמוד 1 מתוך 2"): reverse the
- * whole line, then restore the internal left-to-right order of embedded
- * Latin/number runs. Hebrew needs no cursive shaping so simple reversal is exact;
- * Arabic would additionally need glyph shaping (HarfBuzz) we don't have.
- */
-function reorderRtlVisual(str: string): string {
-  const isLtr = (ch: string) => {
-    const cp = ch.codePointAt(0)!;
-    return (
-      (cp >= 0x0030 && cp <= 0x0039) || // digits
-      (cp >= 0x0041 && cp <= 0x005a) || // A-Z
-      (cp >= 0x0061 && cp <= 0x007a) || // a-z
-      (cp >= 0x00c0 && cp <= 0x024f) // Latin-1 supplement + extended
-    );
-  };
-  const chars = [...str].reverse();
+function isLtrCodePoint(cp: number): boolean {
+  return (
+    (cp >= 0x0030 && cp <= 0x0039) || // digits
+    (cp >= 0x0041 && cp <= 0x005a) || // A-Z
+    (cp >= 0x0061 && cp <= 0x007a) || // a-z
+    (cp >= 0x00c0 && cp <= 0x024f) // Latin-1 supplement + extended
+  );
+}
+// Reverse each maximal run of characters matched by `pick` (in place).
+function reverseRunsInPlace(chars: string[], pick: (ch: string) => boolean): void {
   let i = 0;
   while (i < chars.length) {
-    if (isLtr(chars[i])) {
+    if (pick(chars[i])) {
       let j = i + 1;
-      // extend across an LTR run, allowing single interior spaces between LTR chars
-      while (j < chars.length && (isLtr(chars[j]) || (chars[j] === ' ' && j + 1 < chars.length && isLtr(chars[j + 1]))))
+      // extend across the run, absorbing a single interior space between members
+      while (j < chars.length && (pick(chars[j]) || (chars[j] === ' ' && j + 1 < chars.length && pick(chars[j + 1]))))
         j++;
       const seg = chars.slice(i, j).reverse();
       for (let k = 0; k < seg.length; k++) chars[i + k] = seg[k];
       i = j;
     } else i++;
   }
+}
+/**
+ * Reorder a logical-order string to VISUAL order so pdf-lib's left-to-right draw
+ * reads correctly, for a line whose bidi resolves right-to-left — e.g. a footer
+ * field like "עמוד 1 מתוך 2", where the weak numbers get absorbed into the
+ * surrounding Hebrew and the whole line renders RTL even in an LTR container
+ * (verified against the browser's own layout). Level-1 bidi: reverse the whole
+ * line, then restore the internal left-to-right order of embedded Latin/number
+ * runs. Hebrew needs no cursive shaping so this is exact; Arabic joining still
+ * needs `mode: 'pixel'`.
+ */
+function reorderBidiVisual(str: string): string {
+  const isLtr = (ch: string) => isLtrCodePoint(ch.codePointAt(0)!);
+  const chars = [...str].reverse();
+  reverseRunsInPlace(chars, isLtr);
   return chars.join('');
+}
+
+/**
+ * Effective opacity of an element = product of the computed `opacity` of it and
+ * every ancestor up to (and including checks against) `stop`. SuperDoc dims
+ * headers/footers to `opacity: 0.5` in the editing view; honoring that keeps the
+ * vector export matching what the editor paints (and consistent with pixel mode,
+ * which captures it for free).
+ */
+function effectiveOpacity(el: Element, stop: Element): number {
+  let o = 1;
+  let n: Element | null = el;
+  while (n && n !== stop.parentElement) {
+    const v = parseFloat(getComputedStyle(n).opacity);
+    if (!Number.isNaN(v)) o *= v;
+    if (n === stop) break;
+    n = n.parentElement;
+  }
+  return o;
 }
 
 function paintsInFrontOfText(el: Element, pageEl: Element): boolean {
@@ -658,17 +683,18 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
     font: PDFFont,
     col: ReturnType<typeof rgb>,
     targetWpt: number,
+    opacity = 1,
   ) => {
     const natural = font.widthOfTextAtSize(word, sizePt);
     let sx = natural > 0.01 && targetWpt > 0.01 ? targetWpt / natural : 1;
     if (!Number.isFinite(sx) || sx <= 0) sx = 1;
     sx = Math.min(3, Math.max(0.2, sx));
     if (Math.abs(sx - 1) < 0.008) {
-      page.drawText(word, { x: xPt, y: yPt, size: sizePt, font, color: col });
+      page.drawText(word, { x: xPt, y: yPt, size: sizePt, font, color: col, opacity });
       return;
     }
     page.pushOperators(pushGraphicsState(), concatTransformationMatrix(sx, 0, 0, 1, 0, 0));
-    page.drawText(word, { x: xPt / sx, y: yPt, size: sizePt, font, color: col });
+    page.drawText(word, { x: xPt / sx, y: yPt, size: sizePt, font, color: col, opacity });
     page.pushOperators(popGraphicsState());
   };
 
@@ -814,6 +840,7 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
         const underline = /underline/.test(deco),
           strike = /line-through/.test(deco);
         const dcol = parseColor(isVisible(cs.textDecorationColor || '') ? cs.textDecorationColor : cs.color);
+
         const re = /\S+/g;
         let mm: RegExpExecArray | null;
         while ((mm = re.exec(value))) {
@@ -827,16 +854,8 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
             const primaryFace = await book.pick(cs.fontFamily, cs.fontWeight, cs.fontStyle);
             const cps = [...mm[0]].map((c) => c.codePointAt(0)!);
             const wholeCovered = cps.every((cp) => primaryFace.fk.hasGlyphForCodePoint(cp));
-            if (invisible) {
-              // invisible selectable-text layer (raster mode)
-              page.drawText(mm[0], {
-                x: toPdfX(rect.left),
-                y: toPdfY(baselineDom),
-                size: sizePx * PT,
-                font: primaryFace.pdf,
-                opacity: 0,
-              });
-            } else if (wholeCovered && mode !== 'glyph') {
+            const alpha = invisible ? 0 : 1;
+            if (!invisible && wholeCovered && mode !== 'glyph') {
               // fast path: primary font covers the whole token — keeps kerning
               drawWord(
                 page,
@@ -849,8 +868,12 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
                 rect.width * PT,
               );
             } else {
-              // per-character: 'glyph' mode (place every glyph at its measured x)
-              // OR the fallback path for CJK / symbols / mixed-coverage tokens.
+              // Per-character at each glyph's MEASURED VISUAL position: used for
+              // 'glyph' mode, CJK/symbol/mixed-coverage tokens, and the invisible
+              // selectable layer (pixel mode). Placing each glyph where it visibly
+              // sits — with a font that actually covers it — is what makes the
+              // pixel-mode text layer select accurately and copy real characters
+              // (incl. Hebrew/CJK), and lets a bidi-aware reader reorder RTL.
               let off = 0;
               const token = mm[0];
               for (const ch of token) {
@@ -871,6 +894,7 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
                   face.pdf,
                   rgb(color.r, color.g, color.b),
                   cr.width * PT,
+                  alpha,
                 );
               }
             }
@@ -919,17 +943,19 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
       const box = frag.getBoundingClientRect();
       if (box.width < 1) continue;
       // Field text is synthesized (real page numbers), so it isn't laid out in
-      // the DOM and can't borrow the browser's bidi like body text does. For an
-      // RTL field line (e.g. Hebrew "עמוד 1 מתוך 2") reorder to visual order so
-      // pdf-lib's left-to-right draw reads correctly.
-      const rtlField = getComputedStyle(frag).direction === 'rtl' || hasRtl(logical);
-      const str = rtlField ? reorderRtlVisual(logical) : logical;
+      // the DOM and can't borrow the browser's bidi like body text does. For a
+      // line containing RTL characters, reorder to visual order (honoring the
+      // fragment's base direction) so pdf-lib's left-to-right draw reads right.
+      const csFrag = getComputedStyle(frag);
+      const str = hasRtl(logical) ? reorderBidiVisual(logical) : logical;
       const sizePt = tpl.sizeHalfPt ? tpl.sizeHalfPt / 2 : 11;
       const sizePx = sizePt / PT;
-      const fam = getComputedStyle(frag).fontFamily || 'sans-serif';
+      const fam = csFrag.fontFamily || 'sans-serif';
       const { pdf: font } = await book.pickForToken(fam, 'normal', 'normal', str);
       const { asc, desc } = fontMetrics(`normal normal ${sizePx}px ${fam}`);
       const c = tpl.colorHex ? hexToRgb01(tpl.colorHex) : { r: 0, g: 0, b: 0 };
+      // SuperDoc dims headers/footers (opacity 0.5) in the editing view; match it.
+      const op = effectiveOpacity(frag, pageEl);
       const textWpt = font.widthOfTextAtSize(str, sizePt);
       const boxLeftPt = toPdfX(box.left);
       const boxWpt = box.width * PT;
@@ -938,7 +964,14 @@ export async function exportSuperDocToPdf(_superdoc: unknown, opts: ExportOption
       else if (tpl.align === 'right') xPt = boxLeftPt + boxWpt - textWpt;
       const baselineDom = box.top + box.height / 2 + (asc - desc) / 2;
       try {
-        page.drawText(str, { x: xPt, y: toPdfY(baselineDom), size: sizePt, font, color: rgb(c.r, c.g, c.b) });
+        page.drawText(str, {
+          x: xPt,
+          y: toPdfY(baselineDom),
+          size: sizePt,
+          font,
+          color: rgb(c.r, c.g, c.b),
+          opacity: op,
+        });
       } catch {
         /* skip */
       }

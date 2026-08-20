@@ -762,17 +762,18 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
     font: PDFFont,
     col: ReturnType<typeof rgb>,
     targetWpt: number,
+    opacity = 1,
   ) => {
     const natural = font.widthOfTextAtSize(word, sizePt);
     let sx = natural > 0.01 && targetWpt > 0.01 ? targetWpt / natural : 1;
     if (!Number.isFinite(sx) || sx <= 0) sx = 1;
     sx = Math.min(3, Math.max(0.2, sx));
     if (Math.abs(sx - 1) < 0.008) {
-      page.drawText(word, { x: xPt, y: yPt, size: sizePt, font, color: col });
+      page.drawText(word, { x: xPt, y: yPt, size: sizePt, font, color: col, opacity });
       return;
     }
     page.pushOperators(pushGraphicsState(), concatTransformationMatrix(sx, 0, 0, 1, 0, 0));
-    page.drawText(word, { x: xPt / sx, y: yPt, size: sizePt, font, color: col });
+    page.drawText(word, { x: xPt / sx, y: yPt, size: sizePt, font, color: col, opacity });
     page.pushOperators(popGraphicsState());
   };
 
@@ -988,16 +989,9 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
           try {
             const primaryFace = await book.pick(cs.fontFamily, cs.fontWeight, cs.fontStyle);
             const cps = [...mm[0]].map((c) => c.codePointAt(0)!);
-            if (invisible) {
-              // invisible selectable-text layer over the pixel-exact page image
-              page.drawText(mm[0], {
-                x: toX(rect.left),
-                y: toY(baselineDom),
-                size: sizePx * PT,
-                font: primaryFace.pdf,
-                opacity: 0,
-              });
-            } else if (cps.every((cp) => primaryFace.fk.hasGlyphForCodePoint(cp))) {
+            const wholeCovered = cps.every((cp) => primaryFace.fk.hasGlyphForCodePoint(cp));
+            const alpha = invisible ? 0 : 1;
+            if (!invisible && wholeCovered) {
               // fast path: primary font covers the whole token — keeps kerning
               drawWord(
                 page,
@@ -1010,8 +1004,14 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
                 rect.width * PT,
               );
             } else {
-              // per-character fallback (CJK, symbols, mixed scripts): draw each
-              // glyph with the best-covering face at its own measured position.
+              // Per-character at each glyph's MEASURED VISUAL position: the
+              // fallback path for CJK/symbols/mixed scripts, AND the invisible
+              // selectable layer (pixel mode). Placing each glyph where it
+              // visibly sits, with a font that actually covers it, is what makes
+              // the pixel-mode text layer select accurately and copy real
+              // characters (incl. Hebrew/CJK) — the primary font alone would
+              // embed uncovered glyphs as .notdef with no ToUnicode, so RTL/CJK
+              // text would copy out as nothing.
               let off = 0;
               for (const ch of mm[0]) {
                 const cRange = document.createRange();
@@ -1031,6 +1031,7 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
                   face.pdf,
                   rgb(color.r, color.g, color.b),
                   cr.width * PT,
+                  alpha,
                 );
               }
             }

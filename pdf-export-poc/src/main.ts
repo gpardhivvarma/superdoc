@@ -121,9 +121,10 @@ const originalExport = superdoc.export.bind(superdoc);
     showOverlay(true);
     try {
       if (restoreZoom) pm.setZoom(100);
-      // mode: ?mode= query param overrides the toolbar picker
-      const picker = document.querySelector<HTMLSelectElement>('#mode');
-      const mode = ((new URLSearchParams(location.search).get('mode') || picker?.value) as any) || undefined;
+      // Pixel mode: each page is rasterized by the browser's own engine, so the
+      // PDF is 100% identical to the editor. `?mode=word` still forces the
+      // vector path for comparison.
+      const mode = (new URLSearchParams(location.search).get('mode') as any) || 'pixel';
       bytes = await exportSuperDocToPdf(superdoc, { onProgress: progress, embeddedFonts, fieldTemplates, mode });
     } finally {
       if (restoreZoom) pm.setZoom(prevZoom);
