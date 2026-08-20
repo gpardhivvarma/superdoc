@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, vi } from 'vite-plus/test';
-import { clearMeasurementCache, configureMeasurement, measureBlock } from './index.js';
+import { clearMeasurementCache, clearTextMeasurementCaches, configureMeasurement, measureBlock } from './index.js';
 import type {
   FlowBlock,
   ParagraphMeasure,
@@ -8,12 +8,13 @@ import type {
   DrawingMeasure,
   DrawingBlock,
   TableMeasure,
+  Run,
   TabRun,
   TextRun,
   InlineBoxSpan,
   CellBorders,
 } from '@superdoc/contracts';
-import { EMPTY_SDT_PLACEHOLDER_TEXT } from '@superdoc/contracts';
+import { EMPTY_SDT_PLACEHOLDER_TEXT, expandRunsForInlineNewlines } from '@superdoc/contracts';
 import { resolvePhysicalFamily } from '@superdoc/font-system';
 
 const expectParagraphMeasure = (measure: Measure): ParagraphMeasure => {
@@ -35,6 +36,15 @@ const extractLineText = (block: FlowBlock, line: ParagraphMeasure['lines'][numbe
   return parts.join('');
 };
 
+const extractSegmentText = (block: FlowBlock, line: ParagraphMeasure['lines'][number]): string[] => {
+  if (block.kind !== 'paragraph') return [];
+  const runs = expandRunsForInlineNewlines(block.runs);
+  return (line.segments ?? []).map((segment) => {
+    const run = runs[segment.runIndex];
+    return run && 'text' in run ? run.text.slice(segment.fromChar, segment.toChar) : '';
+  });
+};
+
 const expectImageMeasure = (measure: Measure): ImageMeasure => {
   expect(measure.kind).toBe('image');
   return measure as ImageMeasure;
@@ -53,6 +63,172 @@ describe('measureBlock', () => {
   });
 
   describe('basic measurement', () => {
+    it('offers a measurement failure only to the exact block owner', async () => {
+      const sourceError = new Error('measurement-source-failure');
+      const ownedError = new Error('measurement-owned-failure');
+      const block = {
+        kind: 'paragraph',
+        id: 'owned-measurement-block',
+        get runs(): never {
+          throw sourceError;
+        },
+        attrs: {},
+      } as unknown as FlowBlock;
+      const owner = vi.fn(() => ownedError);
+      const constraints = { maxWidth: 1000, maxHeight: 1000 } as Record<PropertyKey, unknown>;
+      Object.defineProperty(constraints, Symbol.for('superdoc.v2.render-diagnostic.measurement-owner'), {
+        value: owner,
+      });
+
+      await expect(measureBlock(block, constraints as never)).rejects.toBe(ownedError);
+      expect(owner).toHaveBeenCalledTimes(1);
+      expect(owner).toHaveBeenCalledWith(block.id, sourceError);
+    });
+
+    it('preserves the exact nested textbox block owner', async () => {
+      const sourceError = new Error('nested-textbox-measurement-source-failure');
+      const ownedError = new Error('nested-textbox-measurement-owned-failure');
+      const nestedBlock = {
+        kind: 'paragraph',
+        id: 'nested-textbox-block',
+        get runs(): never {
+          throw sourceError;
+        },
+        attrs: {},
+      } as unknown as FlowBlock;
+      const drawing: DrawingBlock = {
+        kind: 'drawing',
+        id: 'textbox-carrier',
+        drawingKind: 'textboxShape',
+        geometry: { width: 240, height: 60, rotation: 0 },
+        contentBlocks: [nestedBlock as never],
+      };
+      const owner = vi.fn(() => ownedError);
+      const constraints = { maxWidth: 1000, maxHeight: 1000 } as Record<PropertyKey, unknown>;
+      Object.defineProperty(constraints, Symbol.for('superdoc.v2.render-diagnostic.measurement-owner'), {
+        value: owner,
+      });
+
+      await expect(measureBlock(drawing, constraints as never)).rejects.toBe(ownedError);
+      expect(owner).toHaveBeenCalledTimes(1);
+      expect(owner).toHaveBeenCalledWith(nestedBlock.id, sourceError);
+    });
+
+    it('preserves the nested textbox owner through a table cell', async () => {
+      const sourceError = new Error('table-textbox-measurement-source-failure');
+      const ownedError = new Error('table-textbox-measurement-owned-failure');
+      const nestedBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: 'table-nested-textbox-block',
+        runs: [
+          {
+            text: 'NESTED_TABLE_TEXTBOX_THROW',
+            fontFamily: 'NestedTableOwnerFault',
+            fontSize: 12,
+          },
+        ],
+      };
+      const drawing: DrawingBlock = {
+        kind: 'drawing',
+        id: 'table-textbox-carrier',
+        drawingKind: 'textboxShape',
+        geometry: { width: 240, height: 60, rotation: 0 },
+        contentBlocks: [nestedBlock as never],
+      };
+      const table: FlowBlock = {
+        kind: 'table',
+        id: 'table-textbox-owner',
+        columnWidths: [240],
+        rows: [
+          {
+            id: 'table-textbox-row',
+            cells: [{ id: 'table-textbox-cell', blocks: [drawing] }],
+          },
+        ],
+      };
+      const owner = vi.fn(() => ownedError);
+      const constraints = { maxWidth: 1000, maxHeight: 1000 } as Record<PropertyKey, unknown>;
+      Object.defineProperty(constraints, Symbol.for('superdoc.v2.render-diagnostic.measurement-owner'), {
+        value: owner,
+      });
+      clearTextMeasurementCaches();
+      let thrown: unknown;
+      try {
+        await measureBlock(table, constraints as never, {
+          fontSignature: 'nested-table-owner-test',
+          resolvePhysical(fontFamily, face) {
+            if (fontFamily === 'NestedTableOwnerFault') throw sourceError;
+            return resolvePhysicalFamily(fontFamily, face);
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(ownedError);
+      expect(owner).toHaveBeenCalledTimes(1);
+      expect(owner).toHaveBeenCalledWith(nestedBlock.id, sourceError);
+    });
+
+    it('lets the enclosing table own a declined cell measurement failure', async () => {
+      const sourceError = new Error('ordinary-table-cell-source-failure');
+      const ownedError = new Error('ordinary-table-owned-failure');
+      const cellBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: 'ordinary-table-cell-block',
+        runs: [
+          {
+            text: 'ORDINARY_TABLE_CELL_THROW',
+            fontFamily: 'OrdinaryTableCellFault',
+            fontSize: 12,
+          },
+        ],
+      };
+      const cellDrawing: DrawingBlock = {
+        kind: 'drawing',
+        id: 'ordinary-table-cell-drawing',
+        drawingKind: 'textboxShape',
+        geometry: { width: 240, height: 60, rotation: 0 },
+        contentBlocks: [cellBlock as never],
+      };
+      const table: FlowBlock = {
+        kind: 'table',
+        id: 'ordinary-table-owner',
+        columnWidths: [240],
+        rows: [
+          {
+            id: 'ordinary-table-row',
+            cells: [{ id: 'ordinary-table-cell', blocks: [cellDrawing] }],
+          },
+        ],
+      };
+      const owner = vi.fn((blockId: string, error: unknown) => (blockId === table.id ? ownedError : error));
+      const constraints = { maxWidth: 1000, maxHeight: 1000 } as Record<PropertyKey, unknown>;
+      Object.defineProperty(constraints, Symbol.for('superdoc.v2.render-diagnostic.measurement-owner'), {
+        value: owner,
+      });
+      clearTextMeasurementCaches();
+
+      let thrown: unknown;
+      try {
+        await measureBlock(table, constraints as never, {
+          fontSignature: 'ordinary-table-owner-test',
+          resolvePhysical(fontFamily, face) {
+            if (fontFamily === 'OrdinaryTableCellFault') throw sourceError;
+            return resolvePhysicalFamily(fontFamily, face);
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBe(ownedError);
+      expect(owner.mock.calls).toEqual([
+        [cellBlock.id, sourceError],
+        [cellDrawing.id, sourceError],
+        [table.id, sourceError],
+      ]);
+    });
+
     it('measures a simple single-line block', async () => {
       const block: FlowBlock = {
         kind: 'paragraph',
@@ -86,6 +262,83 @@ describe('measureBlock', () => {
       // lineHeight should be at least ascent + descent (+ safety margin)
       expect(measure.lines[0].lineHeight).toBeGreaterThanOrEqual(measure.lines[0].ascent + measure.lines[0].descent);
       expect(measure.totalHeight).toBe(measure.lines[0].lineHeight);
+    });
+
+    it('resolves one repeated physical font face once per paragraph', async () => {
+      const resolvePhysical = vi.fn((family: string) => family);
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'repeated-physical-face',
+        runs: Array.from({ length: 12 }, (_, index) => ({
+          text: `segment ${index} `,
+          fontFamily: 'Arial',
+          fontSize: index % 2 === 0 ? 16 : 18,
+        })),
+        attrs: {},
+      };
+
+      const measure = expectParagraphMeasure(
+        await measureBlock(block, 1000, { resolvePhysical, fontSignature: 'repeated-face' }),
+      );
+
+      expect(measure.lines.length).toBeGreaterThan(0);
+      expect(resolvePhysical).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps distinct physical font faces separate', async () => {
+      const resolvePhysical = vi.fn((family: string) => family);
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'distinct-physical-faces',
+        runs: [
+          { text: 'regular ', fontFamily: 'Arial', fontSize: 16 },
+          { text: 'bold ', fontFamily: 'Arial', fontSize: 16, bold: true },
+          { text: 'italic ', fontFamily: 'Arial', fontSize: 16, italic: true },
+          { text: 'other', fontFamily: 'Times New Roman', fontSize: 16 },
+        ],
+        attrs: {},
+      };
+
+      await measureBlock(block, 1000, { resolvePhysical, fontSignature: 'distinct-faces' });
+
+      expect(resolvePhysical).toHaveBeenCalledTimes(4);
+    });
+
+    it('preserves omitted font flags across paragraph-local font-info reuse', async () => {
+      const explicitThenOmitted: FlowBlock = {
+        kind: 'paragraph',
+        id: 'explicit-then-omitted-font-flags',
+        runs: [
+          { text: 'explicit', fontFamily: 'Arial', fontSize: 16, bold: false, italic: false },
+          { kind: 'lineBreak' },
+          { text: 'omitted', fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs: {},
+      };
+      const omittedThenExplicit: FlowBlock = {
+        kind: 'paragraph',
+        id: 'omitted-then-explicit-font-flags',
+        runs: [
+          { text: 'omitted', fontFamily: 'Arial', fontSize: 16 },
+          { kind: 'lineBreak' },
+          { text: 'explicit', fontFamily: 'Arial', fontSize: 16, bold: false, italic: false },
+        ],
+        attrs: {},
+      };
+
+      const explicitThenOmittedMeasure = expectParagraphMeasure(await measureBlock(explicitThenOmitted, 1000));
+      const omittedThenExplicitMeasure = expectParagraphMeasure(await measureBlock(omittedThenExplicit, 1000));
+      const maxFontInfo = (line: ParagraphMeasure['lines'][number]) =>
+        (line as ParagraphMeasure['lines'][number] & { maxFontInfo?: Pick<TextRun, 'bold' | 'italic'> }).maxFontInfo;
+
+      expect(explicitThenOmittedMeasure.lines).toHaveLength(2);
+      expect(maxFontInfo(explicitThenOmittedMeasure.lines[0])).toMatchObject({ bold: false, italic: false });
+      expect(maxFontInfo(explicitThenOmittedMeasure.lines[1])?.bold).toBeUndefined();
+      expect(maxFontInfo(explicitThenOmittedMeasure.lines[1])?.italic).toBeUndefined();
+      expect(omittedThenExplicitMeasure.lines).toHaveLength(2);
+      expect(maxFontInfo(omittedThenExplicitMeasure.lines[0])?.bold).toBeUndefined();
+      expect(maxFontInfo(omittedThenExplicitMeasure.lines[0])?.italic).toBeUndefined();
+      expect(maxFontInfo(omittedThenExplicitMeasure.lines[1])).toMatchObject({ bold: false, italic: false });
     });
 
     it('does not count empty text runs as justification spaces', async () => {
@@ -763,6 +1016,55 @@ describe('measureBlock', () => {
       }
     });
 
+    it('keeps measured newline-expanded run indexes aligned with the painter', async () => {
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'redline-newline-paragraph',
+        runs: [
+          {
+            text: '[______]',
+            fontFamily: 'Times New Roman',
+            fontSize: 14.67,
+          },
+          {
+            text: 'Review Heading:\n\nLOREM IPSUM DOLOR SIT AMET CONSECTETUR ADIPISCING ELIT SED DO EIUSMOD TEMPOR INCIDIDUNT UT LABORE ET DOLORE MAGNA ALIQUA:',
+            fontFamily: 'Times New Roman',
+            fontSize: 14.67,
+          },
+        ],
+        attrs: { indent: { left: 1.5333333333333332 } },
+      };
+      const expandedRuns = expandRunsForInlineNewlines((block as { runs: Run[] }).runs);
+      const expandedLineText = (line: ParagraphMeasure['lines'][number]): string => {
+        const parts: string[] = [];
+        for (let runIndex = line.fromRun; runIndex <= line.toRun; runIndex += 1) {
+          const run = expandedRuns[runIndex] as { text?: string } | undefined;
+          if (!run || typeof run.text !== 'string') continue;
+          const start = runIndex === line.fromRun ? line.fromChar : 0;
+          const end = runIndex === line.toRun ? line.toChar : run.text.length;
+          parts.push(run.text.slice(start, end));
+        }
+        return parts.join('');
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 601.333));
+      const lineTexts = measure.lines.map(expandedLineText);
+
+      for (const line of measure.lines) {
+        expect(line.fromRun).toBeLessThan(expandedRuns.length);
+        expect(line.toRun).toBeLessThan(expandedRuns.length);
+        for (const segment of line.segments ?? []) {
+          expect(segment.runIndex).toBeLessThan(expandedRuns.length);
+        }
+      }
+      expect(lineTexts).toContain('[______]Review Heading:');
+      expect(lineTexts.some((text) => text.startsWith('LOREM IPSUM'))).toBe(true);
+      expect(lineTexts.some((text) => text.endsWith('MAGNA ALIQUA:'))).toBe(true);
+      expect(lineTexts.join('')).toContain(
+        'LOREM IPSUM DOLOR SIT AMET CONSECTETUR ADIPISCING ELIT SED DO EIUSMOD TEMPOR INCIDIDUNT UT LABORE ET DOLORE MAGNA ALIQUA:',
+      );
+    });
+
     it('falls back when text runs are missing font size', async () => {
       const block: FlowBlock = {
         kind: 'paragraph',
@@ -975,6 +1277,49 @@ describe('measureBlock', () => {
       const measure = expectParagraphMeasure(await measureBlock(block, maxWidth));
       // When textStartPx > indentLeft, available width = maxWidth - textStartPx
       expect(measure.lines[0].maxWidth).toBe(maxWidth - textStartPx);
+    });
+
+    it('uses resolved list text start when an explicit suffix tab lands before indentLeft', async () => {
+      const maxWidth = 200;
+      const resolvedTextStartPx = 42;
+      const indentLeft = 90;
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'wordlayout-list-suffix-tab-before-indent',
+        runs: [
+          {
+            text: 'List item text should budget the first line from the rendered suffix tab',
+            fontFamily: 'Times New Roman',
+            fontSize: 16,
+          },
+        ],
+        attrs: {
+          indent: { left: indentLeft, hanging: 66 },
+          wordLayout: {
+            indentLeftPx: indentLeft,
+            textStartPx: indentLeft,
+            tabsPx: [resolvedTextStartPx],
+            marker: {
+              markerText: '•',
+              glyphWidthPx: 6,
+              markerBoxWidthPx: 66,
+              gutterWidthPx: 8,
+              suffix: 'tab',
+              run: {
+                fontFamily: 'Times New Roman',
+                fontSize: 16,
+                bold: false,
+                italic: false,
+                letterSpacing: 0,
+              },
+            },
+          },
+        },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, maxWidth));
+
+      expect(measure.lines[0].maxWidth).toBe(maxWidth - resolvedTextStartPx);
     });
 
     it('uses shared resolver output when only marker.textStartX exists in standard mode', async () => {
@@ -1832,6 +2177,44 @@ describe('measureBlock', () => {
       expect(measure.lines[0].lineHeight).toBeCloseTo(1.5 * 1.15 * fontSize, 1);
     });
 
+    it('keeps Calibri line metrics when Carlito is the physical substitute', async () => {
+      const fontSize = 12;
+      const canvasContext = {
+        font: '',
+        fontKerning: 'auto',
+        measureText: vi.fn((text: string) => ({
+          width: text.length * 6,
+          actualBoundingBoxAscent: 9,
+          actualBoundingBoxDescent: 2,
+        })),
+      } as unknown as CanvasRenderingContext2D;
+      const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(canvasContext);
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'calibri-through-carlito-line-height',
+        runs: [{ text: 'Order form text', fontFamily: 'Calibri, sans-serif', fontSize }],
+        attrs: {
+          spacing: { line: 216 / 240, lineUnit: 'multiplier', lineRule: 'auto' },
+        },
+      };
+
+      clearTextMeasurementCaches();
+      try {
+        const measure = expectParagraphMeasure(
+          await measureBlock(block, 400, {
+            fontSignature: 'calibri-through-carlito',
+            resolvePhysical: () => 'Carlito, sans-serif',
+          }),
+        );
+
+        expect(canvasContext.font).toBe('12px Carlito, sans-serif');
+        expect(measure.lines[0].lineHeight).toBeCloseTo(fontSize * 1.219 * (216 / 240), 4);
+      } finally {
+        getContext.mockRestore();
+        clearTextMeasurementCaches();
+      }
+    });
+
     it('applies higher auto multipliers to the baseline line height', async () => {
       const fontSize = 16;
       const block: FlowBlock = {
@@ -2493,6 +2876,209 @@ describe('measureBlock', () => {
         expect(tabRun.width).toBeGreaterThan(0);
         // Width should move text to position near 200px
         expect(tabRun.width).toBeLessThan(200);
+      }
+    });
+
+    it('keeps literal-tab segment coordinates aligned with authored run boundaries', async () => {
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'sd-3886-literal-tab-run-boundary',
+        runs: [
+          { text: '1.2\tName. ', fontFamily: 'Arial', fontSize: 16, bold: true },
+          { text: 'Body', fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs: { tabs: [{ pos: 480, val: 'start' }] },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 1000));
+      const paintedSegments = extractSegmentText(block, measure.lines[0]);
+
+      expect(paintedSegments.join('')).toBe('1.2Name. Body');
+      expect(paintedSegments.at(-1)).toBe('Body');
+      expect(measure.lines[0]).toMatchObject({ fromRun: 0, fromChar: 0, toRun: 1, toChar: 4 });
+    });
+
+    it.each([
+      { label: 'at the start', literal: '\tName', visibleRanges: [[1, 5]] },
+      { label: 'at the end', literal: 'Name\t', visibleRanges: [[0, 4]] },
+      {
+        label: 'multiple times',
+        literal: 'A\tB\tC',
+        visibleRanges: [
+          [0, 1],
+          [2, 3],
+          [4, 5],
+        ],
+      },
+      {
+        label: 'consecutively',
+        literal: 'A\t\tB',
+        visibleRanges: [
+          [0, 1],
+          [3, 4],
+        ],
+      },
+    ])('preserves source coordinates when a literal tab occurs $label', async ({ label, literal, visibleRanges }) => {
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: `literal-tab-${label.replaceAll(' ', '-')}`,
+        runs: [
+          {
+            text: literal,
+            fontFamily: 'Arial',
+            fontSize: 16,
+            bold: true,
+            pmStart: 100,
+            pmEnd: 100 + literal.length,
+          },
+          {
+            text: 'Tail',
+            fontFamily: 'Arial',
+            fontSize: 16,
+            pmStart: 100 + literal.length,
+            pmEnd: 104 + literal.length,
+          },
+        ],
+        attrs: {
+          tabs: [
+            { pos: 480, val: 'start' },
+            { pos: 960, val: 'start' },
+          ],
+        },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 1000));
+      const line = measure.lines[0];
+      const literalSegments = line.segments?.filter((segment) => segment.runIndex === 0) ?? [];
+      const tailSegment = line.segments?.at(-1);
+
+      expect(measure.lines).toHaveLength(1);
+      expect(extractSegmentText(block, line).join('')).toBe(`${literal.replaceAll('\t', '')}Tail`);
+      expect(literalSegments.map(({ fromChar, toChar }) => [fromChar, toChar])).toEqual(visibleRanges);
+      expect(tailSegment).toMatchObject({ runIndex: 1, fromChar: 0, toChar: 4 });
+      expect(line).toMatchObject({ fromRun: 0, fromChar: 0, toRun: 1, toChar: 4 });
+    });
+
+    it('keeps literal-tab coordinates aligned across wrapping and an adjacent run', async () => {
+      const body = 'BodyTextThatWrapsAcrossSeveralLines';
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'literal-tab-wrapping',
+        runs: [
+          { text: '1.2\tHeading', fontFamily: 'Arial', fontSize: 16, bold: true },
+          { text: body, fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs: { tabs: [{ pos: 480, val: 'start' }] },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 110));
+      const paintedText = measure.lines.flatMap((line) => extractSegmentText(block, line)).join('');
+
+      expect(measure.lines.length).toBeGreaterThan(1);
+      expect(paintedText).toBe(`1.2Heading${body}`);
+      expect(paintedText.match(/1\.2/g)).toHaveLength(1);
+      expect(measure.lines.flatMap((line) => line.segments ?? []).some((segment) => segment.runIndex === 1)).toBe(true);
+    });
+
+    it('composes literal-tab remapping with inline-newline expansion', async () => {
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'literal-tab-inline-newline',
+        runs: [
+          { text: 'First\n1.2\tHeading', fontFamily: 'Arial', fontSize: 16, bold: true },
+          { text: 'Body', fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs: { tabs: [{ pos: 480, val: 'start' }] },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 1000));
+      const paintedLines = measure.lines.map((line) => extractSegmentText(block, line).join(''));
+
+      expect(paintedLines).toEqual(['First', '1.2HeadingBody']);
+      expect(paintedLines.join('').match(/1\.2/g)).toHaveLength(1);
+      expect(measure.lines[1].segments?.at(-1)).toMatchObject({ runIndex: 3, fromChar: 0, toChar: 4 });
+    });
+
+    it('preserves authored run indexes when bookmark markers surround a literal tab', async () => {
+      const block: FlowBlock = {
+        kind: 'paragraph',
+        id: 'literal-tab-bookmark-markers',
+        runs: [
+          {
+            text: '\u200B',
+            fontFamily: 'Arial',
+            fontSize: 16,
+            dataAttrs: { 'data-bookmark-marker': 'start', 'data-bookmark-id': '3886' },
+          },
+          { text: '1.2\tHeading', fontFamily: 'Arial', fontSize: 16, bold: true },
+          {
+            text: '\u200B',
+            fontFamily: 'Arial',
+            fontSize: 16,
+            dataAttrs: { 'data-bookmark-marker': 'end', 'data-bookmark-id': '3886' },
+          },
+          { text: 'Body', fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs: { tabs: [{ pos: 480, val: 'start' }] },
+      };
+
+      const measure = expectParagraphMeasure(await measureBlock(block, 1000));
+      const line = measure.lines[0];
+
+      expect(extractSegmentText(block, line).join('')).toBe('1.2HeadingBody');
+      expect(line.segments?.filter((segment) => segment.runIndex === 1).map((segment) => segment.fromChar)).toEqual([
+        0, 4,
+      ]);
+      expect(line.segments?.at(-1)).toMatchObject({ runIndex: 3, fromChar: 0, toChar: 4 });
+    });
+
+    it.each([
+      { val: 'start' as const },
+      { val: 'center' as const },
+      { val: 'end' as const, leader: 'dot' as const },
+      { val: 'decimal' as const },
+    ])('matches canonical tab geometry for a $val-aligned tab stop', async ({ val, leader }) => {
+      const attrs = { tabs: [{ pos: 2400, val, ...(leader ? { leader } : {}) }] };
+      const literalBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: `literal-${val}-tab`,
+        runs: [{ text: 'Label\t12.34', fontFamily: 'Arial', fontSize: 16 }],
+        attrs,
+      };
+      const canonicalBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: `canonical-${val}-tab`,
+        runs: [
+          { text: 'Label', fontFamily: 'Arial', fontSize: 16 },
+          { kind: 'tab', text: '\t', tabIndex: 0 },
+          { text: '12.34', fontFamily: 'Arial', fontSize: 16 },
+        ],
+        attrs,
+      };
+
+      const [literalMeasure, canonicalMeasure] = await Promise.all([
+        measureBlock(literalBlock, 400).then(expectParagraphMeasure),
+        measureBlock(canonicalBlock, 400).then(expectParagraphMeasure),
+      ]);
+      const literalValue = literalMeasure.lines[0].segments?.find(
+        (segment) =>
+          extractSegmentText(literalBlock, { ...literalMeasure.lines[0], segments: [segment] })[0] === '12.34',
+      );
+      const canonicalValue = canonicalMeasure.lines[0].segments?.find((segment) => segment.runIndex === 2);
+
+      expect(extractSegmentText(literalBlock, literalMeasure.lines[0]).join('')).toBe('Label12.34');
+      expect(literalValue?.x).toBeCloseTo(canonicalValue?.x ?? Number.NaN, 3);
+      expect(literalMeasure.lines[0].width).toBeCloseTo(canonicalMeasure.lines[0].width, 3);
+      if (leader) {
+        expect(literalMeasure.lines[0].leaders?.[0]).toMatchObject({ style: leader });
+        expect(literalMeasure.lines[0].leaders?.[0]?.from).toBeCloseTo(
+          canonicalMeasure.lines[0].leaders?.[0]?.from ?? Number.NaN,
+          3,
+        );
+        expect(literalMeasure.lines[0].leaders?.[0]?.to).toBeCloseTo(
+          canonicalMeasure.lines[0].leaders?.[0]?.to ?? Number.NaN,
+          3,
+        );
       }
     });
 
@@ -4790,6 +5376,128 @@ describe('measureBlock', () => {
       expect(measure.contentMeasures?.[0].lines.length ?? 0).toBeGreaterThan(1);
     });
 
+    it('keeps a baseline-warp auto-fit shape on one logical line while growing its frame', async () => {
+      const block: DrawingBlock = {
+        kind: 'drawing',
+        id: 'autofit-baseline-warp',
+        drawingKind: 'textboxShape',
+        geometry: { width: 80, height: 80, rotation: 0 },
+        autoFit: true,
+        textInsets: { top: 0, right: 4, bottom: 0, left: 4 },
+        textLayout: { wrap: 'none', horizontalOverflow: 'overflow' },
+        textWarp: { preset: 'textArchUp' },
+        contentBlocks: [
+          {
+            kind: 'paragraph',
+            id: 'autofit-baseline-warp-paragraph',
+            runs: [
+              {
+                text: 'A deliberately long WordArt baseline that must not wrap',
+                fontFamily: 'Arial',
+                fontSize: 20,
+              },
+            ],
+          },
+        ],
+      };
+
+      const measure = expectDrawingMeasure(await measureBlock(block, { maxWidth: 200 }));
+
+      expect(measure.geometry.width).toBe(200);
+      expect(measure.contentMeasures?.[0].lines).toHaveLength(1);
+      expect(measure.geometry.height).toBe(measure.contentMeasures?.[0].totalHeight);
+    });
+
+    it('sizes short baseline-warp auto-fit shapes to their natural unwrapped advance', async () => {
+      const block: DrawingBlock = {
+        kind: 'drawing',
+        id: 'autofit-short-baseline-warp',
+        drawingKind: 'textboxShape',
+        geometry: { width: 80, height: 80, rotation: 0 },
+        autoFit: true,
+        textInsets: { top: 0, right: 4, bottom: 0, left: 4 },
+        textLayout: { wrap: 'none', horizontalOverflow: 'overflow' },
+        textWarp: { preset: 'textArchUp' },
+        contentBlocks: [
+          {
+            kind: 'paragraph',
+            id: 'autofit-short-baseline-warp-paragraph',
+            runs: [{ text: 'Arc', fontFamily: 'Arial', fontSize: 20 }],
+          },
+        ],
+      };
+
+      const measure = expectDrawingMeasure(await measureBlock(block, { maxWidth: 200 }));
+      const paragraph = measure.contentMeasures?.[0];
+
+      expect(paragraph?.kind).toBe('paragraph');
+      if (paragraph?.kind !== 'paragraph') throw new Error('expected paragraph measure');
+      expect(paragraph.lines).toHaveLength(1);
+      expect(measure.geometry.width).toBeCloseTo(paragraph.lines[0].width + 8);
+      expect(measure.geometry.width).toBeLessThan(200);
+    });
+
+    it('sizes short single-band envelope auto-fit shapes to their natural advance', async () => {
+      const block: DrawingBlock = {
+        kind: 'drawing',
+        id: 'autofit-short-single-band-envelope',
+        drawingKind: 'textboxShape',
+        geometry: { width: 80, height: 80, rotation: 0 },
+        autoFit: true,
+        textInsets: { top: 0, right: 4, bottom: 0, left: 4 },
+        textLayout: { wrap: 'none', horizontalOverflow: 'overflow' },
+        textWarp: { preset: 'textButton' },
+        contentBlocks: [
+          {
+            kind: 'paragraph',
+            id: 'autofit-short-single-band-envelope-paragraph',
+            runs: [{ text: 'Word Art', fontFamily: 'Arial', fontSize: 20 }],
+          },
+        ],
+      };
+
+      const measure = expectDrawingMeasure(await measureBlock(block, { maxWidth: 200 }));
+      const paragraph = measure.contentMeasures?.[0];
+
+      expect(paragraph?.kind).toBe('paragraph');
+      if (paragraph?.kind !== 'paragraph') throw new Error('expected paragraph measure');
+      expect(paragraph.lines).toHaveLength(1);
+      expect(measure.geometry.width).toBeCloseTo(paragraph.lines[0].width + 8);
+      expect(measure.geometry.width).toBeLessThan(200);
+    });
+
+    it('caps long textButton auto-fit shapes without recomposing the logical baseline', async () => {
+      const block: DrawingBlock = {
+        kind: 'drawing',
+        id: 'autofit-long-single-band-envelope',
+        drawingKind: 'textboxShape',
+        geometry: { width: 80, height: 80, rotation: 0 },
+        autoFit: true,
+        textInsets: { top: 0, right: 4, bottom: 0, left: 4 },
+        textLayout: { wrap: 'none', horizontalOverflow: 'overflow' },
+        textWarp: { preset: 'textButton' },
+        contentBlocks: [
+          {
+            kind: 'paragraph',
+            id: 'autofit-long-single-band-envelope-paragraph',
+            runs: [
+              {
+                text: 'Word Art that inserts as object and keeps extending beyond the available width',
+                fontFamily: 'Arial',
+                fontSize: 20,
+              },
+            ],
+          },
+        ],
+      };
+
+      const measure = expectDrawingMeasure(await measureBlock(block, { maxWidth: 200 }));
+
+      expect(measure.geometry.width).toBeLessThanOrEqual(200);
+      expect(measure.geometry.width).toBeGreaterThan(190);
+      expect(measure.contentMeasures?.[0].lines).toHaveLength(1);
+    });
+
     it('measures textbox tables with canonical auto, atLeast, and exact row-height semantics', async () => {
       const measureVariant = async (rule: 'auto' | 'atLeast' | 'exact', value: number) => {
         const block: DrawingBlock = {
@@ -5020,14 +5728,15 @@ describe('measureBlock', () => {
         id: 'footer-connector',
         drawingKind: 'vectorShape',
         shapeKind: 'line',
-        geometry: { width: 703, height: 8, rotation: 0 },
-        effectExtent: { left: 3, top: 3, right: 5, bottom: 4 },
+        geometry: { width: 700, height: 8, rotation: 0 },
+        effectExtent: { left: 0, top: 3, right: 5, bottom: 4 },
         strokeColor: '#7CE0D3',
         strokeWidth: 6,
+        strokeLineCap: 'butt',
       };
 
       const measure = expectDrawingMeasure(await measureBlock(block, { maxWidth: 697, maxHeight: 100 }));
-      expect(measure.width).toBe(703);
+      expect(measure.width).toBe(700);
       expect(measure.height).toBe(8);
       expect(measure.scale).toBe(1);
     });
@@ -5332,6 +6041,60 @@ describe('measureBlock', () => {
       if (measure.kind !== 'table') throw new Error('expected table measure');
       expect(measure.rows.map((row) => row.height)).toEqual([41, 41]);
       expect(measure.totalHeight).toBe(82);
+    });
+
+    it('adds vertical cell padding outside an authored atLeast row height', async () => {
+      const borderWidth = 2 / 3;
+      const verticalPadding = 3.8;
+      const block: FlowBlock = {
+        kind: 'table',
+        id: 'table-at-least-height-with-cell-padding',
+        attrs: {
+          borders: {
+            top: { style: 'single', width: borderWidth },
+            right: { style: 'single', width: borderWidth },
+            bottom: { style: 'single', width: borderWidth },
+            left: { style: 'single', width: borderWidth },
+            insideH: { style: 'single', width: borderWidth },
+            insideV: { style: 'single', width: borderWidth },
+          },
+        },
+        columnWidths: [450.2],
+        rows: [
+          {
+            id: 'first-name-row',
+            attrs: { rowHeight: { rule: 'atLeast', value: 19.6 } },
+            cells: [
+              {
+                id: 'first-name-cell',
+                attrs: {
+                  padding: { top: verticalPadding, right: 7.2, bottom: verticalPadding, left: 7.2 },
+                },
+                blocks: [
+                  {
+                    kind: 'paragraph',
+                    id: 'first-name-paragraph',
+                    runs: [{ text: 'First name', fontFamily: 'Calibri, sans-serif', fontSize: 12 }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const measure = await measureBlock(
+        block,
+        { maxWidth: 600 },
+        {
+          fontSignature: 'template-data-table-row',
+          resolvePhysical: () => 'Carlito, sans-serif',
+        },
+      );
+
+      expect(measure.kind).toBe('table');
+      if (measure.kind !== 'table') throw new Error('expected table measure');
+      expect(measure.rows[0]?.height).toBeCloseTo(19.6 + verticalPadding * 2 + borderWidth, 4);
     });
 
     it('uses provided column widths from w:tblGrid', async () => {

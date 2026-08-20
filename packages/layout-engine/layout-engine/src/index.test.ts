@@ -1,6 +1,7 @@
 import { describe, expect, it, mock } from 'bun:test';
 import type {
   FlowBlock,
+  Layout,
   Measure,
   Line,
   ParagraphMeasure,
@@ -113,6 +114,153 @@ const DEFAULT_OPTIONS: LayoutOptions = {
   pageSize: { w: 600, h: 800 },
   margins: { top: 50, right: 50, bottom: 50, left: 50 },
 };
+
+it('offers a deterministic pagination input failure only to its exact block owner', () => {
+  const options = { ...DEFAULT_OPTIONS };
+  const owner = mock(
+    (input: { blockIds: readonly string[]; debugDetail: unknown; phase: string; progress?: unknown }) => {
+      expect(input.blockIds).toEqual(['block-1']);
+      expect(input.debugDetail).toBeInstanceOf(Error);
+      expect(input.phase).toBe('input');
+      expect(input.progress).toBeUndefined();
+      return new Error('owned-pagination-failure');
+    },
+  );
+  Object.defineProperty(options, Symbol.for('superdoc.v2.render-diagnostic.pagination-owner'), {
+    configurable: true,
+    value: owner,
+  });
+
+  expect(() => layoutDocument([block], [{ kind: 'pageBreak' }], options)).toThrow('owned-pagination-failure');
+  expect(owner).toHaveBeenCalledTimes(1);
+});
+
+it('offers a supported table dispatch failure only to its exact block owner', () => {
+  const options = { ...DEFAULT_OPTIONS };
+  const owner = mock((input: { blockIds: readonly string[]; debugDetail: unknown }) => {
+    expect(input.blockIds).toEqual(['owned-table']);
+    expect(input.debugDetail).toBeInstanceOf(Error);
+    expect((input.debugDetail as Error).message).toContain('table-dispatch-fault');
+    return new Error('owned-table-pagination-failure');
+  });
+  Object.defineProperty(options, Symbol.for('superdoc.v2.render-diagnostic.pagination-owner'), {
+    configurable: true,
+    value: owner,
+  });
+
+  const faultedMeasure = makeTableMeasure([100], [20]);
+  Object.defineProperty(faultedMeasure, 'rows', {
+    configurable: true,
+    get() {
+      throw new Error('table-dispatch-fault');
+    },
+  });
+  expect(() => layoutDocument([makeTableBlock('owned-table', 1)], [faultedMeasure], options)).toThrow(
+    'owned-table-pagination-failure',
+  );
+  expect(owner).toHaveBeenCalledTimes(1);
+});
+
+it('offers a late paragraph pagination failure only to its active block owner', () => {
+  const options = { ...DEFAULT_OPTIONS };
+  const owner = mock(
+    (input: {
+      blockIds: readonly string[];
+      debugDetail: unknown;
+      phase: string;
+      progress?: {
+        blocks: FlowBlock[];
+        measures: Measure[];
+        layout: Layout;
+        failedBlockId: string;
+        sourcePageRange: { firstPage: number; lastPage: number };
+      };
+    }) => {
+      expect(input.blockIds).toEqual(['late-paragraph']);
+      expect((input.debugDetail as Error).message).toContain('late-pagination-fault');
+      expect(input.phase).toBe('dispatch');
+      expect(input.progress).toMatchObject({
+        failedBlockId: 'late-paragraph',
+        sourcePageRange: { firstPage: 0, lastPage: 0 },
+      });
+      expect(input.progress?.blocks.map((entry) => entry.id)).toEqual(['late-paragraph']);
+      expect(input.progress?.measures).toHaveLength(1);
+      expect(input.progress?.layout.pages).toHaveLength(1);
+      expect(input.progress?.layout.pages[0]?.fragments).toEqual([]);
+      expect(
+        (input.progress?.layout as Layout & Record<PropertyKey, unknown>)[
+          Symbol.for('superdoc.v2.render-diagnostic.pagination-prefix')
+        ],
+      ).toEqual({ blockId: 'late-paragraph', pageIndex: 0 });
+      return new Error('owned-late-pagination-failure');
+    },
+  );
+  Object.defineProperty(options, Symbol.for('superdoc.v2.render-diagnostic.pagination-owner'), {
+    configurable: true,
+    value: owner,
+  });
+  const measure = makeMeasure([20]);
+  Object.defineProperty(measure, 'lines', {
+    configurable: true,
+    get() {
+      throw new Error('late-pagination-fault');
+    },
+  });
+
+  expect(() => layoutDocument([{ ...block, id: 'late-paragraph' }], [measure], options)).toThrow(
+    'owned-late-pagination-failure',
+  );
+  expect(owner).toHaveBeenCalledTimes(1);
+});
+
+it('does not offer the page-boundary early-stop sentinel to a block owner', () => {
+  const owner = mock(() => new Error('must-not-own-pagination-early-stop'));
+  const options = {
+    ...DEFAULT_OPTIONS,
+    pageBoundary: { shouldStopBeforeNewPage: () => true },
+  };
+  Object.defineProperty(options, Symbol.for('superdoc.v2.render-diagnostic.pagination-owner'), {
+    configurable: true,
+    value: owner,
+  });
+
+  const layout = layoutDocument(
+    [
+      { ...block, id: 'first-page-paragraph' },
+      { ...block, id: 'second-page-paragraph' },
+    ],
+    [makeMeasure([600]), makeMeasure([600])],
+    options,
+  );
+
+  expect(layout.pages).toHaveLength(1);
+  expect(owner).not.toHaveBeenCalled();
+});
+
+it('preserves the exact pagination owner through header/footer layout', () => {
+  const constraints = { width: 400, height: 80 };
+  const owner = mock((input: { blockIds: readonly string[]; debugDetail: unknown }) => {
+    expect(input.blockIds).toEqual(['owned-header-table']);
+    expect((input.debugDetail as Error).message).toContain('header-table-dispatch-fault');
+    return new Error('owned-header-pagination-failure');
+  });
+  Object.defineProperty(constraints, Symbol.for('superdoc.v2.render-diagnostic.pagination-owner'), {
+    configurable: true,
+    value: owner,
+  });
+  const faultedMeasure = makeTableMeasure([100], [20]);
+  Object.defineProperty(faultedMeasure, 'rows', {
+    configurable: true,
+    get() {
+      throw new Error('header-table-dispatch-fault');
+    },
+  });
+
+  expect(() =>
+    layoutHeaderFooter([makeTableBlock('owned-header-table', 1)], [faultedMeasure], constraints, 'header'),
+  ).toThrow('owned-header-pagination-failure');
+  expect(owner).toHaveBeenCalledTimes(1);
+});
 
 /**
  * Helper to check if a page contains a block with the given ID.
@@ -3688,6 +3836,73 @@ describe('layoutDocument', () => {
       expect(layout.pages[1].fragments[0].blockId).toBe('p2');
     });
 
+    it('places a paragraph-anchored image whose empty carrier precedes a sectPr marker', () => {
+      const blocks: FlowBlock[] = [
+        { kind: 'paragraph', id: 'p1', runs: [{ text: 'Content', fontFamily: 'Arial', fontSize: 12 }] },
+        {
+          kind: 'image',
+          id: 'anchored-image',
+          src: 'data:image/png;base64,AA==',
+          width: 120,
+          height: 80,
+          anchor: {
+            isAnchored: true,
+            hRelativeFrom: 'page',
+            vRelativeFrom: 'paragraph',
+            offsetH: 160,
+            offsetV: 8,
+          },
+          wrap: { type: 'TopAndBottom', distTop: 0, distBottom: 0, distLeft: 0, distRight: 0 },
+          attrs: { anchorParagraphId: 'image-carrier' },
+        },
+        {
+          kind: 'paragraph',
+          id: 'image-carrier',
+          runs: [{ text: '', fontFamily: 'Arial', fontSize: 12 }],
+        },
+        {
+          kind: 'paragraph',
+          id: 'sectPr-marker',
+          runs: [{ text: '', fontFamily: 'Arial', fontSize: 12 }],
+          attrs: { sectPrMarker: true },
+        },
+        {
+          kind: 'sectionBreak',
+          id: 'sb1',
+          type: 'nextPage',
+          margins: {},
+          pageSize: { w: 612, h: 792 },
+          columns: { count: 1, gap: 0 },
+          attrs: { source: 'sectPr' },
+        },
+        { kind: 'paragraph', id: 'p2', runs: [{ text: 'After', fontFamily: 'Arial', fontSize: 12 }] },
+      ];
+      const measures: Measure[] = [
+        // Put the carrier close enough to the page bottom that the generic
+        // paragraph-relative fit guard would move the image to an extra page.
+        // A section-boundary carrier must remain attached to the preceding
+        // section instead.
+        makeMeasure([580]),
+        { kind: 'image', width: 120, height: 80 },
+        makeMeasure([16]),
+        makeMeasure([16]),
+        { kind: 'sectionBreak' },
+        makeMeasure([20]),
+      ];
+
+      const layout = layoutDocument(blocks, measures, {
+        pageSize: { w: 612, h: 792 },
+        margins: { top: 72, right: 72, bottom: 72, left: 72 },
+      });
+      const allFragmentIds = layout.pages.flatMap((page) => page.fragments.map((fragment) => fragment.blockId));
+
+      expect(allFragmentIds).toContain('anchored-image');
+      expect(allFragmentIds).not.toContain('image-carrier');
+      expect(allFragmentIds).not.toContain('sectPr-marker');
+      expect(layout.pages).toHaveLength(2);
+      expect(layout.pages[0]?.fragments.some((fragment) => fragment.blockId === 'anchored-image')).toBe(true);
+    });
+
     it('keeps empty tracked section-break marker paragraph before forced section break', () => {
       const blocks: FlowBlock[] = [
         { kind: 'paragraph', id: 'p1', runs: [{ text: 'Content', fontFamily: 'Arial', fontSize: 12 }] },
@@ -5080,9 +5295,10 @@ describe('layoutHeaderFooter', () => {
       kind: 'drawing',
       id: 'footer-connector',
       drawingKind: 'vectorShape',
-      geometry: { width: 703, height: 8 },
-      effectExtent: { left: 3, top: 3, right: 5, bottom: 4 },
+      geometry: { width: 700, height: 7 },
+      effectExtent: { left: 0, top: 2, right: 5, bottom: 4 },
       shapeKind: 'line',
+      strokeLineCap: 'butt',
       attrs: {
         anchorParagraphId: carrier.id,
         wrap: { type: 'Inline' },
@@ -5098,12 +5314,12 @@ describe('layoutHeaderFooter', () => {
     const drawingMeasure: DrawingMeasure = {
       kind: 'drawing',
       drawingKind: 'vectorShape',
-      width: 703,
-      height: 8,
+      width: 700,
+      height: 7,
       scale: 1,
-      naturalWidth: 703,
-      naturalHeight: 8,
-      geometry: { width: 703, height: 8, rotation: 0, flipH: false, flipV: false },
+      naturalWidth: 700,
+      naturalHeight: 7,
+      geometry: { width: 700, height: 7, rotation: 0, flipH: false, flipV: false },
     };
 
     const layout = layoutHeaderFooter(
@@ -5119,16 +5335,16 @@ describe('layoutHeaderFooter', () => {
     const footerTextFragment = layout.pages[0].fragments.find((fragment) => fragment.blockId === footerText.id);
 
     expect(connectorFragment).toBeDefined();
-    // Fit decisions use the authored 695px line, while its 3px/5px effect area
-    // remains paintable outside the paragraph content box.
-    expect(connectorFragment?.x).toBe(-3);
-    expect(connectorFragment?.width).toBe(703);
+    // Fit decisions use the authored 695px line. The theme-resolved flat cap
+    // adds no endpoint overflow; only the authored right effect remains.
+    expect(connectorFragment?.x).toBe(0);
+    expect(connectorFragment?.width).toBe(700);
     expect(carrierFragment?.kind).toBe('para');
-    expect(carrierFragment?.y).toBe(24);
+    expect(carrierFragment?.y).toBe(23);
     // The line center (effect top + half the 1px authored box) sits on the text baseline.
-    expect(connectorFragment?.y).toBeCloseTo(24 + 12.8 - 3.5);
+    expect(connectorFragment?.y).toBeCloseTo(23 + 12.8 - 2.5);
     // The connector still reserves its original flow height; only its paint position changes.
-    expect(footerTextFragment?.y).toBe(56);
+    expect(footerTextFragment?.y).toBe(55);
   });
 
   it('throws when width is invalid', () => {
@@ -5210,6 +5426,171 @@ describe('layoutHeaderFooter', () => {
 
     expect(layout.pages[0].fragments[0].kind).toBe('table');
     expect(layout.height).toBeGreaterThanOrEqual(72);
+  });
+
+  it('includes an ordinary table in measured footer height', () => {
+    const tableBlock = makeTableBlock('footer-table', 1);
+    const tableMeasure = makeTableMeasure([200], [72]);
+
+    const layout = layoutHeaderFooter(
+      [tableBlock],
+      [tableMeasure],
+      {
+        width: 300,
+        height: 400,
+        pageWidth: 500,
+        pageHeight: 600,
+        margins: { left: 100, right: 100, top: 80, bottom: 80, footer: 40 },
+      },
+      'footer',
+    );
+
+    expect(layout.height).toBeGreaterThanOrEqual(72);
+  });
+
+  it('keeps a page-positioned floating header table in header flow', () => {
+    const tableBlock = makeTableBlock('floating-header-table', 1, {
+      anchor: {
+        isAnchored: true,
+        hRelativeFrom: 'page',
+        vRelativeFrom: 'page',
+        alignH: 'right',
+        alignV: 'bottom',
+      },
+      wrap: { type: 'Square' },
+    });
+    const carrierBlock: FlowBlock = {
+      kind: 'paragraph',
+      id: 'header-carrier',
+      runs: [{ text: '', fontFamily: 'Arial', fontSize: 12 }],
+    };
+    const tableMeasure = makeTableMeasure([100], [40]);
+    const carrierMeasure = makeMeasure([15]);
+    const constraints = {
+      width: 300,
+      height: 400,
+      pageWidth: 500,
+      pageHeight: 600,
+      margins: { left: 100, right: 100, top: 80, bottom: 80, header: 40 },
+    };
+
+    const layout = layoutHeaderFooter(
+      [tableBlock, carrierBlock],
+      [tableMeasure, carrierMeasure],
+      constraints,
+      'header',
+    );
+    const fragment = layout.pages[0]?.fragments.find((candidate) => candidate.blockId === tableBlock.id);
+
+    expect(layout.height).toBeLessThanOrEqual(constraints.height);
+    expect(fragment).toMatchObject({ kind: 'table', x: 200, y: constraints.height - 40 });
+  });
+
+  it('excludes a page-positioned floating footer table from measured footer height', () => {
+    const tableBlock = makeTableBlock('floating-footer-table', 1, {
+      anchor: {
+        isAnchored: true,
+        hRelativeFrom: 'page',
+        vRelativeFrom: 'page',
+        alignH: 'right',
+        alignV: 'bottom',
+      },
+      wrap: { type: 'Square' },
+    });
+    const carrierBlock: FlowBlock = {
+      kind: 'paragraph',
+      id: 'footer-carrier',
+      runs: [{ text: '', fontFamily: 'Arial', fontSize: 12 }],
+    };
+    const tableMeasure = makeTableMeasure([100], [40]);
+    const carrierMeasure = makeMeasure([15]);
+    const constraints = {
+      width: 300,
+      height: 400,
+      pageWidth: 500,
+      pageHeight: 600,
+      margins: { left: 100, right: 100, top: 80, bottom: 80, footer: 40 },
+    };
+
+    const layout = layoutHeaderFooter(
+      [tableBlock, carrierBlock],
+      [tableMeasure, carrierMeasure],
+      constraints,
+      'footer',
+    );
+    const fragment = layout.pages[0]?.fragments.find((candidate) => candidate.blockId === tableBlock.id);
+
+    expect(layout.height).toBeCloseTo(15);
+    expect(fragment).toMatchObject({
+      kind: 'table',
+      x: constraints.pageWidth - 100,
+      y: constraints.margins.footer - 40,
+    });
+  });
+
+  it('resolves a page-relative floating footer table X against the physical page width', () => {
+    const tableBlock = makeTableBlock('page-relative-x-footer-table', 1, {
+      anchor: {
+        isAnchored: true,
+        hRelativeFrom: 'page',
+        vRelativeFrom: 'margin',
+        alignH: 'right',
+        alignV: 'bottom',
+      },
+      wrap: { type: 'Square' },
+    });
+    const carrierBlock: FlowBlock = {
+      kind: 'paragraph',
+      id: 'page-relative-x-footer-carrier',
+      runs: [{ text: '', fontFamily: 'Arial', fontSize: 12 }],
+    };
+    const tableMeasure = makeTableMeasure([100], [40]);
+    const carrierMeasure = makeMeasure([15]);
+    const constraints = {
+      width: 300,
+      height: 400,
+      pageWidth: 500,
+      pageHeight: 600,
+      margins: { left: 100, right: 100, top: 80, bottom: 80, footer: 40 },
+    };
+
+    const layout = layoutHeaderFooter(
+      [tableBlock, carrierBlock],
+      [tableMeasure, carrierMeasure],
+      constraints,
+      'footer',
+    );
+    const fragment = layout.pages[0]?.fragments.find((candidate) => candidate.blockId === tableBlock.id);
+
+    expect(fragment).toMatchObject({ kind: 'table', x: constraints.pageWidth - 100 });
+  });
+
+  it('keeps a full-width source-anchored footer table in footer flow', () => {
+    const tableBlock = makeTableBlock('inline-footer-table', 1, {
+      anchor: {
+        isAnchored: true,
+        hRelativeFrom: 'page',
+        vRelativeFrom: 'page',
+        offsetH: 0,
+        offsetV: 0,
+      },
+      wrap: { type: 'Square' },
+    });
+    const tableMeasure = makeTableMeasure([300], [40]);
+    const constraints = {
+      width: 300,
+      height: 400,
+      pageWidth: 500,
+      pageHeight: 600,
+      margins: { left: 100, right: 100, top: 80, bottom: 80, footer: 40 },
+    };
+
+    const layout = layoutHeaderFooter([tableBlock], [tableMeasure], constraints, 'footer');
+    const fragment = layout.pages[0]?.fragments.find((candidate) => candidate.blockId === tableBlock.id);
+
+    expect(layout.height).toBeGreaterThanOrEqual(40);
+    expect(fragment).toMatchObject({ kind: 'table', x: 0, y: 0 });
+    expect((fragment as TableFragment).isAnchored).not.toBe(true);
   });
 
   it('ignores far-away behindDoc anchored fragments when computing height', () => {
@@ -6657,6 +7038,247 @@ describe('requirePageBoundary edge cases', () => {
       expect(p3.x).toBeCloseTo(200);
       expect(p3.y).toBeCloseTo(regionTop);
       expect(p3.width).toBeCloseTo(550);
+    });
+
+    it('uses the wider explicit column after a nextColumn section break', () => {
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const toTwoColumns: SectionBreakBlock = {
+        kind: 'sectionBreak',
+        id: 'sb-two-columns',
+        type: 'continuous',
+        columns,
+        margins: {},
+      };
+      const nextColumn: SectionBreakBlock = {
+        kind: 'sectionBreak',
+        id: 'sb-next-column',
+        type: 'nextColumn',
+        columns,
+        margins: {},
+      };
+
+      const blocks: FlowBlock[] = [
+        { kind: 'paragraph', id: 'lead', runs: [] },
+        toTwoColumns,
+        { kind: 'paragraph', id: 'left-signature', runs: [] },
+        nextColumn,
+        { kind: 'paragraph', id: 'right-signature', runs: [] },
+      ];
+      const measures: Measure[] = [
+        makeMeasure([40]),
+        { kind: 'sectionBreak' },
+        makeMeasure([40]),
+        { kind: 'sectionBreak' },
+        makeMeasure([40]),
+      ];
+
+      const layout = layoutDocument(blocks, measures, {
+        pageSize: { w: 800, h: 792 },
+        margins: { top: 72, right: 80, bottom: 72, left: 80 },
+      });
+      const page = layout.pages[0];
+      const lead = page.fragments.find((fragment) => fragment.blockId === 'lead') as ParaFragment;
+      const left = page.fragments.find((fragment) => fragment.blockId === 'left-signature') as ParaFragment;
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+
+      expect(left.x).toBeCloseTo(80);
+      expect(left.y).toBeCloseTo(lead.y + 40);
+      expect(left.width).toBeCloseTo(272.6666666666667);
+      expect(right.x).toBeCloseTo(80 + 272.6666666666667);
+      expect(right.y).toBeCloseTo(lead.y + 40);
+      expect(right.width).toBeCloseTo(365.4);
+    });
+
+    it('starts first-section nextColumn seeds in the destination column', () => {
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const seed: SectionBreakBlock = {
+        kind: 'sectionBreak',
+        id: 'section-seed-right-column',
+        type: 'continuous',
+        columns,
+        margins: {},
+        attrs: { isFirstSection: true, initialColumnIndex: 1 },
+      };
+
+      const layout = layoutDocument(
+        [seed, { kind: 'paragraph', id: 'right-signature', runs: [] }],
+        [{ kind: 'sectionBreak' }, makeMeasure([40])],
+        {
+          pageSize: { w: 800, h: 792 },
+          margins: { top: 72, right: 80, bottom: 72, left: 80 },
+        },
+      );
+
+      const page = layout.pages[0];
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+      expect(right.x).toBeCloseTo(80 + 272.6666666666667);
+      expect(right.width).toBeCloseTo(365.4);
+    });
+
+    it('advances past a sectPr marker paragraph between continuous and nextColumn', () => {
+      // OOXML shape: a continuous two-column section owns left-column content
+      // plus an empty sectPr carrier, then nextColumn starts right-column content.
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const layout = layoutDocument(
+        [
+          {
+            kind: 'sectionBreak',
+            id: 'sb-two-columns',
+            type: 'continuous',
+            columns,
+            margins: {},
+            attrs: { source: 'sectPr', sectionIndex: 5, typeIsExplicit: true },
+          },
+          { kind: 'paragraph', id: 'left-signature', runs: [] },
+          { kind: 'paragraph', id: 'continuous-marker', runs: [], attrs: { sectPrMarker: true } },
+          {
+            kind: 'sectionBreak',
+            id: 'sb-next-column',
+            type: 'nextColumn',
+            columns,
+            margins: {},
+            attrs: { source: 'sectPr', sectionIndex: 6, typeIsExplicit: true },
+          },
+          { kind: 'paragraph', id: 'right-signature', runs: [] },
+        ],
+        [{ kind: 'sectionBreak' }, makeMeasure([40]), makeMeasure([0]), { kind: 'sectionBreak' }, makeMeasure([40])],
+        {
+          pageSize: { w: 816, h: 1056 },
+          margins: { top: 44.27, right: 88.27, bottom: 49.2, left: 89.6 },
+        },
+      );
+
+      const page = layout.pages[0];
+      const left = page.fragments.find((fragment) => fragment.blockId === 'left-signature') as ParaFragment;
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+      expect(left.x).toBeCloseTo(89.6);
+      expect(left.width).toBeCloseTo(272.6666666666667);
+      expect(right.x).toBeCloseTo(89.6 + 272.6666666666667);
+      expect(right.y).toBeCloseTo(left.y);
+      expect(right.width).toBeCloseTo(365.4);
+    });
+
+    it('does not render or consume a measured empty sectPr marker before nextColumn', () => {
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const layout = layoutDocument(
+        [
+          {
+            kind: 'sectionBreak',
+            id: 'sb-two-columns',
+            type: 'continuous',
+            columns,
+            margins: {},
+            attrs: { source: 'sectPr', sectionIndex: 5, typeIsExplicit: true },
+          },
+          { kind: 'paragraph', id: 'left-signature', runs: [] },
+          { kind: 'paragraph', id: 'continuous-marker', runs: [], attrs: { sectPrMarker: true } },
+          {
+            kind: 'sectionBreak',
+            id: 'sb-next-column',
+            type: 'nextColumn',
+            columns,
+            margins: {},
+            attrs: { source: 'sectPr', sectionIndex: 6, typeIsExplicit: true },
+          },
+          { kind: 'paragraph', id: 'right-signature', runs: [] },
+        ],
+        [
+          { kind: 'sectionBreak' },
+          makeMeasure([40]),
+          makeMeasure([19.3967]),
+          { kind: 'sectionBreak' },
+          makeMeasure([40]),
+        ],
+        {
+          pageSize: { w: 816, h: 1056 },
+          margins: { top: 44.27, right: 88.27, bottom: 49.2, left: 89.6 },
+        },
+      );
+
+      const page = layout.pages[0];
+      const marker = page.fragments.find((fragment) => fragment.blockId === 'continuous-marker');
+      const left = page.fragments.find((fragment) => fragment.blockId === 'left-signature') as ParaFragment;
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+      expect(marker).toBeUndefined();
+      expect(right.x).toBeCloseTo(89.6 + 272.6666666666667);
+      expect(right.y).toBeCloseTo(left.y);
+    });
+
+    it('keeps nextColumn content beside a tall left column near the page bottom', () => {
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const layout = layoutDocument(
+        [
+          { kind: 'paragraph', id: 'lead', runs: [] },
+          {
+            kind: 'sectionBreak',
+            id: 'sb-two-columns',
+            type: 'continuous',
+            columns,
+            margins: {},
+          },
+          { kind: 'paragraph', id: 'left-signature', runs: [] },
+          {
+            kind: 'sectionBreak',
+            id: 'sb-next-column',
+            type: 'nextColumn',
+            columns,
+            margins: {},
+          },
+          { kind: 'paragraph', id: 'right-signature', runs: [] },
+        ],
+        [
+          makeMeasure([40]),
+          { kind: 'sectionBreak' },
+          // Tall left column near the page bottom. Restarting the mid-page region
+          // at maxCursorY would leave no room for the right column on this page.
+          makeMeasure([200]),
+          { kind: 'sectionBreak' },
+          makeMeasure([40]),
+        ],
+        {
+          pageSize: { w: 800, h: 400 },
+          margins: { top: 72, right: 80, bottom: 72, left: 80 },
+        },
+      );
+
+      expect(layout.pages).toHaveLength(1);
+      const page = layout.pages[0];
+      const left = page.fragments.find((fragment) => fragment.blockId === 'left-signature') as ParaFragment;
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+      expect(right).toBeDefined();
+      expect(right.x).toBeCloseTo(80 + 272.6666666666667);
+      expect(right.y).toBeCloseTo(left.y);
+      expect(right.width).toBeCloseTo(365.4);
+    });
+
+    it('activates pending multi-column geometry on nextColumn when still single-column', () => {
+      const columns = { count: 2, gap: 0, widths: [272.6666666666667, 365.4], equalWidth: false };
+      const layout = layoutDocument(
+        [
+          { kind: 'paragraph', id: 'lead', runs: [] },
+          {
+            kind: 'sectionBreak',
+            id: 'sb-next-column',
+            type: 'nextColumn',
+            columns,
+            margins: {},
+          },
+          { kind: 'paragraph', id: 'right-signature', runs: [] },
+        ],
+        [makeMeasure([40]), { kind: 'sectionBreak' }, makeMeasure([40])],
+        {
+          pageSize: { w: 800, h: 792 },
+          margins: { top: 72, right: 80, bottom: 72, left: 80 },
+        },
+      );
+
+      expect(layout.pages).toHaveLength(1);
+      const page = layout.pages[0];
+      const lead = page.fragments.find((fragment) => fragment.blockId === 'lead') as ParaFragment;
+      const right = page.fragments.find((fragment) => fragment.blockId === 'right-signature') as ParaFragment;
+      expect(right.x).toBeCloseTo(80 + 272.6666666666667);
+      expect(right.y).toBeCloseTo(lead.y + 40);
+      expect(right.width).toBeCloseTo(365.4);
     });
 
     it('keeps the current explicit column after a manual column break when only later per-column gaps differ', () => {

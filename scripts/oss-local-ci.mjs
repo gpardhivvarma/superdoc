@@ -16,17 +16,21 @@ const docsScripts = existsSync(docsManifestPath)
   : new Set();
 const docsV1RoutesAvailable = ['check:v1-routes', 'test:v1-routes'].every((script) => docsScripts.has(script));
 const orbitSuperdocWorkflow = '.github/workflows/ci-superdoc.yml';
-const publicV2Workflow = '.github/workflows/v2-public-validation.yml';
+const publicV2Workflow = '.github/workflows/validate.yml';
 const orbitSuperdocWorkflowAvailable = existsSync(path.join(repoRoot, orbitSuperdocWorkflow));
 const superdocWorkflow = orbitSuperdocWorkflowAvailable
   ? orbitSuperdocWorkflow
-  : `${publicV2Workflow} (covered across setup, ci-superdoc, and ci-docs)`;
-const superdocLaneTitle = orbitSuperdocWorkflowAvailable ? 'CI SuperDoc' : 'CI V2 Public shared core';
+  : `${publicV2Workflow} (required public aggregate)`;
+const superdocLaneTitle = orbitSuperdocWorkflowAvailable ? 'CI SuperDoc' : 'CI V2 Public validation';
 
-const NON_LOCAL_WORKFLOWS = [
-  'docs-preview-pr.yml: GitHub Pages preview context',
-  'pr-labels.yml: GitHub PR labels/comments',
-];
+function resolveOrbitWorkflow(workflowPaths, laneTitle) {
+  const paths = Array.isArray(workflowPaths) ? workflowPaths : [workflowPaths];
+  return paths.every((workflowPath) => existsSync(path.join(repoRoot, workflowPath)))
+    ? paths.join(' + ')
+    : `${publicV2Workflow} (${laneTitle} runs locally and in Orbit)`;
+}
+
+const NON_LOCAL_WORKFLOWS = ['label-prs.yml: GitHub PR labels/comments'];
 
 function sh(command, options = {}) {
   return {
@@ -54,6 +58,7 @@ const LANES = [
       // makes running them here possible at all.
       { id: 'pnpm-config', title: 'pnpm config ownership', ...sh('pnpm run check:pnpm-config') },
       { id: 'vite-plus', title: 'Vite+ toolchain guard', ...sh('pnpm run check:vite-plus') },
+      { id: 'public-ci', title: 'Public CI coverage contract', ...sh('pnpm run check:public-ci') },
       {
         id: 'install',
         title: 'Install dependencies',
@@ -74,6 +79,7 @@ const LANES = [
       // own the other v2-public-validation steps reported in the metadata.
       { id: 'pnpm-config', title: 'pnpm config ownership', ...sh('pnpm run check:pnpm-config') },
       { id: 'vite-plus', title: 'Vite+ toolchain guard', ...sh('pnpm run check:vite-plus') },
+      { id: 'public-ci', title: 'Public CI coverage contract', ...sh('pnpm run check:public-ci') },
       { id: 'lint', title: 'Lint', ...sh('NODE_OPTIONS=--max-old-space-size=4096 pnpm run lint') },
       { id: 'format', title: 'Format check', ...sh('pnpm run format:check') },
       { id: 'build', title: 'Build', ...sh('pnpm run build') },
@@ -85,6 +91,26 @@ const LANES = [
         id: 'removed-patches',
         title: 'Removed dependency patches stay unnecessary',
         ...sh('pnpm run check:removed-patches'),
+      },
+      {
+        id: 'release-scripts',
+        title: 'Release script checks',
+        ...sh('pnpm run check:release-scripts'),
+      },
+      {
+        id: 'workflow-paths',
+        title: 'Workflow path filter checks',
+        ...sh('pnpm run check:workflow-paths:tests && pnpm run check:workflow-paths'),
+      },
+      {
+        id: 'consumer-install',
+        title: 'Consumer install checks',
+        ...sh('pnpm run check:consumer-install'),
+      },
+      {
+        id: 'public-boundary',
+        title: 'Public boundary checks',
+        ...sh('pnpm run check:public-boundary:tests && pnpm run check:public-boundary'),
       },
       {
         id: 'public-interface',
@@ -119,6 +145,7 @@ const LANES = [
           ].join(' '),
         ),
       },
+      { id: 'slow-tests', title: 'Run slow layout tests', ...sh('pnpm test:slow') },
       ...(sdkAvailable
         ? [
             {
@@ -165,7 +192,7 @@ const LANES = [
   {
     id: 'ci-document-api',
     title: 'CI Document API',
-    workflow: '.github/workflows/ci-document-api.yml',
+    workflow: resolveOrbitWorkflow('.github/workflows/document-api.yml', 'extended Document API validation'),
     stages: [
       { id: 'docapi-sync', title: 'Generate contract outputs', ...sh('pnpm run docapi:sync') },
       {
@@ -178,10 +205,10 @@ const LANES = [
   {
     id: 'ci-docs',
     title: 'CI Docs',
-    workflow: '.github/workflows/ci-docs.yml',
+    workflow: resolveOrbitWorkflow('.github/workflows/ci-docs.yml', 'extended docs validation'),
     // Mirrors every step of that workflow in Orbit. Availability guards remove
     // only stages owned by private workspaces that the exporter omits; the
-    // projected repository runs v2-public-validation instead.
+    // projected repository runs the required public aggregate instead.
     stages: [
       { id: 'docs-pnpm-config', title: 'Check pnpm config', ...sh('pnpm run check:pnpm-config') },
       { id: 'docs-typecheck', title: 'Typecheck docs', ...sh('pnpm --filter @superdoc/docs typecheck') },
@@ -271,17 +298,20 @@ const LANES = [
   {
     id: 'ci-package-wrappers',
     title: 'CI package wrappers',
-    workflow: 'ci-react/vscode-ext.yml',
+    workflow: resolveOrbitWorkflow(
+      ['.github/workflows/react.yml', '.github/workflows/vscode.yml'],
+      'wrapper validation',
+    ),
     stages: [
       { id: 'react-build-superdoc', title: 'Build superdoc for React', ...sh('pnpm run build:superdoc') },
-      { id: 'react-lint', title: 'Lint React package', ...sh('pnpm --filter @superdoc-dev/react lint') },
+      { id: 'react-lint', title: 'Lint React package', ...sh('pnpm --filter @superdoc/react lint') },
       {
         id: 'react-typecheck',
         title: 'Typecheck React package',
-        ...sh('pnpm --filter @superdoc-dev/react type-check'),
+        ...sh('pnpm --filter @superdoc/react type-check'),
       },
-      { id: 'react-build', title: 'Build React package', ...sh('pnpm --filter @superdoc-dev/react build') },
-      { id: 'react-test', title: 'Test React package', ...sh('pnpm --filter @superdoc-dev/react test') },
+      { id: 'react-build', title: 'Build React package', ...sh('pnpm --filter @superdoc/react build') },
+      { id: 'react-test', title: 'Test React package', ...sh('pnpm --filter @superdoc/react test') },
       { id: 'vscode-lint', title: 'Lint VS Code extension', ...sh('pnpm --filter superdoc-vscode-ext lint') },
       {
         id: 'vscode-typecheck',
@@ -299,7 +329,10 @@ const LANES = [
   {
     id: 'ci-sdk-mcp',
     title: 'CI SDK and MCP',
-    workflow: 'ci-sdk.yml + ci-mcp.yml',
+    workflow: resolveOrbitWorkflow(
+      ['.github/workflows/ci-sdk.yml', '.github/workflows/ci-mcp.yml'],
+      'SDK and MCP validation',
+    ),
     defaultEnabled: cliAvailable && mcpAvailable && sdkAvailable,
     stages: [
       { id: 'sdk-generate-all', title: 'Generate SDK artifacts', ...sh('pnpm run generate:all') },
@@ -314,13 +347,13 @@ const LANES = [
   {
     id: 'ci-dts-shadows',
     title: 'Check .d.ts shadows',
-    workflow: '.github/workflows/check-dts-shadows.yml',
+    workflow: resolveOrbitWorkflow('.github/workflows/declarations.yml', '.d.ts shadow validation'),
     stages: [{ id: 'check', title: 'Check .d.ts shadows', ...sh('node scripts/check-dts-shadows.mjs') }],
   },
   {
     id: 'ci-examples',
     title: 'CI Examples',
-    workflow: '.github/workflows/ci-examples.yml',
+    workflow: resolveOrbitWorkflow('.github/workflows/examples.yml', 'extended examples validation'),
     stages: [
       { id: 'go-links', title: 'Check permanent example links', ...sh('pnpm run check:go-links') },
       { id: 'examples-reset', title: 'Verify the examples reset', ...sh('node scripts/check-examples.mjs') },
@@ -472,9 +505,6 @@ function printToolchainNotes() {
   const nodeVersion = readFileSync(path.join(repoRoot, '.nvmrc'), 'utf8').trim().replace(/^v/, '');
   const packageManager = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).packageManager;
   console.log(`Expected local toolchain: node ${nodeVersion}, ${packageManager}, bun 1.3.13 for SuperDoc PR CI.`);
-  console.log(
-    'Some legacy OSS workflows still declare node-version: 20; this runner uses the repository .nvmrc as the local CI toolchain.',
-  );
 }
 
 function runStage(lane, stage) {

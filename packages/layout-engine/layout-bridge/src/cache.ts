@@ -708,6 +708,9 @@ const createStats = (): MeasureCacheStats => ({
  */
 const MAX_DIMENSION = 1_000_000;
 
+declare const preparedMeasureCacheKeyBrand: unique symbol;
+export type PreparedMeasureCacheKey = string & { readonly [preparedMeasureCacheKeyBrand]: true };
+
 /**
  * LRU-enhanced MeasureCache
  *
@@ -721,11 +724,13 @@ const MAX_DIMENSION = 1_000_000;
  * Performance characteristics:
  * - get(): O(1) - Map lookup + delete + re-insert for LRU tracking
  * - set(): O(1) - eviction (delete first key) + insert
- * - invalidate(): O(n) - where n = number of keys matching blockId prefix
+ * - invalidate(): O(k) - where k = cached variants for the requested block IDs
  * - Memory: Bounded at 10K entries ~= 50-100MB
  */
 export class MeasureCache<T> {
   private cache = new Map<string, T>();
+  private keysByBlockId = new Map<string, Set<string>>();
+  private blockIdByKey = new Map<string, string>();
   private stats: MeasureCacheStats = createStats();
 
   /**
@@ -738,13 +743,25 @@ export class MeasureCache<T> {
    * @returns The cached value or undefined
    */
   public get(block: FlowBlock | null | undefined, width: number, height: number, fontSignature = ''): T | undefined {
-    // Safety: Validate block exists and has required properties before accessing
-    // This prevents invalid cache keys from null/undefined blocks
-    if (!block || !block.id) {
-      return undefined;
-    }
+    return this.getPrepared(this.prepareKey(block, width, height, fontSignature));
+  }
 
-    const key = this.composeKey(block, width, height, fontSignature);
+  /**
+   * Compose the complete content, constraint, and font key once for a cache
+   * read followed by an insertion in the same measurement transaction.
+   */
+  public prepareKey(
+    block: FlowBlock | null | undefined,
+    width: number,
+    height: number,
+    fontSignature = '',
+  ): PreparedMeasureCacheKey | undefined {
+    if (!block || !block.id) return undefined;
+    return this.composeKey(block, width, height, fontSignature) as PreparedMeasureCacheKey;
+  }
+
+  public getPrepared(key: PreparedMeasureCacheKey | undefined): T | undefined {
+    if (key === undefined) return undefined;
     const value = this.cache.get(key);
 
     if (value !== undefined) {
@@ -772,16 +789,15 @@ export class MeasureCache<T> {
    * @param value - The value to cache
    */
   public set(block: FlowBlock | null | undefined, width: number, height: number, value: T, fontSignature = ''): void {
-    // Safety: Validate block exists and has required properties before caching
-    // This prevents invalid cache keys and silent failures
-    if (!block || !block.id) {
-      return;
-    }
+    this.setPrepared(this.prepareKey(block, width, height, fontSignature), block?.id, value);
+  }
 
-    const key = this.composeKey(block, width, height, fontSignature);
+  public setPrepared(key: PreparedMeasureCacheKey | undefined, blockId: string | undefined, value: T): void {
+    if (key === undefined || !blockId) return;
 
     // If key already exists, delete it first (will be re-added at end)
-    if (this.cache.has(key)) {
+    const alreadyCached = this.cache.has(key);
+    if (alreadyCached) {
       this.cache.delete(key);
     }
 
@@ -790,13 +806,19 @@ export class MeasureCache<T> {
       // Evict oldest entry (first in Map)
       const oldestKey = this.cache.keys().next().value;
       if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
+        this.deleteKey(oldestKey);
         this.stats.evictions += 1;
       }
     }
 
     // Add new entry (goes to end of Map)
     this.cache.set(key, value);
+    if (!alreadyCached) {
+      this.blockIdByKey.set(key, blockId);
+      const keys = this.keysByBlockId.get(blockId) ?? new Set<string>();
+      keys.add(key);
+      this.keysByBlockId.set(blockId, keys);
+    }
     this.stats.sets += 1;
 
     // Update size stats
@@ -816,14 +838,15 @@ export class MeasureCache<T> {
    */
   public invalidate(blockIds: string[]): void {
     let removed = 0;
-    blockIds.forEach((id) => {
-      for (const key of this.cache.keys()) {
-        if (key.startsWith(id + '@')) {
-          this.cache.delete(key);
+    for (const id of new Set(blockIds)) {
+      const keys = this.keysByBlockId.get(id);
+      if (!keys) continue;
+      for (const key of [...keys]) {
+        if (this.deleteKey(key)) {
           removed += 1;
         }
       }
-    });
+    }
     this.stats.invalidations += removed;
     this.updateSizeStats();
   }
@@ -834,6 +857,8 @@ export class MeasureCache<T> {
    */
   public clear(): void {
     this.cache.clear();
+    this.keysByBlockId.clear();
+    this.blockIdByKey.clear();
     this.stats.clears += 1;
     this.updateSizeStats();
   }
@@ -887,6 +912,18 @@ export class MeasureCache<T> {
   private updateSizeStats(): void {
     this.stats.size = this.cache.size;
     this.stats.memorySizeEstimate = this.cache.size * BYTES_PER_ENTRY_ESTIMATE;
+  }
+
+  private deleteKey(key: string): boolean {
+    if (!this.cache.delete(key)) return false;
+    const blockId = this.blockIdByKey.get(key);
+    this.blockIdByKey.delete(key);
+    if (blockId != null) {
+      const keys = this.keysByBlockId.get(blockId);
+      keys?.delete(key);
+      if (keys?.size === 0) this.keysByBlockId.delete(blockId);
+    }
+    return true;
   }
 
   /**

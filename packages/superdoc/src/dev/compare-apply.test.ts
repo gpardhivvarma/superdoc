@@ -1,47 +1,77 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vite-plus/test';
 import {
   applyCompareWithWs09Fallback,
   captureCompareApplyDebugSnapshot,
-  compareApplyDeferredMessage,
-  isWs09TrackedCompareDeferred,
+  compareApplyFallbackMessage,
   settleCompareApplyPaint,
 } from './compare-apply';
 
 describe('dev compare apply fallback', () => {
-  it('keeps tracked compare apply when it succeeds', () => {
-    const apply = vi.fn(() => ({ appliedOperations: 3, diagnostics: [] }));
-    const outcome = applyCompareWithWs09Fallback({ diff: { apply } }, { id: 'diff' });
+  it('awaits the asynchronous host comparison before checking its summary', () => {
+    const testDirectory = dirname(fileURLToPath(import.meta.url));
+    const devAppSource = readFileSync(resolve(testDirectory, 'components/SuperdocDev.vue'), 'utf8');
+
+    expect(devAppSource).toContain('const diff = await liveCompareDocApi.diff.compare({ targetSnapshot });');
+  });
+
+  it('keeps tracked compare apply when an asynchronous host facade succeeds', async () => {
+    const apply = vi.fn(async () => ({ appliedOperations: 3, diagnostics: [] }));
+    const outcome = await applyCompareWithWs09Fallback({ diff: { apply } }, { id: 'diff' });
 
     expect(outcome.changeMode).toBe('tracked');
     expect(outcome.fallbackFromTracked).toBe(false);
+    expect(outcome.fallbackReason).toBeNull();
     expect(outcome.applyResult.appliedOperations).toBe(3);
     expect(apply).toHaveBeenCalledTimes(1);
     expect(apply).toHaveBeenNthCalledWith(1, { diff: { id: 'diff' } }, { changeMode: 'tracked' });
   });
 
-  it('falls back to direct compare apply for ws09 tracked deferral', () => {
-    const deferredError = Object.assign(
-      new Error('compare-apply-deferred (ws09): table topology changes are detected'),
-      { code: 'CAPABILITY_UNSUPPORTED' },
-    );
+  it('falls back to direct compare apply for relationship-backed tracked deferral', async () => {
+    const deferredError = Object.assign(new Error('relationship-backed replay is unavailable in tracked mode'), {
+      code: 'CAPABILITY_UNSUPPORTED',
+      details: {
+        changedFamilies: ['body', 'media', 'package-graph'],
+        unsupportedReason: 'family-apply-lane-unavailable',
+      },
+    });
     const apply = vi
       .fn()
-      .mockImplementationOnce(() => {
-        throw deferredError;
-      })
-      .mockImplementationOnce(() => ({ appliedOperations: 5, diagnostics: ['body: applied 2 safe operation(s)'] }));
+      .mockRejectedValueOnce(deferredError)
+      .mockResolvedValueOnce({ appliedOperations: 1, diagnostics: [] });
+    const diff = { payload: { relationshipBackedBody: { target: { media: [{ partUri: '/word/media/image.png' }] } } } };
 
-    const outcome = applyCompareWithWs09Fallback({ diff: { apply } }, { id: 'diff' });
+    const outcome = await applyCompareWithWs09Fallback({ diff: { apply } }, diff);
 
-    expect(outcome.changeMode).toBe('direct');
-    expect(outcome.fallbackFromTracked).toBe(true);
-    expect(outcome.applyResult.appliedOperations).toBe(5);
+    expect(outcome).toMatchObject({
+      changeMode: 'direct',
+      fallbackFromTracked: true,
+      fallbackReason: 'tracked-deferred',
+      applyResult: { appliedOperations: 1 },
+    });
     expect(apply).toHaveBeenCalledTimes(2);
-    expect(apply).toHaveBeenNthCalledWith(1, { diff: { id: 'diff' } }, { changeMode: 'tracked' });
-    expect(apply).toHaveBeenNthCalledWith(2, { diff: { id: 'diff' } }, { changeMode: 'direct' });
+    expect(apply).toHaveBeenNthCalledWith(1, { diff }, { changeMode: 'tracked' });
+    expect(apply).toHaveBeenNthCalledWith(2, { diff }, { changeMode: 'direct' });
   });
 
-  it('prefers direct compare apply for ws09 deferred table topology diffs before tracked apply can partially succeed', () => {
+  it('does not retry unrelated body deferrals without relationship-backed media', async () => {
+    const deferredError = Object.assign(new Error('body replay is unavailable'), {
+      code: 'CAPABILITY_UNSUPPORTED',
+      details: {
+        changedFamilies: ['body'],
+        unsupportedReason: 'family-apply-lane-unavailable',
+      },
+    });
+    const apply = vi.fn().mockRejectedValue(deferredError);
+    const diff = { payload: { relationshipBackedBody: { target: { media: [] } } } };
+
+    await expect(applyCompareWithWs09Fallback({ diff: { apply } }, diff)).rejects.toBe(deferredError);
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps tracked compare apply when a deferred table policy succeeds', async () => {
     const apply = vi.fn(() => ({ appliedOperations: 6, diagnostics: [] }));
     const diff = {
       payload: {
@@ -55,158 +85,95 @@ describe('dev compare apply fallback', () => {
       },
     };
 
-    const outcome = applyCompareWithWs09Fallback({ diff: { apply } }, diff);
+    const outcome = await applyCompareWithWs09Fallback({ diff: { apply } }, diff);
 
-    expect(outcome.changeMode).toBe('direct');
-    expect(outcome.fallbackFromTracked).toBe(true);
+    expect(outcome.changeMode).toBe('tracked');
+    expect(outcome.fallbackFromTracked).toBe(false);
+    expect(outcome.fallbackReason).toBeNull();
     expect(outcome.applyResult.appliedOperations).toBe(6);
     expect(apply).toHaveBeenCalledTimes(1);
-    expect(apply).toHaveBeenCalledWith({ diff }, { changeMode: 'direct' });
+    expect(apply).toHaveBeenCalledWith({ diff }, { changeMode: 'tracked' });
   });
 
-  it('retries direct compare apply with ws07 visual-only families stripped when they are the only remaining blocker', () => {
-    const ws07Error = Object.assign(
-      new Error(
-        'diff.apply: full diff apply cannot safely replay changed families ' +
-          '[sections (deferred: compare-apply-deferred (ws07)); ' +
-          'settings (deferred: compare-apply-deferred (ws07)); ' +
-          'theme (deferred: compare-apply-deferred (ws07))] in this build.',
-      ),
-      { code: 'CAPABILITY_UNSUPPORTED' },
-    );
-    const diff = {
-      payload: {
-        analysis: {
-          families: [
-            { family: 'body', state: 'changed-supported' },
-            { family: 'tables', state: 'changed-supported' },
-            { family: 'sections', state: 'changed-supported' },
-            { family: 'settings', state: 'changed-supported' },
-            { family: 'theme', state: 'changed-supported' },
-          ],
-        },
-        semanticAnalysis: {
-          familyDeltas: [
-            { family: 'body', detectedChange: true },
-            { family: 'tables', detectedChange: true },
-            { family: 'sections', detectedChange: true },
-            { family: 'settings', detectedChange: true },
-            { family: 'theme', detectedChange: true },
-          ],
-        },
-        familyPolicy: [
-          { family: 'body', disposition: 'deferred', changed: true, applyRequired: true },
-          { family: 'tables', disposition: 'deferred', changed: true, applyRequired: true },
-        ],
-        mainDocument: {
-          target: { xml: '<w:document><w:body><w:tbl/></w:body></w:document>' },
-        },
-      },
-    };
-    const apply = vi
-      .fn()
-      .mockImplementationOnce(() => {
-        throw ws07Error;
-      })
-      .mockImplementationOnce(() => ({ appliedOperations: 2, diagnostics: [] }));
+  it('retries in direct mode for a structured unsafe tracked table row replay', async () => {
+    const trackedError = trackedTableRowReplayUnsafeError();
+    const diff = tableTopologyDiff();
+    const apply = vi.fn().mockRejectedValueOnce(trackedError).mockResolvedValueOnce({ appliedOperations: 5 });
 
-    const outcome = applyCompareWithWs09Fallback({ diff: { apply } }, diff);
+    const outcome = await applyCompareWithWs09Fallback({ diff: { apply } }, diff);
 
-    expect(outcome.changeMode).toBe('direct');
-    expect(outcome.fallbackFromTracked).toBe(true);
-    expect(outcome.applyResult.appliedOperations).toBe(2);
-    expect(apply).toHaveBeenCalledTimes(2);
-    expect(apply.mock.calls[0]).toEqual([{ diff }, { changeMode: 'direct' }]);
-    const retriedDiff = apply.mock.calls[1]?.[0]?.diff as typeof diff;
-    expect(apply.mock.calls[1]).toEqual([{ diff: retriedDiff }, { changeMode: 'direct' }]);
-    expect(retriedDiff.payload.analysis.families.find((family) => family.family === 'sections')?.state).toBe(
-      'unchanged',
-    );
-    expect(retriedDiff.payload.analysis.families.find((family) => family.family === 'settings')?.state).toBe(
-      'unchanged',
-    );
-    expect(retriedDiff.payload.analysis.families.find((family) => family.family === 'theme')?.state).toBe('unchanged');
-    expect(
-      retriedDiff.payload.semanticAnalysis.familyDeltas.find((family) => family.family === 'sections')?.detectedChange,
-    ).toBe(false);
-    expect(
-      retriedDiff.payload.semanticAnalysis.familyDeltas.find((family) => family.family === 'settings')?.detectedChange,
-    ).toBe(false);
-    expect(
-      retriedDiff.payload.semanticAnalysis.familyDeltas.find((family) => family.family === 'theme')?.detectedChange,
-    ).toBe(false);
-  });
-
-  it('retries direct compare apply when only a subset of ws07 visual families blocks apply', () => {
-    const ws07Error = Object.assign(
-      new Error(
-        'diff.apply: full diff apply cannot safely replay changed families ' +
-          '[sections (deferred: compare-apply-deferred (ws07))] in this build.',
-      ),
-      { code: 'CAPABILITY_UNSUPPORTED' },
-    );
-    const diff = {
-      payload: {
-        analysis: {
-          families: [
-            { family: 'body', state: 'changed-supported' },
-            { family: 'sections', state: 'changed-supported' },
-          ],
-        },
-        semanticAnalysis: {
-          familyDeltas: [
-            { family: 'body', detectedChange: true },
-            { family: 'sections', detectedChange: true },
-          ],
-        },
-        familyPolicy: [
-          { family: 'body', disposition: 'deferred', changed: true, applyRequired: true },
-          { family: 'tables', disposition: 'deferred', changed: true, applyRequired: true },
-        ],
-        mainDocument: {
-          target: { xml: '<w:document><w:body><w:tbl/></w:body></w:document>' },
-        },
-      },
-    };
-    const apply = vi
-      .fn()
-      .mockImplementationOnce(() => {
-        throw ws07Error;
-      })
-      .mockImplementationOnce(() => ({ appliedOperations: 1, diagnostics: [] }));
-
-    const outcome = applyCompareWithWs09Fallback({ diff: { apply } }, diff);
-
-    expect(outcome.changeMode).toBe('direct');
-    expect(outcome.fallbackFromTracked).toBe(true);
-    expect(apply).toHaveBeenCalledTimes(2);
-    const retriedDiff = apply.mock.calls[1]?.[0]?.diff as typeof diff;
-    expect(retriedDiff.payload.analysis.families.find((family) => family.family === 'sections')?.state).toBe(
-      'unchanged',
-    );
-    expect(
-      retriedDiff.payload.semanticAnalysis.familyDeltas.find((family) => family.family === 'sections')?.detectedChange,
-    ).toBe(false);
-  });
-
-  it('rethrows non-ws09 compare apply failures', () => {
-    const error = Object.assign(new Error('boom'), { code: 'PRECONDITION_FAILED' });
-    const apply = vi.fn(() => {
-      throw error;
+    expect(outcome).toMatchObject({
+      changeMode: 'direct',
+      fallbackFromTracked: true,
+      fallbackReason: 'table-topology',
+      applyResult: { appliedOperations: 5 },
     });
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(apply).toHaveBeenNthCalledWith(1, { diff }, { changeMode: 'tracked' });
+    expect(apply).toHaveBeenNthCalledWith(2, { diff }, { changeMode: 'direct' });
+  });
 
-    expect(() => applyCompareWithWs09Fallback({ diff: { apply } }, { id: 'diff' })).toThrow(error);
+  it('rethrows a matching message without structured unsafe table details', async () => {
+    const error = Object.assign(new Error('tracked-table-row-replay-unsafe'), {
+      code: 'CAPABILITY_UNSUPPORTED',
+    });
+    const apply = vi.fn().mockRejectedValue(error);
+
+    await expect(applyCompareWithWs09Fallback({ diff: { apply } }, tableTopologyDiff())).rejects.toBe(error);
     expect(apply).toHaveBeenCalledTimes(1);
   });
 
-  it('recognizes the ws09 tracked deferral message', () => {
-    const error = Object.assign(
-      new Error('diff.apply: compare-apply-deferred (ws09): table topology changes are detected'),
-      { code: 'CAPABILITY_UNSUPPORTED' },
-    );
+  it('rethrows an unsafe tracked table error when target main document XML is missing', async () => {
+    const error = trackedTableRowReplayUnsafeError();
+    const apply = vi.fn().mockRejectedValue(error);
+    const diff = tableTopologyDiff();
+    const diffWithoutTargetXml = {
+      payload: { ...diff.payload, mainDocument: { target: {} } },
+    };
 
-    expect(isWs09TrackedCompareDeferred(error)).toBe(true);
-    expect(compareApplyDeferredMessage(error)).toContain('retried the same diff in direct mode');
+    await expect(applyCompareWithWs09Fallback({ diff: { apply } }, diffWithoutTargetXml)).rejects.toBe(error);
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    Object.assign(new Error('compare-apply-deferred (ws07)'), { code: 'CAPABILITY_UNSUPPORTED' }),
+    Object.assign(new Error('boom'), { code: 'PRECONDITION_FAILED' }),
+    Object.assign(new Error('tracked table replay is unsafe'), {
+      code: 'CAPABILITY_UNSUPPORTED',
+      details: { unsupportedReason: 'tracked-table-row-replay-unsafe', changedFamilies: ['body'] },
+    }),
+  ])('rethrows unrelated compare apply failures without retrying', async (error) => {
+    const apply = vi.fn().mockRejectedValue(error);
+
+    await expect(applyCompareWithWs09Fallback({ diff: { apply } }, tableTopologyDiff())).rejects.toBe(error);
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('wraps a failed direct retry with the table topology fallback reason', async () => {
+    const trackedError = trackedTableRowReplayUnsafeError();
+    const directError = new Error('direct apply is unavailable');
+    const apply = vi.fn().mockRejectedValueOnce(trackedError).mockRejectedValueOnce(directError);
+
+    await expect(applyCompareWithWs09Fallback({ diff: { apply } }, tableTopologyDiff())).rejects.toMatchObject({
+      cause: directError,
+      changeMode: 'direct',
+      fallbackReason: 'table-topology',
+      message: 'Direct compare apply failed after tracked table row replay was unsafe: direct apply is unavailable',
+    });
+    expect(apply).toHaveBeenCalledTimes(2);
+  });
+
+  it('describes successful fallback from its diff context', () => {
+    const tableOutcome = {
+      applyResult: { appliedOperations: 1 },
+      changeMode: 'direct' as const,
+      fallbackFromTracked: true,
+      fallbackReason: 'table-topology' as const,
+    };
+
+    expect(compareApplyFallbackMessage(tableOutcome)).toBe(
+      'Tracked compare apply could not safely replay the table topology, so SuperDoc Dev applied the diff in direct mode. ',
+    );
   });
 
   it('awaits mutation readiness paint when the active editor exposes it', async () => {
@@ -249,3 +216,24 @@ describe('dev compare apply fallback', () => {
     });
   });
 });
+
+function tableTopologyDiff() {
+  return {
+    payload: {
+      familyPolicy: [
+        { family: 'body', disposition: 'deferred', changed: true, applyRequired: true },
+        { family: 'tables', disposition: 'deferred', changed: true, applyRequired: true },
+      ],
+      mainDocument: {
+        target: { xml: '<w:document><w:body><w:tbl/></w:body></w:document>' },
+      },
+    },
+  };
+}
+
+function trackedTableRowReplayUnsafeError() {
+  return Object.assign(new Error('tracked table replay is unsafe'), {
+    code: 'CAPABILITY_UNSUPPORTED',
+    details: { unsupportedReason: 'tracked-table-row-replay-unsafe', changedFamilies: ['tables'] },
+  });
+}

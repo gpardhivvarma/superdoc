@@ -7,6 +7,7 @@ import { applyRunDataAttributes } from './hash.js';
 import { sanitizeUrl } from './links.js';
 import { isValidImageDataUrl } from '@superdoc/url-validation';
 import { calculateRotatedBounds, normalizeRotation } from '@superdoc/geometry-utils';
+import { applyImageOutline } from '../images/image-outline.js';
 
 /**
  * Maximum resize multiplier for image metadata.
@@ -191,6 +192,7 @@ export const renderImageRun = (
     if (run.pmStart != null) placeholder.dataset.pmStart = String(run.pmStart);
     if (run.pmEnd != null) placeholder.dataset.pmEnd = String(run.pmEnd);
     if (run.imageId) placeholder.dataset.sdImageId = run.imageId;
+    if (run.imageMutationId) placeholder.dataset.sdImageMutationId = run.imageMutationId;
     placeholder.dataset.layoutEpoch = String(context.layoutEpoch);
     context.applySdtDataset(placeholder, run.sdt);
     if (run.dataAttrs) applyRunDataAttributes(placeholder, run.dataAttrs);
@@ -272,6 +274,7 @@ export const renderImageRun = (
     img.setAttribute('data-image-metadata', JSON.stringify(inlineImageMetadata));
     // docPr/@id so the resize overlay can target the Document API (images.setSize).
     if (run.imageId) img.setAttribute('data-sd-image-id', run.imageId);
+    if (run.imageMutationId) img.setAttribute('data-sd-image-mutation-id', run.imageMutationId);
   }
 
   // Set alt text (required for accessibility)
@@ -322,6 +325,7 @@ export const renderImageRun = (
   if (opacity != null) {
     img.style.opacity = opacity;
   }
+  applyImageOutline(img, run.outline);
 
   // When clipPath is set, scale makes the img paint outside its box;
   // wrap in a clip container so only the cropped portion occupies space in the document.

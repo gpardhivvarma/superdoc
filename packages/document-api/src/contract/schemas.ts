@@ -16,6 +16,22 @@ import {
 import { buildPatchSchema, buildStateSchema } from '../styles/index.js';
 import { Z_ORDER_RELATIVE_HEIGHT_MAX, Z_ORDER_RELATIVE_HEIGHT_MIN } from '../images/z-order.js';
 import { SD_EXPORT_MODES } from '../export/export.types.js';
+import {
+  SD_CONVERSION_CONSTRUCTS,
+  SD_CONVERSION_DIAGNOSTIC_CODES,
+  SD_CONVERSION_DISPOSITIONS,
+  SD_CONVERSION_FORMATS,
+  SD_HTML_MARKDOWN_OUTCOMES,
+} from '../types/sd-contract.js';
+import {
+  SD_PROJECTION_CONSTRUCTS,
+  SD_PROJECTION_DIAGNOSTIC_CODES,
+  SD_PROJECTION_DISPOSITIONS,
+  SD_PROJECTION_FORMATS,
+  SD_PROJECTION_REVIEW_MODES,
+  SD_PROJECTION_STATUSES,
+} from '../types/content-projection.js';
+import { SD_CONVERSION_FRAGMENT_SCHEMA, SD_CONVERSION_FRAGMENT_SCHEMA_DEFS } from './sd-fragment-schema.js';
 type JsonSchema = Record<string, unknown>;
 const trackChangeTypeValues = [
   'insertion',
@@ -71,6 +87,65 @@ function arraySchema(items: JsonSchema): JsonSchema {
 function ref(name: string): JsonSchema {
   return { $ref: `#/$defs/${name}` };
 }
+const sourcePathSchema = arraySchema({ oneOf: [{ type: 'string' }, { type: 'integer' }] });
+const diagnosticPathSchema = arraySchema({ oneOf: [{ type: 'string' }, { type: 'integer' }] });
+const conversionSourceRangeSchema = objectSchema(
+  {
+    startOffset: { type: 'integer', minimum: 0 },
+    endOffset: { type: 'integer', minimum: 0 },
+    startLine: { type: 'integer', minimum: 1 },
+    startColumn: { type: 'integer', minimum: 1 },
+    endLine: { type: 'integer', minimum: 1 },
+    endColumn: { type: 'integer', minimum: 1 },
+  },
+  ['startOffset', 'endOffset'],
+);
+const conversionSourceSchema = objectSchema(
+  {
+    format: { enum: [...SD_CONVERSION_FORMATS] },
+    range: conversionSourceRangeSchema,
+  },
+  ['format'],
+);
+const diagnosticProperties: Record<string, JsonSchema> = {
+  code: { type: 'string' },
+  severity: { enum: ['error', 'warning', 'info'] },
+  message: { type: 'string' },
+  path: diagnosticPathSchema,
+  construct: { enum: [...SD_CONVERSION_CONSTRUCTS] },
+  disposition: { enum: [...SD_CONVERSION_DISPOSITIONS] },
+  lossy: { type: 'boolean' },
+  source: conversionSourceSchema,
+};
+const sdDiagnosticSchema = objectSchema(diagnosticProperties, ['code', 'severity', 'message']);
+const sdConversionDiagnosticSchema = objectSchema(
+  {
+    ...diagnosticProperties,
+    code: { enum: [...SD_CONVERSION_DIAGNOSTIC_CODES] },
+  },
+  ['code', 'severity', 'message', 'construct', 'disposition', 'lossy', 'source'],
+);
+const conversionReportSchema = objectSchema(
+  {
+    format: { enum: [...SD_CONVERSION_FORMATS] },
+    lossy: { type: 'boolean' },
+    diagnostics: arraySchema(sdConversionDiagnosticSchema),
+  },
+  ['format', 'lossy', 'diagnostics'],
+);
+const receiptSuccessMetadataProperties: Record<string, JsonSchema> = {
+  id: { type: 'string' },
+  inserted: arraySchema(ref('EntityAddress')),
+  updated: arraySchema(ref('EntityAddress')),
+  removed: arraySchema(ref('EntityAddress')),
+  invalidatedRefs: arraySchema(ref('AffectedRef')),
+  remappedRefs: arraySchema(ref('AffectedRefRemapping')),
+  affectedStories: arraySchema(ref('StoryLocator')),
+  textRangeShifts: arraySchema(ref('TextRangeShift')),
+  txId: { type: 'string' },
+  warnings: arraySchema(ref('ReviewWarning')),
+  effects: ref('ReceiptEffects'),
+};
 /**
  * Builds a `oneOf` schema that merges each TargetLocator branch with additional
  * payload properties. This avoids the `allOf` + `additionalProperties: false`
@@ -185,6 +260,7 @@ const knownTargetKindValues = [
  * graph is self-consistent.
  */
 const SHARED_DEFS: Record<string, JsonSchema> = {
+  ...SD_CONVERSION_FRAGMENT_SCHEMA_DEFS,
   // -- Primitives --
   Range: objectSchema(
     {
@@ -233,8 +309,170 @@ const SHARED_DEFS: Record<string, JsonSchema> = {
       kind: { const: 'text' },
       segments: { type: 'array', items: ref('TextSegment'), minItems: 1 },
       story: ref('StoryLocator'),
+      coordinateSpace: ref('TextCoordinateSpace'),
     },
     ['kind', 'segments'],
+  ),
+  SDProjectionFormat: { enum: [...SD_PROJECTION_FORMATS] },
+  SDProjectionReviewMode: { enum: [...SD_PROJECTION_REVIEW_MODES] },
+  SDProjectionStatus: { enum: [...SD_PROJECTION_STATUSES] },
+  SDProjectionDisposition: { enum: [...SD_PROJECTION_DISPOSITIONS] },
+  SDProjectionConstruct: { enum: [...SD_PROJECTION_CONSTRUCTS] },
+  SDProjectionScope: {
+    oneOf: [ref('BlockNodeAddress'), ref('SelectionTarget')],
+  },
+  SDResolvedProjectionScope: {
+    oneOf: [
+      objectSchema({ kind: { const: 'story' } }, ['kind']),
+      objectSchema({ kind: { const: 'block' }, target: ref('BlockNodeAddress') }, ['kind', 'target']),
+      objectSchema({ kind: { const: 'range' }, target: ref('SelectionTarget') }, ['kind', 'target']),
+    ],
+  },
+  SDProjectionBlockMapEntry: {
+    oneOf: [
+      objectSchema(
+        {
+          nodeType: { enum: [...BLOCK_NODE_TYPES] },
+          output: ref('Range'),
+          parentBlockId: { type: 'string' },
+          changeIds: arraySchema({ type: 'string' }),
+          commentIds: arraySchema({ type: 'string' }),
+          identity: { const: 'public' },
+          blockId: { type: 'string' },
+        },
+        ['nodeType', 'output', 'identity', 'blockId'],
+      ),
+      objectSchema(
+        {
+          nodeType: { enum: [...BLOCK_NODE_TYPES] },
+          output: ref('Range'),
+          parentBlockId: { type: 'string' },
+          changeIds: arraySchema({ type: 'string' }),
+          commentIds: arraySchema({ type: 'string' }),
+          identity: { const: 'unavailable' },
+          identityUnavailableReason: { const: 'positionDerivedFallback' },
+        },
+        ['nodeType', 'output', 'identity', 'identityUnavailableReason'],
+      ),
+    ],
+  },
+  SDProjectionDiagnostic: objectSchema(
+    {
+      code: { enum: [...SD_PROJECTION_DIAGNOSTIC_CODES] },
+      severity: { enum: ['error', 'warning', 'info'] },
+      message: { type: 'string' },
+      path: diagnosticPathSchema,
+      construct: ref('SDProjectionConstruct'),
+      disposition: ref('SDProjectionDisposition'),
+      lossy: { type: 'boolean' },
+      source: objectSchema(
+        {
+          story: ref('StoryLocator'),
+          blockId: { type: 'string' },
+          range: ref('Range'),
+          coordinateSpace: { const: 'tracked' },
+          changeIds: arraySchema({ type: 'string' }),
+          commentIds: arraySchema({ type: 'string' }),
+        },
+        ['story'],
+      ),
+      output: objectSchema({ format: ref('SDProjectionFormat'), range: ref('Range') }, ['format']),
+    },
+    ['code', 'severity', 'message', 'construct', 'disposition', 'lossy', 'source'],
+  ),
+  SDProjectionSourceMapTextEntry: objectSchema(
+    {
+      kind: { const: 'text' },
+      output: ref('Range'),
+      source: ref('TextTarget'),
+      blockId: { type: 'string' },
+      changeIds: arraySchema({ type: 'string' }),
+      commentIds: arraySchema({ type: 'string' }),
+    },
+    ['kind', 'output', 'source', 'blockId'],
+  ),
+  SDProjectionSourceMapSyntheticEntry: {
+    oneOf: [
+      objectSchema(
+        {
+          kind: { const: 'synthetic' },
+          output: ref('Range'),
+          role: { enum: ['listLabel', 'placeholder'] },
+          changeIds: arraySchema({ type: 'string' }),
+          commentIds: arraySchema({ type: 'string' }),
+          identity: { const: 'public' },
+          blockId: { type: 'string' },
+        },
+        ['kind', 'output', 'role', 'identity', 'blockId'],
+      ),
+      objectSchema(
+        {
+          kind: { const: 'synthetic' },
+          output: ref('Range'),
+          role: { enum: ['listLabel', 'placeholder'] },
+          changeIds: arraySchema({ type: 'string' }),
+          commentIds: arraySchema({ type: 'string' }),
+          identity: { const: 'unavailable' },
+          identityUnavailableReason: { const: 'positionDerivedFallback' },
+        },
+        ['kind', 'output', 'role', 'identity', 'identityUnavailableReason'],
+      ),
+    ],
+  },
+  SDProjectionSourceMap: objectSchema(
+    {
+      version: { const: 'sd-projection-source-map/1' },
+      outputCoordinateSpace: { const: 'utf16' },
+      sourceCoordinateSpace: { const: 'tracked' },
+      entries: arraySchema({
+        oneOf: [ref('SDProjectionSourceMapTextEntry'), ref('SDProjectionSourceMapSyntheticEntry')],
+      }),
+    },
+    ['version', 'outputCoordinateSpace', 'sourceCoordinateSpace', 'entries'],
+  ),
+  SDProjectionAnnotation: objectSchema(
+    {
+      kind: { enum: ['trackedChange', 'comment'] },
+      id: { type: 'string' },
+      blockIds: arraySchema({ type: 'string' }),
+      sourceTarget: ref('TextTarget'),
+      outputRanges: arraySchema(ref('Range')),
+      status: { enum: ['emitted', 'partiallyEmitted', 'omitted'] },
+      omittedReason: { enum: ['reviewMode', 'unsupported'] },
+      side: { enum: ['inserted', 'deleted', 'source', 'destination', 'formatting'] },
+    },
+    ['kind', 'id', 'blockIds', 'outputRanges', 'status'],
+  ),
+  SDContentProjectionResult: objectSchema(
+    {
+      format: ref('SDProjectionFormat'),
+      content: { type: 'string' },
+      status: ref('SDProjectionStatus'),
+      outcome: { enum: [...SD_HTML_MARKDOWN_OUTCOMES] },
+      reviewMode: ref('SDProjectionReviewMode'),
+      evaluatedRevision: { type: 'string' },
+      story: ref('StoryLocator'),
+      scope: ref('SDResolvedProjectionScope'),
+      lossy: { type: 'boolean' },
+      diagnostics: arraySchema(ref('SDProjectionDiagnostic')),
+      blocks: arraySchema(ref('SDProjectionBlockMapEntry')),
+      annotations: arraySchema(ref('SDProjectionAnnotation')),
+      sourceMap: ref('SDProjectionSourceMap'),
+    },
+    [
+      'format',
+      'content',
+      'status',
+      'outcome',
+      'reviewMode',
+      'evaluatedRevision',
+      'story',
+      'scope',
+      'lossy',
+      'diagnostics',
+      'blocks',
+      'annotations',
+    ],
   ),
   // -- Selection-based targeting --
   SelectionEdgeNodeAddress: objectSchema(
@@ -499,18 +737,22 @@ const SHARED_DEFS: Record<string, JsonSchema> = {
     },
     ['story', 'atChar', 'delta'],
   ),
+  ReviewWarning: objectSchema(
+    {
+      code: { type: 'string' },
+      message: { type: 'string' },
+      feature: { enum: ['comments', 'trackedChanges'] },
+      severity: { const: 'warning' },
+      affectedObjectId: { type: 'string' },
+      affectedPartUri: { type: 'string' },
+      canProceed: { type: 'boolean' },
+    },
+    ['code', 'message', 'feature', 'severity', 'canProceed'],
+  ),
   ReceiptSuccess: objectSchema(
     {
       success: { const: true },
-      id: { type: 'string' },
-      inserted: arraySchema(ref('EntityAddress')),
-      updated: arraySchema(ref('EntityAddress')),
-      removed: arraySchema(ref('EntityAddress')),
-      invalidatedRefs: arraySchema(ref('AffectedRef')),
-      remappedRefs: arraySchema(ref('AffectedRefRemapping')),
-      affectedStories: arraySchema(ref('StoryLocator')),
-      textRangeShifts: arraySchema(ref('TextRangeShift')),
-      txId: { type: 'string' },
+      ...receiptSuccessMetadataProperties,
     },
     ['success'],
   ),
@@ -566,6 +808,7 @@ const SHARED_DEFS: Record<string, JsonSchema> = {
   TextMutationEffect: objectSchema(
     {
       kind: { const: 'insertedText' },
+      sourcePath: sourcePathSchema,
       target: ref('TextAddress'),
       selectionTarget: ref('SelectionTarget'),
       text: { type: 'string' },
@@ -575,6 +818,7 @@ const SHARED_DEFS: Record<string, JsonSchema> = {
   BlockMutationEffect: objectSchema(
     {
       kind: { const: 'insertedBlock' },
+      sourcePath: sourcePathSchema,
       target: ref('BlockNodeAddress'),
       insertedText: ref('TextMutationEffect'),
     },
@@ -788,6 +1032,10 @@ const textMutationSuccessSchema = ref('TextMutationSuccess');
 const matchRunSchema = ref('MatchRun');
 const matchBlockSchema = ref('MatchBlock');
 const storyLocatorSchema = ref('StoryLocator');
+const bodyStoryLocatorSchema = objectSchema({ kind: { const: 'story' }, storyType: { const: 'body' } }, [
+  'kind',
+  'storyType',
+]);
 // Keep these aliases for internal readability
 void positionSchema;
 void inlineAnchorSchema;
@@ -1302,28 +1550,50 @@ const sdFindResultSchema = objectSchema(
 // ---------------------------------------------------------------------------
 const sdMutationResolutionSchema = objectSchema(
   {
-    target: { oneOf: [textAddressSchema, blockNodeAddressSchema] },
+    target: { oneOf: [textAddressSchema, blockNodeAddressSchema, bodyStoryLocatorSchema] },
     range: textMutationRangeSchema,
     selectionTarget: selectionTargetSchema,
   },
   ['target', 'range'],
 );
+const evaluatedRevisionSchema = objectSchema({ before: { type: 'string' }, after: { type: 'string' } }, [
+  'before',
+  'after',
+]);
 const sdMutationSuccessSchema = objectSchema(
   {
     success: { const: true },
+    outcome: { enum: [...SD_HTML_MARKDOWN_OUTCOMES] },
     resolution: sdMutationResolutionSchema,
-    effects: ref('ReceiptEffects'),
-    evaluatedRevision: objectSchema({ before: { type: 'string' }, after: { type: 'string' } }, ['before', 'after']),
+    ...receiptSuccessMetadataProperties,
+    evaluatedRevision: evaluatedRevisionSchema,
+    conversion: conversionReportSchema,
   },
   ['success'],
 );
+function sdErrorSchemaFor(operationId: OperationId): JsonSchema {
+  return objectSchema(
+    {
+      code: { enum: possibleFailureCodes(operationId) },
+      message: { type: 'string' },
+      path: diagnosticPathSchema,
+      target: {
+        oneOf: [ref('BlockNodeAddress'), ref('TextAddress'), ref('SelectionTarget'), bodyStoryLocatorSchema],
+      },
+      details: {},
+    },
+    ['code', 'message'],
+  );
+}
 function sdMutationFailureSchemaFor(operationId: OperationId): JsonSchema {
   return objectSchema(
     {
       success: { const: false },
-      failure: receiptFailureSchemaFor(operationId),
+      outcome: { enum: [...SD_HTML_MARKDOWN_OUTCOMES] },
+      failure: sdErrorSchemaFor(operationId),
       resolution: sdMutationResolutionSchema,
-      evaluatedRevision: objectSchema({ before: { type: 'string' }, after: { type: 'string' } }, ['before', 'after']),
+      evaluatedRevision: evaluatedRevisionSchema,
+      conversion: conversionReportSchema,
     },
     ['success', 'failure'],
   );
@@ -2278,6 +2548,7 @@ const nullableTableBorderSpecSchema: JsonSchema = {
 const sdFragmentSchema: JsonSchema = {
   oneOf: [{ type: 'object' }, { type: 'array', items: { type: 'object' } }],
 };
+const conversionFragmentSchema: JsonSchema = SD_CONVERSION_FRAGMENT_SCHEMA;
 const placementSchema: JsonSchema = { enum: ['before', 'after', 'insideStart', 'insideEnd'] };
 const nestingPolicySchema: JsonSchema = {
   ...objectSchema({
@@ -2292,13 +2563,45 @@ const insertInputSchema: JsonSchema = {
         in: storyLocatorSchema,
         value: { type: 'string', description: 'Text content to insert.' },
         type: {
-          type: 'string',
-          enum: ['text', 'markdown', 'html'],
-          description: "Content format: 'text' (default), 'markdown', or 'html'.",
+          const: 'text',
+          description: "Plain-text content format. Omit for the same 'text' default.",
         },
       },
       ['value'],
     ),
+    {
+      oneOf: [
+        objectSchema(
+          {
+            in: storyLocatorSchema,
+            target: { oneOf: [selectionTargetSchema, blockNodeAddressSchema] },
+            value: { type: 'string', description: 'HTML or Markdown content to convert and insert.' },
+            type: { enum: ['markdown', 'html'] },
+            placement: placementSchema,
+          },
+          ['target', 'value', 'type'],
+        ),
+        objectSchema(
+          {
+            in: storyLocatorSchema,
+            ref: { type: 'string', minLength: 1 },
+            value: { type: 'string', description: 'HTML or Markdown content to convert and insert.' },
+            type: { enum: ['markdown', 'html'] },
+            placement: placementSchema,
+          },
+          ['ref', 'value', 'type'],
+        ),
+        objectSchema(
+          {
+            in: storyLocatorSchema,
+            value: { type: 'string', description: 'HTML or Markdown content to convert and insert.' },
+            type: { enum: ['markdown', 'html'] },
+            placement: placementSchema,
+          },
+          ['value', 'type'],
+        ),
+      ],
+    },
     objectSchema(
       {
         in: storyLocatorSchema,
@@ -2314,6 +2617,158 @@ const insertInputSchema: JsonSchema = {
         nestingPolicy: nestingPolicySchema,
       },
       ['content'],
+    ),
+  ],
+};
+const supportCheckRichInsertInputSchema: JsonSchema = {
+  oneOf: [
+    objectSchema(
+      {
+        in: storyLocatorSchema,
+        target: { oneOf: [selectionTargetSchema, blockNodeAddressSchema] },
+        value: { type: 'string' },
+        type: { enum: ['html', 'markdown'] },
+        placement: placementSchema,
+      },
+      ['target', 'value', 'type'],
+    ),
+    objectSchema(
+      {
+        in: storyLocatorSchema,
+        ref: { type: 'string', minLength: 1 },
+        value: { type: 'string' },
+        type: { enum: ['html', 'markdown'] },
+        placement: placementSchema,
+      },
+      ['ref', 'value', 'type'],
+    ),
+    objectSchema(
+      {
+        in: storyLocatorSchema,
+        value: { type: 'string' },
+        type: { enum: ['html', 'markdown'] },
+        placement: placementSchema,
+      },
+      ['value', 'type'],
+    ),
+  ],
+};
+const supportCheckRichReplaceInputSchema: JsonSchema = {
+  oneOf: [
+    objectSchema(
+      {
+        in: storyLocatorSchema,
+        target: { oneOf: [selectionTargetSchema, blockNodeAddressSchema] },
+        value: { type: 'string' },
+        type: { enum: ['html', 'markdown'] },
+        nestingPolicy: nestingPolicySchema,
+      },
+      ['target', 'value', 'type'],
+    ),
+    objectSchema(
+      {
+        in: storyLocatorSchema,
+        ref: { type: 'string', minLength: 1 },
+        value: { type: 'string' },
+        type: { enum: ['html', 'markdown'] },
+        nestingPolicy: nestingPolicySchema,
+      },
+      ['ref', 'value', 'type'],
+    ),
+  ],
+};
+const supportCheckProjectionInputSchema = objectSchema({
+  in: storyLocatorSchema,
+  reviewMode: ref('SDProjectionReviewMode'),
+  scope: ref('SDProjectionScope'),
+  includeSourceMap: { type: 'boolean' },
+});
+const supportCheckInputSchema: JsonSchema = {
+  oneOf: [
+    objectSchema(
+      {
+        operation: { const: 'insert' },
+        input: supportCheckRichInsertInputSchema,
+        options: objectSchema({ changeMode: { enum: ['direct', 'tracked'] } }),
+      },
+      ['operation', 'input'],
+    ),
+    objectSchema(
+      {
+        operation: { const: 'replace' },
+        input: supportCheckRichReplaceInputSchema,
+        options: objectSchema({ changeMode: { enum: ['direct', 'tracked'] } }),
+      },
+      ['operation', 'input'],
+    ),
+    objectSchema({ operation: { const: 'projectHtml' }, input: supportCheckProjectionInputSchema }, ['operation']),
+    objectSchema({ operation: { const: 'projectMarkdown' }, input: supportCheckProjectionInputSchema }, ['operation']),
+  ],
+};
+const supportCheckFailureSchema = objectSchema(
+  {
+    code: { type: 'string' },
+    message: { type: 'string' },
+    path: diagnosticPathSchema,
+    target: { oneOf: [blockNodeAddressSchema, textAddressSchema, selectionTargetSchema] },
+    details: {},
+  },
+  ['code', 'message'],
+);
+const supportCheckGuardSchema = objectSchema(
+  {
+    version: { const: 'sd-html-markdown-check/1' },
+    operation: { enum: ['insert', 'replace'] },
+    evaluatedRevision: { type: 'string' },
+    requestSha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+    analysisSha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+  },
+  ['version', 'operation', 'evaluatedRevision', 'requestSha256', 'analysisSha256'],
+);
+const supportCheckCommonProperties: Record<string, JsonSchema> = {
+  format: { enum: ['html', 'markdown'] },
+  supported: { type: 'boolean' },
+  outcome: { enum: [...SD_HTML_MARKDOWN_OUTCOMES] },
+  evaluatedRevision: { type: 'string' },
+  failure: supportCheckFailureSchema,
+};
+const supportCheckOutputSchema: JsonSchema = {
+  oneOf: [
+    objectSchema(
+      {
+        operation: { enum: ['insert', 'replace'] },
+        ...supportCheckCommonProperties,
+        wouldChange: { type: 'boolean' },
+        conversion: conversionReportSchema,
+        plan: objectSchema(
+          {
+            fragment: conversionFragmentSchema,
+            resolution: sdMutationResolutionSchema,
+            changeMode: { enum: ['direct', 'tracked'] },
+            atomic: { const: true },
+          },
+          ['fragment', 'resolution', 'changeMode', 'atomic'],
+        ),
+        guard: supportCheckGuardSchema,
+      },
+      ['operation', 'format', 'supported', 'outcome', 'evaluatedRevision', 'wouldChange', 'conversion'],
+    ),
+    objectSchema(
+      {
+        operation: { enum: ['projectHtml', 'projectMarkdown'] },
+        ...supportCheckCommonProperties,
+        plan: objectSchema(
+          {
+            reviewMode: ref('SDProjectionReviewMode'),
+            story: storyLocatorSchema,
+            scope: ref('SDResolvedProjectionScope'),
+            includeSourceMap: { type: 'boolean' },
+          },
+          ['reviewMode', 'story', 'scope', 'includeSourceMap'],
+        ),
+        projection: ref('SDContentProjectionResult'),
+      },
+      ['operation', 'format', 'supported', 'outcome', 'evaluatedRevision'],
     ),
   ],
 };
@@ -3510,13 +3965,72 @@ const diffPayloadSchema: JsonSchema = objectSchema(
 const diffApplyResultSchema: JsonSchema = objectSchema(
   {
     appliedOperations: { type: 'integer' },
+    operationReceipts: {
+      type: 'array',
+      items: {
+        oneOf: [
+          objectSchema(
+            {
+              operationId: { type: 'string' },
+              disposition: { const: 'review-created' },
+              reviewItems: {
+                type: 'array',
+                minItems: 1,
+                items: objectSchema(
+                  {
+                    id: { type: 'string' },
+                    story: storyLocatorSchema,
+                    address: trackedChangeAddressSchema,
+                    navigationTarget: objectSchema(
+                      {
+                        kind: { const: 'block' },
+                        story: storyLocatorSchema,
+                        blockId: { type: 'string' },
+                        role: {
+                          enum: [
+                            'primary',
+                            'move-source',
+                            'move-destination',
+                            'formatting-carrier',
+                            'structural-carrier',
+                          ],
+                        },
+                      },
+                      ['kind', 'story', 'blockId', 'role'],
+                    ),
+                  },
+                  ['id', 'story', 'address'],
+                ),
+              },
+            },
+            ['operationId', 'disposition', 'reviewItems'],
+          ),
+          objectSchema(
+            {
+              operationId: { type: 'string' },
+              disposition: { const: 'applied-directly' },
+              reviewItems: { type: 'array', maxItems: 0 },
+            },
+            ['operationId', 'disposition', 'reviewItems'],
+          ),
+        ],
+      },
+    },
     baseFingerprint: { type: 'string' },
     targetFingerprint: { type: 'string' },
     coverage: diffCoverageSchema,
     summary: diffSummarySchema,
     diagnostics: { type: 'array', items: { type: 'string' } },
   },
-  ['appliedOperations', 'baseFingerprint', 'targetFingerprint', 'coverage', 'summary', 'diagnostics'],
+  [
+    'appliedOperations',
+    'operationReceipts',
+    'baseFingerprint',
+    'targetFingerprint',
+    'coverage',
+    'summary',
+    'diagnostics',
+  ],
 );
 const operationSchemas: Record<OperationId, OperationSchemaSet> = {
   get: {
@@ -3562,36 +4076,63 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
   getMarkdown: {
     input: objectSchema({
       in: storyLocatorSchema,
+      reviewMode: ref('SDProjectionReviewMode'),
+      scope: ref('SDProjectionScope'),
     }),
     output: { type: 'string' },
   },
   getHtml: {
     input: objectSchema({
       in: storyLocatorSchema,
+      reviewMode: ref('SDProjectionReviewMode'),
+      scope: ref('SDProjectionScope'),
       unflattenLists: {
         type: 'boolean',
-        description: 'When true, flattens nested list structures in output. Default: false.',
+        description: 'Deprecated and ignored by V2. V2 always emits canonical nested semantic lists.',
       },
     }),
     output: { type: 'string' },
+  },
+  projectMarkdown: {
+    input: objectSchema({
+      in: storyLocatorSchema,
+      reviewMode: ref('SDProjectionReviewMode'),
+      scope: ref('SDProjectionScope'),
+      includeSourceMap: { type: 'boolean' },
+    }),
+    output: {
+      allOf: [ref('SDContentProjectionResult'), { type: 'object', properties: { format: { const: 'markdown' } } }],
+    },
+  },
+  projectHtml: {
+    input: objectSchema({
+      in: storyLocatorSchema,
+      reviewMode: ref('SDProjectionReviewMode'),
+      scope: ref('SDProjectionScope'),
+      includeSourceMap: { type: 'boolean' },
+    }),
+    output: {
+      allOf: [ref('SDContentProjectionResult'), { type: 'object', properties: { format: { const: 'html' } } }],
+    },
   },
   markdownToFragment: {
     input: objectSchema({ markdown: { type: 'string' } }, ['markdown']),
     output: objectSchema(
       {
-        fragment: {},
+        fragment: conversionFragmentSchema,
         lossy: { type: 'boolean' },
-        diagnostics: arraySchema(
-          objectSchema(
-            {
-              code: { type: 'string' },
-              severity: { type: 'string', enum: ['error', 'warning', 'info'] },
-              message: { type: 'string' },
-              path: arraySchema({ type: 'string' }),
-            },
-            ['code', 'severity', 'message'],
-          ),
-        ),
+        diagnostics: arraySchema(sdDiagnosticSchema),
+      },
+      ['fragment', 'lossy', 'diagnostics'],
+    ),
+  },
+  htmlToFragment: {
+    input: objectSchema({ html: { type: 'string' } }, ['html']),
+    output: objectSchema(
+      {
+        fragment: conversionFragmentSchema,
+        lossy: { type: 'boolean' },
+        diagnostics: arraySchema(sdConversionDiagnosticSchema),
       },
       ['fragment', 'lossy', 'diagnostics'],
     ),
@@ -3757,6 +4298,13 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
             ['text'],
           ),
         },
+        objectSchema(
+          {
+            target: bodyStoryLocatorSchema,
+            text: { type: 'string', description: 'Complete replacement text for the main body.' },
+          },
+          ['target', 'text'],
+        ),
         // Structural replacement: exactly one of (target | ref) + content
         {
           oneOf: [
@@ -3786,6 +4334,48 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
                 nestingPolicy: nestingPolicySchema,
               },
               ['ref', 'content'],
+            ),
+            objectSchema(
+              {
+                target: bodyStoryLocatorSchema,
+                content: {
+                  ...sdFragmentSchema,
+                  description: 'Document fragment that replaces the complete main body.',
+                },
+              },
+              ['target', 'content'],
+            ),
+          ],
+        },
+        {
+          oneOf: [
+            objectSchema(
+              {
+                in: storyLocatorSchema,
+                target: { oneOf: [blockNodeAddressSchema, selectionTargetSchema] },
+                value: { type: 'string', description: 'HTML or Markdown replacement content.' },
+                type: { enum: ['html', 'markdown'] },
+                nestingPolicy: nestingPolicySchema,
+              },
+              ['target', 'value', 'type'],
+            ),
+            objectSchema(
+              {
+                in: storyLocatorSchema,
+                ref: { type: 'string', minLength: 1 },
+                value: { type: 'string', description: 'HTML or Markdown replacement content.' },
+                type: { enum: ['html', 'markdown'] },
+                nestingPolicy: nestingPolicySchema,
+              },
+              ['ref', 'value', 'type'],
+            ),
+            objectSchema(
+              {
+                target: bodyStoryLocatorSchema,
+                value: { type: 'string', description: 'HTML or Markdown that replaces the complete main body.' },
+                type: { enum: ['html', 'markdown'] },
+              },
+              ['target', 'value', 'type'],
             ),
           ],
         },
@@ -6711,7 +7301,8 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
             success: { const: true },
             revision: objectSchema({ before: { type: 'string' }, after: { type: 'string' } }, ['before', 'after']),
             steps: arraySchema({ type: 'object' }),
-            trackedChanges: arraySchema({ type: 'object' }),
+            trackedChanges: arraySchema(trackedChangeAddressSchema),
+            invalidatedRefs: arraySchema(ref('AffectedRef')),
             timing: objectSchema({ totalMs: { type: 'number' } }, ['totalMs']),
           },
           ['success', 'revision', 'steps', 'timing'],
@@ -6721,6 +7312,8 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
             success: { const: true },
             revision: objectSchema({ before: { type: 'string' }, after: { type: 'string' } }, ['before', 'after']),
             steps: arraySchema({ type: 'object' }),
+            trackedChanges: arraySchema(trackedChangeAddressSchema),
+            invalidatedRefs: arraySchema(ref('AffectedRef')),
             timing: objectSchema({ totalMs: { type: 'number' } }, ['totalMs']),
           },
           ['success', 'revision', 'steps', 'timing'],
@@ -6815,6 +7408,10 @@ const operationSchemas: Record<OperationId, OperationSchemaSet> = {
   'capabilities.get': {
     input: strictEmptyObjectSchema,
     output: capabilitiesOutputSchema,
+  },
+  'capabilities.check': {
+    input: supportCheckInputSchema,
+    output: supportCheckOutputSchema,
   },
   // --- create.table ---
   'create.table': {

@@ -2,13 +2,17 @@ import {
   areValidPageCheckpointDependencyClasses,
   cloneColumnLayout,
   collectSectionBoundaryFillerBlockIds,
+  columnRenderLayoutsEqual,
   doesFlowBlockProduceLayoutFragment,
   formatSectionPageNumberText,
   getColumnGeometry,
+  getColumnWidth,
   getColumnX,
+  isValidNonFlowingPageRelativeAnchorDependencyProof,
   isPageRelativeAnchor,
   normalizeColumnLayout,
   rescaleColumnWidths,
+  resolveColumnCount,
 } from '@superdoc/contracts';
 import type {
   NonFlowingPageRelativeAnchorDependencyProof,
@@ -152,6 +156,8 @@ export type IncrementalLayoutResult = {
   footnoteReserveSeed?: FootnoteReserveSeed | null;
   /** Canonical pre-layout furniture heights that can affect body margins. */
   headerFooterGeometryFingerprint: string;
+  /** Immutable input-owned warm seed; consumers must revalidate every key before reuse. */
+  headerFooterGeometrySeed: HeaderFooterGeometrySeed | null;
   layoutReuse?: IncrementalLayoutReuseSummary;
   measureReuse?: {
     mode: 'full-scan' | 'proved-dirty-only' | 'body-stable';
@@ -176,6 +182,10 @@ export type IncrementalLayoutBridgeTiming = {
   /** Union wall time spent inside caller-owned measure callbacks across body and furniture. */
   measureCallbackWallMs: number;
   measureCacheLookupMs: number;
+  /** Body-measure cache insertion wall time, including content-key composition. */
+  measureCacheWriteMs: number;
+  /** Previous-measure content-adoption lookup/build wall time. */
+  measureContentAdoptionMs: number;
   measureActualMs: number;
   headerFooterPreLayoutMs: number;
   headerPreLayoutMs: number;
@@ -185,6 +195,14 @@ export type IncrementalLayoutBridgeTiming = {
   layoutDocumentMs: number;
   /** Initial body-layout wrapper work outside `layoutDocument` (proof, slice, convergence, splice). */
   layoutReuseOrchestrationMs: number;
+  /** Initial pagination invocation including bridge reuse orchestration. */
+  paginationInitialMs: number;
+  /** Body page-token convergence pagination only. */
+  paginationPageTokenMs: number;
+  /** Footnote convergence pagination only; overlaps `footnoteMs`. */
+  paginationFootnoteMs: number;
+  /** All initial, page-token, and footnote pagination invocation wall time. */
+  paginationTotalMs: number;
   paginationMs: number;
   pageTokenSetupMs: number;
   pageTokenTotalMs: number;
@@ -197,13 +215,24 @@ export type IncrementalLayoutBridgeTiming = {
   unattributedMs: number;
   counters: {
     blocksRead: number;
+    blocksByKind?: Record<FlowBlock['kind'], number>;
+    bodyBlocksMeasuredByKind: Record<FlowBlock['kind'], number>;
     cacheHits: number;
     cacheMisses: number;
+    bodyMeasureCacheReads: number;
+    bodyMeasureCacheWrites: number;
+    bodyMeasureCacheKeyComputations: number;
+    measureContentSignatureComputations: number;
+    fontSignaturePresent: number;
+    fontSignatureChanged: number;
     measuresAdopted: number;
     pagesPaginated: number | null;
     pagesSplicedByReuse: number;
     paginationPasses: number;
     pageTokenRelayouts: number;
+    headerFooterPreLayoutReuses: number;
+    headerFooterPreLayoutBodyBlocksEnumerated: number;
+    headerFooterPreLayoutSectionsEnumerated: number;
     footnoteRelayouts: number;
     footnoteReserveRelayouts: number;
     footnoteGrowRelayouts: number;
@@ -214,6 +243,44 @@ export type IncrementalLayoutBridgeTiming = {
     footnoteOtherRelayouts: number;
   };
 };
+
+type HeaderFooterGeometryPlane = {
+  headerContentHeights?: Partial<Record<'default' | 'first' | 'even' | 'odd', number>>;
+  footerContentHeights?: Partial<Record<'default' | 'first' | 'even' | 'odd', number>>;
+  headerContentHeightsByRId?: ReadonlyMap<string, number>;
+  headerContentHeightsBySectionRef?: ReadonlyMap<string, number>;
+  footerContentHeightsByRId?: ReadonlyMap<string, number>;
+  footerContentHeightsBySectionRef?: ReadonlyMap<string, number>;
+};
+
+export type HeaderFooterGeometrySeed = {
+  readonly version: 2;
+  readonly ownerFingerprint: string;
+  readonly fontSignature: string;
+  readonly pageCountFieldsExact: boolean;
+  readonly constraintsFingerprint: string;
+  readonly sectionMetadataFingerprint: string;
+  readonly sectionMetadataHasChapterNumbering: false;
+  readonly geometryFingerprint: string;
+  readonly requiredHeaderVariants: readonly ('default' | 'first' | 'even' | 'odd')[];
+  readonly requiredFooterVariants: readonly ('default' | 'first' | 'even' | 'odd')[];
+  readonly requiredHeaderRelationshipIds: readonly string[];
+  readonly requiredFooterRelationshipIds: readonly string[];
+  readonly geometry: HeaderFooterGeometryPlane;
+};
+
+const issuedHeaderFooterGeometrySeeds = new WeakSet<object>();
+
+const createFlowBlockKindCounters = (): Record<FlowBlock['kind'], number> => ({
+  paragraph: 0,
+  image: 0,
+  drawing: 0,
+  list: 0,
+  table: 0,
+  sectionBreak: 0,
+  pageBreak: 0,
+  columnBreak: 0,
+});
 
 /**
  * Structural discriminator for what happened to the document tail (SD-3772
@@ -324,6 +391,190 @@ function buildHeaderFooterGeometryFingerprint(input: {
     footersByRId: entries(input.footerContentHeightsByRId),
     footersBySectionRef: entries(input.footerContentHeightsBySectionRef),
   });
+}
+
+function headerFooterInputFingerprint(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    item instanceof Map ? [...item].sort(([left], [right]) => String(left).localeCompare(String(right))) : item,
+  );
+}
+
+function cloneFiniteGeometryMap(value: unknown): ReadonlyMap<string, number> | undefined | null {
+  if (value === undefined) return undefined;
+  if (!(value instanceof Map)) return null;
+  const copy = new Map<string, number>();
+  for (const [key, height] of value) {
+    if (
+      typeof key !== 'string' ||
+      key.length === 0 ||
+      typeof height !== 'number' ||
+      !Number.isFinite(height) ||
+      height < 0
+    ) {
+      return null;
+    }
+    copy.set(key, height);
+  }
+  return new Proxy(copy, {
+    get(target, property) {
+      if (property === 'set' || property === 'delete' || property === 'clear') {
+        return () => {
+          throw new Error('header/footer geometry maps are immutable');
+        };
+      }
+      const member = Reflect.get(target, property, target);
+      return typeof member === 'function' ? member.bind(target) : member;
+    },
+  });
+}
+
+function cloneFiniteGeometryVariants(
+  value: unknown,
+): Partial<Record<'default' | 'first' | 'even' | 'odd', number>> | undefined | null {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const copy: Partial<Record<'default' | 'first' | 'even' | 'odd', number>> = {};
+  for (const key of ['default', 'first', 'even', 'odd'] as const) {
+    const height = record[key];
+    if (height === undefined) continue;
+    if (typeof height !== 'number' || !Number.isFinite(height) || height < 0) return null;
+    copy[key] = height;
+  }
+  return Object.freeze(copy);
+}
+
+function cloneValidatedHeaderFooterGeometry(value: unknown): HeaderFooterGeometryPlane | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const geometry = value as Record<string, unknown>;
+  const headerContentHeights = cloneFiniteGeometryVariants(geometry.headerContentHeights);
+  const footerContentHeights = cloneFiniteGeometryVariants(geometry.footerContentHeights);
+  const headerContentHeightsByRId = cloneFiniteGeometryMap(geometry.headerContentHeightsByRId);
+  const headerContentHeightsBySectionRef = cloneFiniteGeometryMap(geometry.headerContentHeightsBySectionRef);
+  const footerContentHeightsByRId = cloneFiniteGeometryMap(geometry.footerContentHeightsByRId);
+  const footerContentHeightsBySectionRef = cloneFiniteGeometryMap(geometry.footerContentHeightsBySectionRef);
+  if (
+    headerContentHeights === null ||
+    footerContentHeights === null ||
+    headerContentHeightsByRId === null ||
+    headerContentHeightsBySectionRef === null ||
+    footerContentHeightsByRId === null ||
+    footerContentHeightsBySectionRef === null
+  )
+    return null;
+  return Object.freeze({
+    ...(headerContentHeights === undefined ? {} : { headerContentHeights }),
+    ...(footerContentHeights === undefined ? {} : { footerContentHeights }),
+    ...(headerContentHeightsByRId === undefined ? {} : { headerContentHeightsByRId }),
+    ...(headerContentHeightsBySectionRef === undefined ? {} : { headerContentHeightsBySectionRef }),
+    ...(footerContentHeightsByRId === undefined ? {} : { footerContentHeightsByRId }),
+    ...(footerContentHeightsBySectionRef === undefined ? {} : { footerContentHeightsBySectionRef }),
+  });
+}
+
+function hasRequiredHeaderFooterGeometry(seed: HeaderFooterGeometrySeed, geometry: HeaderFooterGeometryPlane): boolean {
+  const validVariants = new Set(['default', 'first', 'even', 'odd']);
+  const readKeys = (value: unknown, allowed?: ReadonlySet<string>): readonly string[] | null => {
+    if (!Array.isArray(value)) return null;
+    const keys = value.filter((key): key is string => typeof key === 'string' && key.length > 0);
+    if (keys.length !== value.length || new Set(keys).size !== keys.length) return null;
+    if (allowed && keys.some((key) => !allowed.has(key))) return null;
+    return keys;
+  };
+  const headerVariants = readKeys(seed.requiredHeaderVariants, validVariants);
+  const footerVariants = readKeys(seed.requiredFooterVariants, validVariants);
+  const headerRelationshipIds = readKeys(seed.requiredHeaderRelationshipIds);
+  const footerRelationshipIds = readKeys(seed.requiredFooterRelationshipIds);
+  if (!headerVariants || !footerVariants || !headerRelationshipIds || !footerRelationshipIds) return false;
+  return (
+    headerVariants.every(
+      (key) => geometry.headerContentHeights?.[key as 'default' | 'first' | 'even' | 'odd'] != null,
+    ) &&
+    footerVariants.every(
+      (key) => geometry.footerContentHeights?.[key as 'default' | 'first' | 'even' | 'odd'] != null,
+    ) &&
+    headerRelationshipIds.every((relationshipId) => geometry.headerContentHeightsByRId?.has(relationshipId)) &&
+    footerRelationshipIds.every((relationshipId) => geometry.footerContentHeightsByRId?.has(relationshipId))
+  );
+}
+
+function readReusableHeaderFooterGeometry(input: {
+  retainedSeed: HeaderFooterGeometrySeed | null | undefined;
+  ownerFingerprint: string | null | undefined;
+  fontSignature: string;
+  pageCountFieldsExact: boolean;
+  constraints: HeaderFooterConstraints | null;
+  sectionMetadata: readonly SectionMetadata[];
+}): HeaderFooterGeometryPlane | null {
+  const seed = input.retainedSeed;
+  if (
+    !seed ||
+    seed.version !== 2 ||
+    typeof input.ownerFingerprint !== 'string' ||
+    input.ownerFingerprint.length === 0 ||
+    seed.ownerFingerprint !== input.ownerFingerprint ||
+    seed.fontSignature !== input.fontSignature ||
+    seed.pageCountFieldsExact !== input.pageCountFieldsExact ||
+    !input.constraints ||
+    seed.sectionMetadataHasChapterNumbering !== false ||
+    seed.constraintsFingerprint !== headerFooterInputFingerprint(input.constraints) ||
+    typeof seed.sectionMetadataFingerprint !== 'string' ||
+    seed.sectionMetadataFingerprint.length === 0
+  )
+    return null;
+  if (issuedHeaderFooterGeometrySeeds.has(seed)) return seed.geometry;
+  const geometry = cloneValidatedHeaderFooterGeometry(seed.geometry);
+  return geometry &&
+    hasRequiredHeaderFooterGeometry(seed, geometry) &&
+    buildHeaderFooterGeometryFingerprint(geometry) === seed.geometryFingerprint
+    ? geometry
+    : null;
+}
+
+function createHeaderFooterGeometrySeed(input: {
+  ownerFingerprint: string | null | undefined;
+  fontSignature: string;
+  pageCountFieldsExact: boolean;
+  constraints: HeaderFooterConstraints | null;
+  sectionMetadata: readonly SectionMetadata[];
+  requiredHeaderVariants: readonly ('default' | 'first' | 'even' | 'odd')[];
+  requiredFooterVariants: readonly ('default' | 'first' | 'even' | 'odd')[];
+  requiredHeaderRelationshipIds: readonly string[];
+  requiredFooterRelationshipIds: readonly string[];
+  geometryFingerprint: string;
+  geometry: HeaderFooterGeometryPlane;
+}): HeaderFooterGeometrySeed | null {
+  if (
+    typeof input.ownerFingerprint !== 'string' ||
+    input.ownerFingerprint.length === 0 ||
+    !input.constraints ||
+    sectionsHaveChapterNumbering(input.sectionMetadata as SectionMetadata[])
+  )
+    return null;
+  const geometry = cloneValidatedHeaderFooterGeometry(input.geometry);
+  if (!geometry) return null;
+  const seed: HeaderFooterGeometrySeed = Object.freeze({
+    version: 2,
+    ownerFingerprint: input.ownerFingerprint,
+    fontSignature: input.fontSignature,
+    pageCountFieldsExact: input.pageCountFieldsExact,
+    constraintsFingerprint: headerFooterInputFingerprint(input.constraints),
+    sectionMetadataFingerprint: headerFooterInputFingerprint(input.sectionMetadata),
+    sectionMetadataHasChapterNumbering: false,
+    geometryFingerprint: input.geometryFingerprint,
+    requiredHeaderVariants: Object.freeze([...input.requiredHeaderVariants].sort()),
+    requiredFooterVariants: Object.freeze([...input.requiredFooterVariants].sort()),
+    requiredHeaderRelationshipIds: Object.freeze([...input.requiredHeaderRelationshipIds].sort()),
+    requiredFooterRelationshipIds: Object.freeze([...input.requiredFooterRelationshipIds].sort()),
+    geometry,
+  });
+  if (
+    !hasRequiredHeaderFooterGeometry(seed, geometry) ||
+    buildHeaderFooterGeometryFingerprint(geometry) !== input.geometryFingerprint
+  )
+    return null;
+  issuedHeaderFooterGeometrySeeds.add(seed);
+  return seed;
 }
 
 function computeTimingUnionMs(intervals: readonly { start: number; end: number }[]): number {
@@ -444,6 +695,39 @@ export type IncrementalLayoutReuseOptions = {
 };
 
 export const measureCache = new MeasureCache<Measure>();
+
+function isPrivateV2SourceToLayoutFailure(error: unknown): error is Error {
+  return error instanceof Error && error.name === 'V2SourceToLayoutFailure';
+}
+
+const V2_RENDER_DIAGNOSTIC_POST_BODY_LAYOUT_FAILURE = Symbol.for(
+  'superdoc.v2.render-diagnostic.post-body-layout-failure',
+);
+const V2_RENDER_DIAGNOSTIC_POST_BODY_LAYOUT_MEASUREMENT = Symbol.for(
+  'superdoc.v2.render-diagnostic.post-body-layout-measurement',
+);
+const V2_RENDER_DIAGNOSTIC_BOUNDED_RETRY = Symbol.for('superdoc.v2.render-diagnostic.bounded-layout-retry');
+const V2_RENDER_DIAGNOSTIC_PAGINATION_PREFIX = Symbol.for('superdoc.v2.render-diagnostic.pagination-prefix');
+
+function readRenderDiagnosticPaginationPrefix(layout: Layout): { blockId: string; pageIndex: number } | null {
+  const value = (layout as Layout & Record<PropertyKey, unknown>)[V2_RENDER_DIAGNOSTIC_PAGINATION_PREFIX];
+  if (!value || typeof value !== 'object') return null;
+  const { blockId, pageIndex } = value as { blockId?: unknown; pageIndex?: unknown };
+  return typeof blockId === 'string' && Number.isSafeInteger(pageIndex) && (pageIndex as number) >= 0
+    ? { blockId, pageIndex: pageIndex as number }
+    : null;
+}
+
+function markPostBodyLayoutFailure<T>(error: T): T {
+  if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+    Object.defineProperty(error, V2_RENDER_DIAGNOSTIC_POST_BODY_LAYOUT_FAILURE, {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+  }
+  return error;
+}
 const headerMeasureCache = new HeaderFooterLayoutCache();
 const headerFooterCacheState = new HeaderFooterCacheState();
 
@@ -630,6 +914,26 @@ const resolveMaxColumnWidth = (contentWidth: number, columns?: ColumnLayout): nu
   if (!columns || columns.count <= 1) return contentWidth;
   const normalized = normalizeColumnsForFootnotes(columns, contentWidth);
   return normalized.width;
+};
+
+const measurementWidthForColumn = (
+  contentWidth: number,
+  columns: ColumnLayout | undefined,
+  columnIndex: number,
+): number => {
+  if (!columns || resolveColumnCount(columns) <= 1) return contentWidth;
+  return getColumnWidth(getColumnGeometry(normalizeColumnsForFootnotes(columns, contentWidth)), columnIndex);
+};
+
+const advanceMeasurementColumnIndex = (columns: ColumnLayout | undefined, currentColumnIndex: number): number => {
+  const columnCount = resolveColumnCount(columns);
+  return currentColumnIndex < columnCount - 1 ? currentColumnIndex + 1 : 0;
+};
+
+const normalizeMeasurementColumnIndex = (columns: ColumnLayout | undefined, value: unknown): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const columnCount = resolveColumnCount(columns);
+  return Math.max(0, Math.min(Math.floor(value), columnCount - 1));
 };
 
 const normalizeColumnsForFootnotes = (input: ColumnLayout | undefined, contentWidth: number): NormalizedColumns => {
@@ -1385,7 +1689,7 @@ function validateRetainedNoteMeasurePlane(
  * Tables recurse: cell paragraphs are measured nested (`TableCellMeasure.
  * blocks`/`paragraph`), and their tab runs carry the same stamps — a warm
  * cache hit on the TABLE otherwise leaves every nested tab width unstamped,
- * which is exactly the freddie browser determinism divergence (painter plan
+ * which is exactly the large-document browser determinism divergence (painter plan
  * debt 1, 2026-07-05: pass 1 measured/stamped, pass 2 cache-hit/unstamped).
  */
 function hydrateTabRunWidthsFromMeasure(block: FlowBlock, measure: Measure): void {
@@ -1549,6 +1853,11 @@ export async function incrementalLayout(
     noteMeasurePlaneRetainedExact?: true;
     /** Extra note/decorative planes paired with the retained note bundle. */
     retainedFootnoteExtras?: { blocks: FlowBlock[]; measures: Measure[] };
+    /** Current immutable host owner and the prior bridge-issued geometry seed. */
+    headerFooterGeometry?: {
+      ownerFingerprint: string;
+      retainedSeed: HeaderFooterGeometrySeed | null;
+    };
   },
   layoutReuse?: IncrementalLayoutReuseOptions,
   measureReuseProof?: IncrementalMeasureReuseProof,
@@ -1581,7 +1890,7 @@ export async function incrementalLayout(
       : undefined;
   const headerFooterExecution: HeaderFooterLayoutExecution | undefined = execution
     ? {
-        ...(layoutExecution ?? {}),
+        ...layoutExecution,
         ...(execution.checkpointIfDue ? { checkpointIfDue: execution.checkpointIfDue } : {}),
       }
     : undefined;
@@ -1639,6 +1948,9 @@ export async function incrementalLayout(
     nextBlocks = rewriteSectionBreaksForSemanticFlow(nextBlocks, options);
   }
 
+  let blocksByKind: Record<FlowBlock['kind'], number> | undefined;
+  const bodyBlocksMeasuredByKind = createFlowBlockKindCounters();
+
   // Dirty region computation
   const effectiveMeasureReuseProof = measureReuseProof ?? layoutReuse;
   const headerFooterOnlyProof = layoutReuse?.provedHeaderFooterOnlyRefresh;
@@ -1666,8 +1978,9 @@ export async function incrementalLayout(
   // builds the content map.
   const CONTENT_ADOPTION_MISS_THRESHOLD = 4;
 
-  if (dirty.deletedBlockIds.length > 0) {
-    measureCache.invalidate(dirty.deletedBlockIds);
+  const invalidatedMeasureBlockIds = [...new Set([...dirty.changedBlockIds, ...dirty.deletedBlockIds])];
+  if (invalidatedMeasureBlockIds.length > 0) {
+    measureCache.invalidate(invalidatedMeasureBlockIds);
   }
 
   const provedDirtyMeasurePacket =
@@ -1759,7 +2072,13 @@ export async function incrementalLayout(
   let cacheMisses = 0;
   let reusedMeasures = 0;
   let cacheLookupTime = 0;
+  let cacheWriteTime = 0;
+  let contentAdoptionTime = 0;
   let actualMeasureTime = 0;
+  let bodyMeasureCacheReads = 0;
+  let bodyMeasureCacheWrites = 0;
+  let bodyMeasureCacheKeyComputations = 0;
+  let measureContentSignatureComputations = 0;
 
   // P8.4 — content-keyed previous-measure adoption. Structural keystrokes
   // under synthetic occurrence ids (paraId-less documents: split/merge/paste,
@@ -1785,10 +2104,12 @@ export async function incrementalLayout(
         const previousBlock = previousBlocks[index];
         if (previousBlock.kind === 'sectionBreak') continue;
         const constraints = previousPerSectionConstraints![index];
+        measureContentSignatureComputations += 1;
         const key = `${hashMeasureContent(previousBlock)}@${constraints.maxWidth}x${constraints.maxHeight}`;
         if (!previousMeasuresByContent.has(key)) previousMeasuresByContent.set(key, previousMeasures![index]);
       }
     }
+    measureContentSignatureComputations += 1;
     return previousMeasuresByContent?.get(`${hashMeasureContent(block)}@${maxWidth}x${maxHeight}`) ?? undefined;
   };
 
@@ -1843,24 +2164,26 @@ export async function incrementalLayout(
       const measureBlockStart = performance.now();
       const measurement = await measureBlock(block, constraints);
       actualMeasureTime += performance.now() - measureBlockStart;
+      bodyBlocksMeasuredByKind[block.kind] += 1;
+      const cacheWriteStart = performance.now();
       measureCache.set(block, constraints.maxWidth, constraints.maxHeight, measurement, fontSignature);
+      cacheWriteTime += performance.now() - cacheWriteStart;
+      bodyMeasureCacheWrites += 1;
+      bodyMeasureCacheKeyComputations += 1;
       overrides.set(blockIndex, measurement);
       cacheMisses += 1;
     }
     if (provedDirtyMeasure.measureSplice) {
-      // Structural ±1 alignment: preserve the retained measure plane by
-      // position, insert/remove only at the proved adjacent paragraph, then
-      // overwrite every dirty result measure. This avoids the O(document)
-      // content-hash adoption scan while keeping same-index block/measure
-      // ownership exact.
+      // Preserve the retained measure plane by position, replace only the
+      // certified contiguous owner interval, then overwrite every current
+      // dirty result.
       measures = previousMeasures!.slice();
-      if (provedDirtyMeasure.measureSplice.ordinalDelta === 1) {
-        const headMeasure = measures[provedDirtyMeasure.measureSplice.atIndex - 1];
-        if (!headMeasure) throw new Error('incrementalLayout: structural split measure anchor missing');
-        measures.splice(provedDirtyMeasure.measureSplice.atIndex, 0, headMeasure);
-      } else {
-        measures.splice(provedDirtyMeasure.measureSplice.atIndex, 1);
+      const { atIndex, deleteCount, insertCount } = provedDirtyMeasure.measureSplice;
+      const anchorMeasure = measures[Math.max(0, atIndex - 1)] ?? measures[atIndex];
+      if (insertCount > 0 && !anchorMeasure) {
+        throw new Error('incrementalLayout: structural measure splice anchor missing');
       }
+      measures.splice(atIndex, deleteCount, ...Array.from({ length: insertCount }, () => anchorMeasure!));
       for (const [index, measurement] of overrides) measures[index] = measurement;
       if (measures.length !== nextBlocks.length) {
         throw new Error('incrementalLayout: structural measure splice cardinality mismatch');
@@ -1869,7 +2192,8 @@ export async function incrementalLayout(
       measures = createMeasureOverlay(previousMeasures!, overrides);
     }
     reusedMeasures = nextBlocks.length - overrides.size;
-  } else
+  } else {
+    blocksByKind = createFlowBlockKindCounters();
     for (let blockIndex = 0; blockIndex < nextBlocks.length; blockIndex++) {
       const checkpoint = checkpointMeasurement(blockIndex, nextBlocks.length);
       if (checkpoint) {
@@ -1877,6 +2201,7 @@ export async function incrementalLayout(
         throwIfLayoutExecutionAborted(layoutExecution);
       }
       const block = nextBlocks[blockIndex];
+      blocksByKind[block.kind] += 1;
       if (block.kind === 'sectionBreak') {
         measures.push({ kind: 'sectionBreak' });
         continue;
@@ -1905,8 +2230,11 @@ export async function incrementalLayout(
 
       // Time the cache lookup (includes hashRuns computation)
       const lookupStart = performance.now();
-      const cached = measureCache.get(block, blockMeasureWidth, blockMeasureHeight, fontSignature);
+      const measureCacheKey = measureCache.prepareKey(block, blockMeasureWidth, blockMeasureHeight, fontSignature);
+      const cached = measureCache.getPrepared(measureCacheKey);
       cacheLookupTime += performance.now() - lookupStart;
+      bodyMeasureCacheReads += 1;
+      bodyMeasureCacheKeyComputations += 1;
 
       if (cached) {
         hydrateTabRunWidthsFromMeasure(block, cached);
@@ -1928,10 +2256,15 @@ export async function incrementalLayout(
         previousMeasuresById != null &&
         (!previousMeasuresById.has(block.id) || cacheMisses >= CONTENT_ADOPTION_MISS_THRESHOLD)
       ) {
+        const adoptionStart = performance.now();
         const adopted = adoptPreviousMeasureByContent(block, blockMeasureWidth, blockMeasureHeight);
+        contentAdoptionTime += performance.now() - adoptionStart;
         if (adopted) {
           hydrateTabRunWidthsFromMeasure(block, adopted);
-          measureCache.set(block, blockMeasureWidth, blockMeasureHeight, adopted, fontSignature);
+          const cacheWriteStart = performance.now();
+          measureCache.setPrepared(measureCacheKey, block.id, adopted);
+          cacheWriteTime += performance.now() - cacheWriteStart;
+          bodyMeasureCacheWrites += 1;
           measures.push(adopted);
           reusedMeasures++;
           continue;
@@ -1942,11 +2275,19 @@ export async function incrementalLayout(
       const measureBlockStart = performance.now();
       const measurement = await measureBlock(block, sectionConstraints);
       actualMeasureTime += performance.now() - measureBlockStart;
+      bodyBlocksMeasuredByKind[block.kind] += 1;
 
-      measureCache.set(block, blockMeasureWidth, blockMeasureHeight, measurement, fontSignature);
+      const cacheWriteStart = performance.now();
+      // The measurer may stamp runtime-only tab widths and drop-cap dimensions;
+      // hashMeasureContent intentionally excludes those fields. Content that
+      // affects measurement must remain unchanged across this transaction.
+      measureCache.setPrepared(measureCacheKey, block.id, measurement);
+      cacheWriteTime += performance.now() - cacheWriteStart;
+      bodyMeasureCacheWrites += 1;
       measures.push(measurement);
       cacheMisses++;
     }
+  }
   const measureEnd = performance.now();
   const totalMeasureTime = measureEnd - measureStart;
   await checkpointPhaseIfDue();
@@ -1980,6 +2321,42 @@ export async function incrementalLayout(
   const hasHeaderBlocks = headerFooter?.headerBlocks && Object.keys(headerFooter.headerBlocks).length > 0;
   const hasHeaderBlocksByRId = headerFooter?.headerBlocksByRId && headerFooter.headerBlocksByRId.size > 0;
   const sectionMetadata = options.sectionMetadata ?? [];
+  const pageCountFieldsExact = headerFooter?.pageCountFieldsExact !== false;
+  const retainedHeaderFooterGeometry = readReusableHeaderFooterGeometry({
+    retainedSeed: warmStart?.headerFooterGeometry?.retainedSeed,
+    ownerFingerprint: warmStart?.headerFooterGeometry?.ownerFingerprint,
+    fontSignature,
+    pageCountFieldsExact,
+    constraints: headerFooter?.constraints ?? null,
+    sectionMetadata,
+  });
+  const headerFooterGeometryReused = retainedHeaderFooterGeometry != null;
+  let headerFooterPrelayoutComplete = true;
+  let prelayoutPageResolver: PageResolver | undefined;
+  let prelayoutPageResolverBuilt = false;
+  let headerFooterPreLayoutBodyBlocksEnumerated = 0;
+  let headerFooterPreLayoutSectionsEnumerated = 0;
+  const getPrelayoutPageResolver = async (): Promise<PageResolver | undefined> => {
+    if (prelayoutPageResolverBuilt) return prelayoutPageResolver;
+    headerFooterPreLayoutBodyBlocksEnumerated = nextBlocks.length;
+    headerFooterPreLayoutSectionsEnumerated = sectionMetadata.length;
+    prelayoutPageResolver = layoutExecution
+      ? await buildConservativePrelayoutPageResolverCooperatively(nextBlocks, sectionMetadata, layoutExecution)
+      : buildConservativePrelayoutPageResolver(nextBlocks, sectionMetadata);
+    prelayoutPageResolverBuilt = true;
+    return prelayoutPageResolver;
+  };
+  if (retainedHeaderFooterGeometry) {
+    headerContentHeights = retainedHeaderFooterGeometry.headerContentHeights
+      ? { ...retainedHeaderFooterGeometry.headerContentHeights }
+      : undefined;
+    headerContentHeightsByRId = retainedHeaderFooterGeometry.headerContentHeightsByRId
+      ? (retainedHeaderFooterGeometry.headerContentHeightsByRId as Map<string, number>)
+      : undefined;
+    headerContentHeightsBySectionRef = retainedHeaderFooterGeometry.headerContentHeightsBySectionRef
+      ? (retainedHeaderFooterGeometry.headerContentHeightsBySectionRef as Map<string, number>)
+      : undefined;
+  }
 
   const measureHeightsByReference = async (
     kind: 'header' | 'footer',
@@ -2071,7 +2448,7 @@ export async function incrementalLayout(
     };
   };
 
-  if (headerFooter?.constraints && (hasHeaderBlocks || hasHeaderBlocksByRId)) {
+  if (!headerFooterGeometryReused && headerFooter?.constraints && (hasHeaderBlocks || hasHeaderBlocksByRId)) {
     const hfPreStart = performance.now();
     const measureFn = headerFooter.measure ?? measureBlock;
 
@@ -2091,9 +2468,7 @@ export async function incrementalLayout(
      * header height calculations. A value of 1 is sufficient as a placeholder.
      */
     const HEADER_PRELAYOUT_PLACEHOLDER_PAGE_COUNT = 1;
-    const prelayoutPageResolver = layoutExecution
-      ? await buildConservativePrelayoutPageResolverCooperatively(nextBlocks, sectionMetadata, layoutExecution)
-      : buildConservativePrelayoutPageResolver(nextBlocks, sectionMetadata);
+    const prelayoutPageResolver = await getPrelayoutPageResolver();
 
     /**
      * Type guard to check if a key is a valid header variant type.
@@ -2166,7 +2541,10 @@ export async function incrementalLayout(
    * Values are the actual content heights in pixels, guaranteed to be finite and non-negative.
    * Undefined if footer pre-layout fails or footers are not present.
    */
-  let footerContentHeights: Partial<Record<'default' | 'first' | 'even' | 'odd', number>> | undefined;
+  let footerContentHeights: Partial<Record<'default' | 'first' | 'even' | 'odd', number>> | undefined =
+    retainedHeaderFooterGeometry?.footerContentHeights
+      ? { ...retainedHeaderFooterGeometry.footerContentHeights }
+      : undefined;
 
   /**
    * Actual measured footer content heights per relationship ID.
@@ -2174,15 +2552,21 @@ export async function incrementalLayout(
    * Keys are relationship IDs (e.g., 'rId8', 'rId9').
    * Values are the actual content heights in pixels.
    */
-  let footerContentHeightsByRId: Map<string, number> | undefined;
-  let footerContentHeightsBySectionRef: Map<string, number> | undefined;
+  let footerContentHeightsByRId: Map<string, number> | undefined =
+    retainedHeaderFooterGeometry?.footerContentHeightsByRId
+      ? (retainedHeaderFooterGeometry.footerContentHeightsByRId as Map<string, number>)
+      : undefined;
+  let footerContentHeightsBySectionRef: Map<string, number> | undefined =
+    retainedHeaderFooterGeometry?.footerContentHeightsBySectionRef
+      ? (retainedHeaderFooterGeometry.footerContentHeightsBySectionRef as Map<string, number>)
+      : undefined;
   let footerPreLayoutTime = 0;
 
   // Check if we have footers via either footerBlocks (by variant) or footerBlocksByRId (by relationship ID)
   const hasFooterBlocks = headerFooter?.footerBlocks && Object.keys(headerFooter.footerBlocks).length > 0;
   const hasFooterBlocksByRId = headerFooter?.footerBlocksByRId && headerFooter.footerBlocksByRId.size > 0;
 
-  if (headerFooter?.constraints && (hasFooterBlocks || hasFooterBlocksByRId)) {
+  if (!headerFooterGeometryReused && headerFooter?.constraints && (hasFooterBlocks || hasFooterBlocksByRId)) {
     const footerPreStart = performance.now();
     const measureFn = headerFooter.measure ?? measureBlock;
 
@@ -2205,9 +2589,7 @@ export async function incrementalLayout(
      * footer height calculations. A value of 1 is sufficient as a placeholder.
      */
     const FOOTER_PRELAYOUT_PLACEHOLDER_PAGE_COUNT = 1;
-    const prelayoutPageResolver = layoutExecution
-      ? await buildConservativePrelayoutPageResolverCooperatively(nextBlocks, sectionMetadata, layoutExecution)
-      : buildConservativePrelayoutPageResolver(nextBlocks, sectionMetadata);
+    const prelayoutPageResolver = await getPrelayoutPageResolver();
 
     /**
      * Type guard to check if a key is a valid footer variant type.
@@ -2268,8 +2650,14 @@ export async function incrementalLayout(
       }
     } catch (error) {
       throwIfLayoutExecutionAborted(layoutExecution);
+      // The v2 host validates this realm-local carrier against its private
+      // WeakSet before containing it. Preserve it across the compatibility
+      // footer fallback; a forged name still reaches the ordinary host
+      // recovery path because it cannot pass that validation.
+      if (isPrivateV2SourceToLayoutFailure(error)) throw error;
       console.error('[Layout] Footer pre-layout failed:', error);
       footerContentHeights = undefined;
+      headerFooterPrelayoutComplete = false;
     }
 
     const footerPreEnd = performance.now();
@@ -2277,14 +2665,49 @@ export async function incrementalLayout(
     perfLog(`[Perf] 4.1.6 Pre-layout footers for height: ${footerPreLayoutTime.toFixed(2)}ms`);
   }
 
-  const headerFooterGeometryFingerprint = buildHeaderFooterGeometryFingerprint({
-    headerContentHeights,
-    footerContentHeights,
-    headerContentHeightsByRId,
-    headerContentHeightsBySectionRef,
-    footerContentHeightsByRId,
-    footerContentHeightsBySectionRef,
-  });
+  const headerFooterGeometryFingerprint = headerFooterGeometryReused
+    ? warmStart!.headerFooterGeometry!.retainedSeed!.geometryFingerprint
+    : buildHeaderFooterGeometryFingerprint({
+        headerContentHeights,
+        footerContentHeights,
+        headerContentHeightsByRId,
+        headerContentHeightsBySectionRef,
+        footerContentHeightsByRId,
+        footerContentHeightsBySectionRef,
+      });
+  const hasHeaderFooterContent = Boolean(
+    hasHeaderBlocks || hasHeaderBlocksByRId || hasFooterBlocks || hasFooterBlocksByRId,
+  );
+  const nextHeaderFooterGeometrySeed = headerFooterGeometryReused
+    ? (warmStart?.headerFooterGeometry?.retainedSeed ?? null)
+    : headerFooterPrelayoutComplete && hasHeaderFooterContent
+      ? createHeaderFooterGeometrySeed({
+          ownerFingerprint: warmStart?.headerFooterGeometry?.ownerFingerprint,
+          fontSignature,
+          pageCountFieldsExact,
+          constraints: headerFooter?.constraints ?? null,
+          sectionMetadata,
+          requiredHeaderVariants: Object.keys(headerFooter?.headerBlocks ?? {}).filter(
+            (key): key is 'default' | 'first' | 'even' | 'odd' =>
+              key === 'default' || key === 'first' || key === 'even' || key === 'odd',
+          ),
+          requiredFooterVariants: Object.keys(headerFooter?.footerBlocks ?? {}).filter(
+            (key): key is 'default' | 'first' | 'even' | 'odd' =>
+              key === 'default' || key === 'first' || key === 'even' || key === 'odd',
+          ),
+          requiredHeaderRelationshipIds: [...(headerFooter?.headerBlocksByRId?.keys() ?? [])],
+          requiredFooterRelationshipIds: [...(headerFooter?.footerBlocksByRId?.keys() ?? [])],
+          geometryFingerprint: headerFooterGeometryFingerprint,
+          geometry: {
+            headerContentHeights,
+            footerContentHeights,
+            headerContentHeightsByRId,
+            headerContentHeightsBySectionRef,
+            footerContentHeightsByRId,
+            footerContentHeightsBySectionRef,
+          },
+        })
+      : null;
 
   // SD-3432: when a warm-start seed is usable, build the INITIAL pagination
   // directly with the seeded reserves (and the note body heights the slicer
@@ -2413,6 +2836,12 @@ export async function incrementalLayout(
     dirty,
     stableBlockIds: dirty.stableBlockIds,
     reuse: layoutReuse,
+    relayoutProvedPrefixToDocumentEndOnBoundedConvergenceFailure:
+      earlyFootnotesInput != null &&
+      layoutReuse?.dependencyProof != null &&
+      (layoutReuse.dependencyProof.profile === 'document-start-local-text' ||
+        (layoutReuse.dependencyProof.profile === 'page-checkpoint-local-text' &&
+          layoutReuse.dependencyProof.admittedDependencyClasses.includes('footnotes'))),
     ...(warmSeedUsable && warmSeed && earlyFootnotesInput && preparedWarmNoteMeasures
       ? {
           preparedNoteOnly: {
@@ -2643,6 +3072,7 @@ export async function incrementalLayout(
   const footnoteStart = performance.now();
   let footnoteFullRelayoutPerformed = false;
   let footnoteRelayouts = 0;
+  let footnotePaginationTime = 0;
   const footnoteRelayoutBreakdown = {
     reserve: 0,
     grow: 0,
@@ -2685,6 +3115,11 @@ export async function incrementalLayout(
       const footnoteSectionColumnsByIndex =
         retainedFootnoteGeometry?.sectionColumnsByIndex ?? resolveSectionColumnsByIndex(options, currentBlocks);
       const footnoteConstraints = { maxWidth: footnoteWidth, maxHeight: measurementHeight };
+      Object.defineProperty(footnoteConstraints, V2_RENDER_DIAGNOSTIC_POST_BODY_LAYOUT_MEASUREMENT, {
+        configurable: true,
+        enumerable: true,
+        value: true,
+      });
       // The fixed-point planner can rediscover the same cap/truncation on
       // several internal passes. Console I/O is diagnostic only; emit each
       // stable fact once per incrementalLayout invocation.
@@ -2700,32 +3135,42 @@ export async function incrementalLayout(
         return ids;
       };
 
-      const measureFootnoteBlocks = (ids: Set<string>) => {
-        if (!retainedNoteMeasures) {
-          return measureNoteBlocks(ids, footnotesInput.blocksById, footnoteConstraints, measureBlock, fontSignature);
-        }
-        const blocks: FlowBlock[] = [];
-        const measuresById = new Map<string, Measure>();
-        for (const id of ids) {
-          for (const block of footnotesInput.blocksById.get(id) ?? []) {
-            const measure = retainedNoteMeasures.get(block.id);
-            if (!measure) {
-              return measureNoteBlocks(
-                ids,
-                footnotesInput.blocksById,
-                footnoteConstraints,
-                measureBlock,
-                fontSignature,
-              );
-            }
-            blocks.push(block);
-            measuresById.set(block.id, measure);
+      const measureFootnoteBlocks = async (ids: Set<string>) => {
+        try {
+          if (!retainedNoteMeasures) {
+            return await measureNoteBlocks(
+              ids,
+              footnotesInput.blocksById,
+              footnoteConstraints,
+              measureBlock,
+              fontSignature,
+            );
           }
+          const blocks: FlowBlock[] = [];
+          const measuresById = new Map<string, Measure>();
+          for (const id of ids) {
+            for (const block of footnotesInput.blocksById.get(id) ?? []) {
+              const measure = retainedNoteMeasures.get(block.id);
+              if (!measure) {
+                return await measureNoteBlocks(
+                  ids,
+                  footnotesInput.blocksById,
+                  footnoteConstraints,
+                  measureBlock,
+                  fontSignature,
+                );
+              }
+              blocks.push(block);
+              measuresById.set(block.id, measure);
+            }
+          }
+          return {
+            blocks,
+            measuresById: measuresById.size === retainedNoteMeasures.size ? retainedNoteMeasures : measuresById,
+          };
+        } catch (error) {
+          throw markPostBodyLayoutFailure(error);
         }
-        return Promise.resolve({
-          blocks,
-          measuresById: measuresById.size === retainedNoteMeasures.size ? retainedNoteMeasures : measuresById,
-        });
       };
 
       const computeFootnoteLayoutPlan = (
@@ -3626,7 +4071,7 @@ export async function incrementalLayout(
                 plannedReserveTail: summarizeReserveTail(plannedReserves),
               }
             : {}),
-          ...(extra ?? {}),
+          ...extra,
         });
       };
 
@@ -3637,6 +4082,14 @@ export async function incrementalLayout(
       // Otherwise the slicer falls back to defaults that drift on docs with
       // custom separator dimensions, packing body onto a page whose band
       // can't actually fit the refs.
+      const timeFootnotePagination = async <Result>(paginate: () => Result | Promise<Result>): Promise<Result> => {
+        const startedAt = performance.now();
+        try {
+          return await paginate();
+        } finally {
+          footnotePaginationTime += performance.now() - startedAt;
+        }
+      };
       const relayout = async (
         footnoteReservedByPageIndex: number[],
         plannerSeparatorSpacingBefore?: number,
@@ -3680,17 +4133,20 @@ export async function incrementalLayout(
           delete localizedReuse.provedNoteOnlyRefresh;
           delete localizedReuse.provedHeaderFooterOnlyRefresh;
           const localizedTiming = { layoutDocumentMs: 0, layoutDocumentCalls: 0 };
-          const localized = await layoutWithOptionalReuse({
-            previousBlocks,
-            blocks: currentBlocks,
-            measures: currentMeasures,
-            options: footnoteLayoutOptions,
-            dirty,
-            stableBlockIds: dirty.stableBlockIds,
-            reuse: localizedReuse,
-            timing: localizedTiming,
-            execution: layoutExecution,
-          });
+          const localized = await timeFootnotePagination(() =>
+            layoutWithOptionalReuse({
+              previousBlocks,
+              blocks: currentBlocks,
+              measures: currentMeasures,
+              options: footnoteLayoutOptions,
+              dirty,
+              stableBlockIds: dirty.stableBlockIds,
+              reuse: localizedReuse,
+              relayoutProvedPrefixToDocumentEndOnBoundedConvergenceFailure: true,
+              timing: localizedTiming,
+              execution: layoutExecution,
+            }),
+          );
           if (localized.reuse.mode !== 'full') {
             layoutReuseSummary = {
               ...localized.reuse,
@@ -3713,9 +4169,11 @@ export async function incrementalLayout(
           return localized.layout;
         }
         footnoteFullRelayoutPerformed = true;
-        return layoutExecution
-          ? layoutDocumentCooperatively(currentBlocks, currentMeasures, footnoteLayoutOptions, layoutExecution)
-          : layoutDocument(currentBlocks, currentMeasures, footnoteLayoutOptions);
+        return timeFootnotePagination(() =>
+          layoutExecution
+            ? layoutDocumentCooperatively(currentBlocks, currentMeasures, footnoteLayoutOptions, layoutExecution)
+            : layoutDocument(currentBlocks, currentMeasures, footnoteLayoutOptions),
+        );
       };
 
       // SD-3049: every reachable footnote id, computed once. Used to keep
@@ -4535,6 +4993,8 @@ export async function incrementalLayout(
     measureTotalMs: roundTimingMs(totalMeasureTime),
     measureCallbackWallMs: roundTimingMs(measureCallbackWallTime),
     measureCacheLookupMs: roundTimingMs(cacheLookupTime),
+    measureCacheWriteMs: roundTimingMs(cacheWriteTime),
+    measureContentAdoptionMs: roundTimingMs(contentAdoptionTime),
     measureActualMs: roundTimingMs(actualMeasureTime),
     headerFooterPreLayoutMs: roundTimingMs(headerPreLayoutTime + footerPreLayoutTime),
     headerPreLayoutMs: roundTimingMs(headerPreLayoutTime),
@@ -4542,6 +5002,10 @@ export async function incrementalLayout(
     warmStartPreparationMs: roundTimingMs(warmStartPreparationTime),
     layoutDocumentMs: roundTimingMs(layoutDocumentTime),
     layoutReuseOrchestrationMs: roundTimingMs(layoutReuseOrchestrationTime),
+    paginationInitialMs: roundTimingMs(layoutTime),
+    paginationPageTokenMs: roundTimingMs(totalRelayoutTime),
+    paginationFootnoteMs: roundTimingMs(footnotePaginationTime),
+    paginationTotalMs: roundTimingMs(layoutTime + totalRelayoutTime + footnotePaginationTime),
     paginationMs: roundTimingMs(layoutDocumentTime),
     pageTokenSetupMs: roundTimingMs(pageTokenSetupTime),
     pageTokenTotalMs: roundTimingMs(totalTokenTime),
@@ -4554,13 +5018,24 @@ export async function incrementalLayout(
     unattributedMs: roundTimingMs(totalBridgeTime - additiveTopLevelMs),
     counters: {
       blocksRead: nextBlocks.length,
+      ...(blocksByKind ? { blocksByKind } : {}),
+      bodyBlocksMeasuredByKind,
       cacheHits,
       cacheMisses,
+      bodyMeasureCacheReads,
+      bodyMeasureCacheWrites,
+      bodyMeasureCacheKeyComputations,
+      measureContentSignatureComputations,
+      fontSignaturePresent: Number(fontSignature !== ''),
+      fontSignatureChanged: Number(previousFontSignature !== '' && previousFontSignature !== fontSignature),
       measuresAdopted: reusedMeasures,
       pagesPaginated: layoutReuseSummary.pagesPaginated,
       pagesSplicedByReuse: layoutReuseSummary.pagesSplicedByReuse,
       paginationPasses: initialLayoutInvocationTiming.layoutDocumentCalls + iteration + footnoteRelayouts,
       pageTokenRelayouts: iteration,
+      headerFooterPreLayoutReuses: headerFooterGeometryReused ? 1 : 0,
+      headerFooterPreLayoutBodyBlocksEnumerated,
+      headerFooterPreLayoutSectionsEnumerated,
       footnoteRelayouts,
       footnoteReserveRelayouts: footnoteRelayoutBreakdown.reserve,
       footnoteGrowRelayouts: footnoteRelayoutBreakdown.grow,
@@ -4583,6 +5058,7 @@ export async function incrementalLayout(
     extraMeasures,
     footnoteReserveSeed: nextFootnoteReserveSeed,
     headerFooterGeometryFingerprint,
+    headerFooterGeometrySeed: nextHeaderFooterGeometrySeed,
     layoutReuse: layoutReuseSummary,
     measureReuse: {
       mode:
@@ -4617,13 +5093,13 @@ function validateProvedDirtyMeasurePacket(input: {
   dirtyBlockIds: readonly string[];
   currentBlockIndexById: ReadonlyMap<string, number>;
   dirtyMeasureConstraints: ReadonlyMap<string, { maxWidth: number; maxHeight: number }> | null;
-  measureSplice: { ordinalDelta: 1 | -1; atIndex: number } | null;
+  measureSplice: { atIndex: number; deleteCount: number; insertCount: number } | null;
 } | null {
   if (input.previousMeasures.length !== input.previousBlocks.length) return null;
   if (input.currentBlockIndexById.size !== input.blocks.length) return null;
   const inserted = input.dirty.insertedBlockIds;
   const deleted = input.dirty.deletedBlockIds;
-  let measureSplice: { ordinalDelta: 1 | -1; atIndex: number } | null = null;
+  let measureSplice: { atIndex: number; deleteCount: number; insertCount: number } | null = null;
   if (inserted.length === 0 && deleted.length === 0) {
     if (input.blocks.length !== input.previousBlocks.length) return null;
   } else if (inserted.length === 1 && deleted.length === 0) {
@@ -4637,7 +5113,7 @@ function validateProvedDirtyMeasurePacket(input: {
       input.previousBlocks[insertedIndex! - 1]?.id !== headId
     )
       return null;
-    measureSplice = { ordinalDelta: 1, atIndex: insertedIndex! };
+    measureSplice = { atIndex: insertedIndex!, deleteCount: 0, insertCount: 1 };
   } else if (inserted.length === 0 && deleted.length === 1) {
     if (input.blocks.length + 1 !== input.previousBlocks.length || !input.previousBlockIndexById) return null;
     const deletedIndex = input.previousBlockIndexById.get(deleted[0]!);
@@ -4649,12 +5125,40 @@ function validateProvedDirtyMeasurePacket(input: {
       input.blocks[deletedIndex! - 1]?.id !== headId
     )
       return null;
-    measureSplice = { ordinalDelta: -1, atIndex: deletedIndex! };
+    measureSplice = { atIndex: deletedIndex!, deleteCount: 1, insertCount: 0 };
+  } else if (inserted.length === 1 && deleted.length >= 1) {
+    if (input.blocks.length !== input.previousBlocks.length - deleted.length + 1 || !input.previousBlockIndexById)
+      return null;
+    const insertedIndex = input.currentBlockIndexById.get(inserted[0]!);
+    const deletedIndexes = deleted.map((blockId) => input.previousBlockIndexById!.get(blockId));
+    if (
+      !Number.isInteger(insertedIndex) ||
+      deletedIndexes.some((index) => !Number.isInteger(index)) ||
+      deletedIndexes.some((index, offset) => index !== deletedIndexes[0]! + offset) ||
+      insertedIndex !== deletedIndexes[0] ||
+      input.blocks[insertedIndex!]?.id !== inserted[0] ||
+      deleted.some((blockId, offset) => input.previousBlocks[deletedIndexes[0]! + offset]?.id !== blockId)
+    ) {
+      return null;
+    }
+    if (deleted.length > 1) {
+      measureSplice = {
+        atIndex: insertedIndex!,
+        deleteCount: deleted.length,
+        insertCount: 1,
+      };
+    }
   } else {
     return null;
   }
-  const dirtyBlockIds = [...new Set(input.dirty.changedBlockIds)];
-  if (dirtyBlockIds.length === 0 || dirtyBlockIds.length !== input.dirty.changedBlockIds.length) return null;
+  const changedBlockIds = [...new Set(input.dirty.changedBlockIds)];
+  if (changedBlockIds.length !== input.dirty.changedBlockIds.length) return null;
+  // Structural split packets already include their inserted tail in
+  // changedBlockIds. Same-position replacements may instead expose the new
+  // owner only through insertedBlockIds. Admit both canonical shapes without
+  // treating that intentional overlap as a duplicate dirty owner.
+  const dirtyBlockIds = [...new Set([...changedBlockIds, ...input.dirty.insertedBlockIds])];
+  if (dirtyBlockIds.length === 0) return null;
   for (const blockId of dirtyBlockIds) {
     const index = input.currentBlockIndexById.get(blockId);
     if (!Number.isInteger(index) || index! < 0 || index! >= input.blocks.length) return null;
@@ -5240,6 +5744,7 @@ async function layoutWithOptionalReuse(input: {
   reuse?: IncrementalLayoutReuseOptions;
   preparedNoteOnly?: PreparedNoteOnlyLayoutReuse;
   preparedHeaderFooterOnly?: PreparedHeaderFooterOnlyLayoutReuse;
+  relayoutProvedPrefixToDocumentEndOnBoundedConvergenceFailure?: boolean;
   timing: { layoutDocumentMs: number; layoutDocumentCalls: number };
   execution?: LayoutExecutionControl;
 }): Promise<{
@@ -5270,28 +5775,41 @@ async function layoutWithOptionalReuse(input: {
       ...(noteOnlyRejectionReason == null ? [] : [`note-only=${noteOnlyRejectionReason}`]),
       ...(headerFooterOnlyRejectionReason == null ? [] : [`header-footer-only=${headerFooterOnlyRejectionReason}`]),
     ].join(';');
-  const full = async (reason: string): Promise<{ layout: Layout; reuse: IncrementalLayoutReuseSummary }> => ({
-    layout: await runLayoutDocument(input.blocks, input.measures, input.options),
-    reuse: {
-      mode: 'full',
-      reason: withSpecializedRejections(reason),
-      tailDisposition: 'none',
-      checkpointPageIndex: null,
-      affectedFrontierPageIndex: null,
-      sourceAffectedFrontierPageIndex: null,
-      convergencePageIndex: null,
-      sourceConvergencePageIndex: null,
-      pagesPaginated: null,
-      pagesSplicedByReuse: 0,
-      tailAdoption: null,
-    },
-  });
+  const isBoundedRenderDiagnosticRetry =
+    input.reuse != null &&
+    (input.reuse as IncrementalLayoutReuseOptions & Record<PropertyKey, unknown>)[
+      V2_RENDER_DIAGNOSTIC_BOUNDED_RETRY
+    ] === true;
+  const full = async (reason: string): Promise<{ layout: Layout; reuse: IncrementalLayoutReuseSummary }> => {
+    if (isBoundedRenderDiagnosticRetry) {
+      const error = new Error(`bounded render diagnostic layout retry was not admitted: ${reason}`);
+      error.name = 'V2RenderDiagnosticBoundedRetryRejectedError';
+      throw error;
+    }
+    return {
+      layout: await runLayoutDocument(input.blocks, input.measures, input.options),
+      reuse: {
+        mode: 'full',
+        reason: withSpecializedRejections(reason),
+        tailDisposition: 'none',
+        checkpointPageIndex: null,
+        affectedFrontierPageIndex: null,
+        sourceAffectedFrontierPageIndex: null,
+        convergencePageIndex: null,
+        sourceConvergencePageIndex: null,
+        pagesPaginated: null,
+        pagesSplicedByReuse: 0,
+        tailAdoption: null,
+      },
+    };
+  };
 
   const previousLayout = input.reuse?.previousLayout;
   const previousPages = previousLayout?.pages;
   if (!previousLayout || !Array.isArray(previousPages) || previousPages.length === 0) {
     return full('m5-layout-reuse-unavailable-no-previous-layout');
   }
+  const paginationPrefix = readRenderDiagnosticPaginationPrefix(previousLayout);
   const reuse = input.reuse;
   if (!reuse?.previousBlockPageIndex || !reuse.previousPageStartKeys) {
     return full('m5-layout-reuse-unavailable-retained-page-metadata-missing');
@@ -5360,9 +5878,10 @@ async function layoutWithOptionalReuse(input: {
   if (hasBlockCountChange) {
     const oneSplit = input.dirty.insertedBlockIds.length === 1 && input.dirty.deletedBlockIds.length === 0;
     const oneMerge = input.dirty.insertedBlockIds.length === 0 && input.dirty.deletedBlockIds.length === 1;
+    const oneReplacement = input.dirty.insertedBlockIds.length === 1 && input.dirty.deletedBlockIds.length >= 1;
     if (
       reuse.allowBlockIdChurn !== true ||
-      (!oneSplit && !oneMerge) ||
+      (!oneSplit && !oneMerge && !oneReplacement) ||
       !reuse.previousBlockIndexById ||
       !reuse.blockIdRewrites
     ) {
@@ -5373,10 +5892,11 @@ async function layoutWithOptionalReuse(input: {
     return full('m5-layout-reuse-disabled-no-dirty-block');
   }
 
-  if (reuse.dirtyBlockIds && !haveExactUniqueIdSet(reuse.dirtyBlockIds, input.dirty.changedBlockIds)) {
+  const currentDirtyBlockIds = [...new Set([...input.dirty.changedBlockIds, ...input.dirty.insertedBlockIds])];
+  if (reuse.dirtyBlockIds && !haveExactUniqueIdSet(reuse.dirtyBlockIds, currentDirtyBlockIds)) {
     return full('m4-layout-reuse-disabled-dirty-block-set-mismatch');
   }
-  const dirtyBlockIds = [...(reuse.dirtyBlockIds ?? input.dirty.changedBlockIds)];
+  const dirtyBlockIds = [...(reuse.dirtyBlockIds ?? currentDirtyBlockIds)];
   if (dirtyBlockIds.length === 0) {
     return full('m4-layout-reuse-disabled-dirty-set-empty');
   }
@@ -5419,6 +5939,58 @@ async function layoutWithOptionalReuse(input: {
   let earliestDirtyPage = Number.POSITIVE_INFINITY;
   let sourceAffectedFrontierPageIndex = -1;
   const dirtyPageRanges: Array<{ blockId: string; firstPage: number; lastPage: number }> = [];
+  const fragmentlessBreakCompanionRange = (deletedBlockId: string): { firstPage: number; lastPage: number } | null => {
+    const deletedIndex = reuse.previousBlockIndexById?.get(deletedBlockId);
+    if (!Number.isInteger(deletedIndex) || input.previousBlocks[deletedIndex!]?.id !== deletedBlockId) return null;
+    const deletedBlock = input.previousBlocks[deletedIndex!];
+    const deletedAttrs = (deletedBlock as { attrs?: { lineBreakType?: unknown; source?: unknown } } | undefined)?.attrs;
+    const lineBreakType = deletedAttrs?.lineBreakType;
+    const isPageBreakBefore = deletedBlock?.kind === 'pageBreak' && deletedAttrs?.source === 'pageBreakBefore';
+    const isManualBreak =
+      (deletedBlock?.kind === 'pageBreak' && lineBreakType === 'page') ||
+      (deletedBlock?.kind === 'columnBreak' && lineBreakType === 'column');
+    if (!isPageBreakBefore && !isManualBreak) return null;
+    const replacementId = reuse.blockIdRewrites?.previousToCurrent.get(deletedBlockId);
+    if (!replacementId) return null;
+    const representativeId = reuse.blockIdRewrites?.currentToPrevious.get(replacementId);
+    if (!representativeId || !input.dirty.deletedBlockIds.includes(representativeId)) return null;
+    const companionRanges: Array<{ firstPage: number; lastPage: number }> = [];
+    for (const siblingId of input.dirty.deletedBlockIds) {
+      if (reuse.blockIdRewrites?.previousToCurrent.get(siblingId) !== replacementId) return null;
+      const sibling = input.previousBlocks[reuse.previousBlockIndexById?.get(siblingId) ?? -1];
+      const siblingAttrs = (sibling as { attrs?: { lineBreakType?: unknown; source?: unknown } } | undefined)?.attrs;
+      const siblingLineBreakType = siblingAttrs?.lineBreakType;
+      const siblingIsFragmentlessBreak =
+        (sibling?.kind === 'pageBreak' &&
+          (siblingAttrs?.source === 'pageBreakBefore' || siblingLineBreakType === 'page')) ||
+        (sibling?.kind === 'columnBreak' && siblingLineBreakType === 'column');
+      const range = reuse.previousBlockPageIndex?.get(siblingId);
+      const rangeIsExact =
+        range != null &&
+        Number.isInteger(range.firstPage) &&
+        Number.isInteger(range.lastPage) &&
+        range.firstPage >= 0 &&
+        range.lastPage >= range.firstPage &&
+        range.lastPage < previousPages.length &&
+        pageContainsBlock(previousPages[range.firstPage], siblingId) &&
+        pageContainsBlock(previousPages[range.lastPage], siblingId);
+      if (rangeIsExact) companionRanges.push(range);
+      else if (!siblingIsFragmentlessBreak) return null;
+    }
+    if (
+      companionRanges.length === 0 ||
+      !companionRanges.some((range) => {
+        const representativeRange = reuse.previousBlockPageIndex?.get(representativeId);
+        return representativeRange === range;
+      })
+    )
+      return null;
+    const firstCompanionPage = Math.min(...companionRanges.map((range) => range.firstPage));
+    return {
+      firstPage: isPageBreakBefore ? Math.max(0, firstCompanionPage - 1) : firstCompanionPage,
+      lastPage: Math.max(...companionRanges.map((range) => range.lastPage)),
+    };
+  };
   for (const blockId of dirtyBlockIds) {
     const previousBlockId = reuse.blockIdRewrites?.currentToPrevious.get(blockId) ?? blockId;
     const pageRange = reuse.previousBlockPageIndex.get(previousBlockId);
@@ -5426,14 +5998,19 @@ async function layoutWithOptionalReuse(input: {
       if (input.dirty.insertedBlockIds.includes(blockId)) continue;
       return full('m4-layout-reuse-unavailable-dirty-page-range-not-found');
     }
+    const pageRangeMatchesPaginationPrefix =
+      paginationPrefix?.blockId === previousBlockId &&
+      pageRange?.firstPage === paginationPrefix.pageIndex &&
+      pageRange.lastPage === paginationPrefix.pageIndex;
     if (
       !Number.isInteger(pageRange.firstPage) ||
       !Number.isInteger(pageRange.lastPage) ||
       pageRange.firstPage < 0 ||
       pageRange.lastPage < pageRange.firstPage ||
       pageRange.lastPage >= previousPages.length ||
-      !pageContainsBlock(previousPages[pageRange.firstPage], previousBlockId) ||
-      !pageContainsBlock(previousPages[pageRange.lastPage], previousBlockId)
+      (!pageRangeMatchesPaginationPrefix &&
+        (!pageContainsBlock(previousPages[pageRange.firstPage], previousBlockId) ||
+          !pageContainsBlock(previousPages[pageRange.lastPage], previousBlockId)))
     ) {
       return full('m4-layout-reuse-disabled-stale-dirty-page-range');
     }
@@ -5454,17 +6031,23 @@ async function layoutWithOptionalReuse(input: {
     sourceAffectedFrontierPageIndex = Math.max(sourceAffectedFrontierPageIndex, pageRange.lastPage);
   }
   for (const deletedBlockId of input.dirty.deletedBlockIds) {
-    const pageRange = reuse.previousBlockPageIndex.get(deletedBlockId);
-    if (
-      !pageRange ||
-      !Number.isInteger(pageRange.firstPage) ||
-      !Number.isInteger(pageRange.lastPage) ||
-      pageRange.firstPage < 0 ||
-      pageRange.lastPage < pageRange.firstPage ||
-      pageRange.lastPage >= previousPages.length ||
-      !pageContainsBlock(previousPages[pageRange.firstPage], deletedBlockId) ||
-      !pageContainsBlock(previousPages[pageRange.lastPage], deletedBlockId)
-    ) {
+    const retainedPageRange = reuse.previousBlockPageIndex.get(deletedBlockId);
+    const retainedRangeMatchesPaginationPrefix =
+      paginationPrefix?.blockId === deletedBlockId &&
+      retainedPageRange?.firstPage === paginationPrefix.pageIndex &&
+      retainedPageRange.lastPage === paginationPrefix.pageIndex;
+    const retainedPageRangeIsExact =
+      retainedPageRange != null &&
+      Number.isInteger(retainedPageRange.firstPage) &&
+      Number.isInteger(retainedPageRange.lastPage) &&
+      retainedPageRange.firstPage >= 0 &&
+      retainedPageRange.lastPage >= retainedPageRange.firstPage &&
+      retainedPageRange.lastPage < previousPages.length &&
+      (retainedRangeMatchesPaginationPrefix ||
+        (pageContainsBlock(previousPages[retainedPageRange.firstPage], deletedBlockId) &&
+          pageContainsBlock(previousPages[retainedPageRange.lastPage], deletedBlockId)));
+    const pageRange = retainedPageRangeIsExact ? retainedPageRange : fragmentlessBreakCompanionRange(deletedBlockId);
+    if (!pageRange) {
       return full('m4-layout-reuse-unavailable-deleted-page-range-not-found');
     }
     dirtyPageRanges.push({ blockId: deletedBlockId, firstPage: pageRange.firstPage, lastPage: pageRange.lastPage });
@@ -5513,7 +6096,11 @@ async function layoutWithOptionalReuse(input: {
     return full('m4-layout-reuse-disabled-dirty-block-in-retained-prefix');
   }
   const suffixStartBlockId =
-    partialPageCheckpoint?.previousBlockId ?? (checkpointPageIndex === 0 ? null : readFirstPageBlockId(checkpointPage));
+    partialPageCheckpoint?.previousBlockId ??
+    (checkpointPageIndex === 0
+      ? (paginationPrefix?.blockId ?? null)
+      : (readFirstPageBlockId(checkpointPage) ??
+        (paginationPrefix?.pageIndex === checkpointPageIndex ? paginationPrefix.blockId : null)));
   const currentSuffixStartBlockId =
     suffixStartBlockId == null
       ? null
@@ -5525,7 +6112,7 @@ async function layoutWithOptionalReuse(input: {
     // suffix genuinely is the whole document — maps to index 0. The previous
     // `checkpointPageIndex === 0 → 0` shortcut mislabeled every page-zero
     // partial checkpoint as `current-block-index-stale` and fell to full
-    // layout (observed as the alkuri/nvca first-target admission failures).
+    // layout (observed as first-target admission failures in large documents).
     currentSuffixStartBlockId != null
       ? (reuse.currentBlockIndexById?.get(currentSuffixStartBlockId) ??
         input.blocks.findIndex((block) => block.id === currentSuffixStartBlockId))
@@ -5551,30 +6138,33 @@ async function layoutWithOptionalReuse(input: {
     ? Math.max(1, Math.floor(reuse.maxRelaidPages!))
     : 3;
   let convergenceProbePageHorizon = initialRelaidPageHorizon;
+  let terminalSuffixRelayoutAttempted = false;
   let reuseProbePagesPaginated = 0;
 
   while (true) {
     const maxRelaidPages = convergenceProbePageHorizon;
     affectedFrontierPageIndex = earliestDirtyPage;
     const reachesSourceTail = sourceAffectedFrontierPageIndex + maxRelaidPages + 2 >= previousPages.length - 1;
-    const boundedLocalEndBlockIndexExclusive = findLocalPaginationEndBlockIndexExclusive({
-      blocks: input.blocks,
-      previousPages,
-      currentBlockIndexById: reuse.currentBlockIndexById!,
-      suffixStartBlockIndex,
-      sourceAffectedFrontierPageIndex,
-      maxRelaidPages,
-      previousToCurrentBlockId: reuse.blockIdRewrites?.previousToCurrent ?? null,
-      deletedBlockIds: new Set(input.dirty.deletedBlockIds),
-      ignoreUnindexedFootnoteFragments: footnoteFinalizerFragmentsAreExternal,
-    });
+    const boundedLocalEndBlockIndexExclusive = reachesSourceTail
+      ? input.blocks.length
+      : findLocalPaginationEndBlockIndexExclusive({
+          blocks: input.blocks,
+          previousPages,
+          currentBlockIndexById: reuse.currentBlockIndexById!,
+          suffixStartBlockIndex,
+          sourceAffectedFrontierPageIndex,
+          maxRelaidPages,
+          previousToCurrentBlockId: reuse.blockIdRewrites?.previousToCurrent ?? null,
+          deletedBlockIds: new Set(input.dirty.deletedBlockIds),
+          ignoreUnindexedFootnoteFragments: footnoteFinalizerFragmentsAreExternal,
+        });
     if (boundedLocalEndBlockIndexExclusive == null) {
       return full('m4-layout-reuse-disabled-local-pagination-boundary-not-found');
     }
     // Once the source horizon reaches the retained tail, include every current
     // block. This covers inserted terminal blocks and trailing non-rendering
     // section carriers that have no retained fragment index.
-    const localEndBlockIndexExclusive = reachesSourceTail ? input.blocks.length : boundedLocalEndBlockIndexExclusive;
+    const localEndBlockIndexExclusive = boundedLocalEndBlockIndexExclusive;
     // Non-terminal probes paginate a bounded source segment only. Passing the
     // complete suffix would run section/anchor/keep prepasses over the untouched
     // tail even when convergence is local.
@@ -5738,6 +6328,10 @@ async function layoutWithOptionalReuse(input: {
       }
     }
     for (let completedPageIndex = 0; completedPageIndex < suffixLayout.pages.length; completedPageIndex += 1) {
+      if (paginationPrefix) {
+        checkpointConvergenceRejection = 'same-pass-pagination-prefix-has-no-retained-tail';
+        continue;
+      }
       const targetPageIndex = checkpointPageIndex + completedPageIndex;
       const completedPage = suffixLayout.pages[completedPageIndex];
       const withinConvergenceBudget = targetPageIndex - affectedFrontierPageIndex <= maxRelaidPages;
@@ -5882,6 +6476,7 @@ async function layoutWithOptionalReuse(input: {
     }
 
     if (
+      !terminalSuffixRelayoutAttempted &&
       convergencePageIndex != null &&
       sourceConvergencePageIndex != null &&
       convergenceSectionPageNumberTransform != null
@@ -6017,24 +6612,32 @@ async function layoutWithOptionalReuse(input: {
       };
     }
 
-    // This finalized probe did not converge, but it is neither publishable nor a
-    // reason to throw away the retained prefix. Expand the source horizon
-    // geometrically and retry within this same bridge call.
-    const remainingSourcePageCount = Math.max(1, previousPages.length - sourceAffectedFrontierPageIndex);
-    const nextProbePageHorizon = Math.min(remainingSourcePageCount, Math.max(maxRelaidPages + 1, maxRelaidPages * 2));
-    if (nextProbePageHorizon <= maxRelaidPages) {
-      // Defensive only: reaching the retained tail above must either publish a
-      // complete terminal suffix or take its named exact full fallback.
-      return full(
-        checkpointConvergenceRejection
-          ? `m4-layout-reuse-convergence-probe-stalled:${checkpointConvergenceRejection}`
-          : 'm4-layout-reuse-convergence-probe-stalled',
-      );
+    if (
+      input.relayoutProvedPrefixToDocumentEndOnBoundedConvergenceFailure === true &&
+      !isBoundedRenderDiagnosticRetry &&
+      !terminalSuffixRelayoutAttempted &&
+      !reachesSourceTail
+    ) {
+      // A changed footnote reserve can shift every later page, leaving no
+      // retained convergence key inside the bounded probe. Keep the already
+      // proved prefix and lay out the remaining current suffix exactly once.
+      // This is not the old geometric probe expansion: no speculative
+      // intermediate result or retained tail can be adopted from this retry.
+      terminalSuffixRelayoutAttempted = true;
+      convergenceProbePageHorizon = previousPages.length;
+      continue;
     }
-    perfLog(
-      `[incrementalLayout] Expanding exact convergence probe from ${maxRelaidPages} to ${nextProbePageHorizon} pages (${checkpointConvergenceRejection})`,
+
+    // The first probe is the ordinary production locality and correctness
+    // boundary. Expanding it speculatively can cost more than a full pass and
+    // can converge against incomplete retained geometry. Callers without the
+    // explicit proved-prefix note-finalizer contract take the canonical full
+    // path here.
+    return full(
+      checkpointConvergenceRejection
+        ? `m4-layout-reuse-bounded-convergence-not-proved:${checkpointConvergenceRejection}`
+        : 'm4-layout-reuse-bounded-convergence-not-proved',
     );
-    convergenceProbePageHorizon = nextProbePageHorizon;
   }
 }
 
@@ -6091,74 +6694,232 @@ function applyPositionTransforms(position: number, transforms: readonly LayoutPo
   return current;
 }
 
-class SplicedBlockResumeCheckpointMap implements ReadonlyMap<string, LayoutBlockResumeCheckpoint> {
-  readonly #local = new Map<string, LayoutBlockResumeCheckpoint>();
-  readonly #cache = new Map<string, LayoutBlockResumeCheckpoint>();
-  readonly #input: {
-    previous: ReadonlyMap<string, LayoutBlockResumeCheckpoint>;
-    local: ReadonlyMap<string, LayoutBlockResumeCheckpoint>;
-    checkpointPageIndex: number;
-    relaidPageCount: number;
-    sourceTailStartPageIndex: number;
-    pageIndexDelta: number;
-    previousToCurrentBlockId: ReadonlyMap<string, string> | null;
-    currentToPreviousBlockId: ReadonlyMap<string, string> | null;
-    positionTransforms: readonly LayoutPositionTransform[];
-    suffixStartBlockId: string | null;
-    checkpointPagePrefixFragmentCount: number | null;
-  };
+interface CheckpointPositionTransformNode {
+  left?: CheckpointPositionTransformNode;
+  right?: CheckpointPositionTransformNode;
+  atChar?: number;
+  delta?: number;
+  sumDelta: number;
+  maxNormalizedThreshold: number;
+  minRawThreshold: number;
+}
 
-  constructor(input: {
-    previous: ReadonlyMap<string, LayoutBlockResumeCheckpoint>;
-    local: ReadonlyMap<string, LayoutBlockResumeCheckpoint>;
-    checkpointPageIndex: number;
-    relaidPageCount: number;
-    sourceTailStartPageIndex: number;
-    pageIndexDelta: number;
-    previousToCurrentBlockId: ReadonlyMap<string, string> | null;
-    currentToPreviousBlockId: ReadonlyMap<string, string> | null;
-    positionTransforms: readonly LayoutPositionTransform[];
-    suffixStartBlockId: string | null;
-    checkpointPagePrefixFragmentCount: number | null;
-  }) {
-    this.#input = input;
-    for (const [blockId, checkpoint] of input.local) {
-      if (checkpoint.pageIndex >= input.relaidPageCount) continue;
-      // The local run's stamp for the SUFFIX-START block reflects the seeded
-      // resume posture (top of the relaid window), not the pre-break state a
-      // cold run records on the preceding page. When the previous layout
-      // holds an admissible stamp for that block — identical prefix pages
-      // make it exact — prefer it so the spliced sidecar equals cold's and a
-      // later resume replays the same break decision (SD-3772 stitched-plane
-      // one-line drift).
-      if (blockId === input.suffixStartBlockId && this.#admissiblePreviousCheckpoint(blockId) != null) {
-        continue;
-      }
-      this.#local.set(blockId, {
-        ...checkpoint,
-        pageIndex: checkpoint.pageIndex + input.checkpointPageIndex,
-      });
+interface CheckpointPositionTransformLedger {
+  root: CheckpointPositionTransformNode;
+  count: number;
+}
+
+interface BlockResumeCheckpointPiece {
+  source: ReadonlyMap<string, LayoutBlockResumeCheckpoint>;
+  sourcePageStart: number;
+  sourcePageEnd: number;
+  pageIndexDelta: number;
+  maxPrefixFragmentCount: number | null;
+  sourceToCurrentBlockId: ReadonlyMap<string, string> | null;
+  currentToSourceBlockId: ReadonlyMap<string, string> | null;
+  excludedSourceBlockIds: ReadonlySet<string> | null;
+  positionTransforms: CheckpointPositionTransformLedger | null;
+}
+
+const MAX_CHECKPOINT_POSITION_TRANSFORMS = 0x7fffffff;
+const splicedCheckpointPieces = new WeakMap<object, readonly BlockResumeCheckpointPiece[]>();
+
+function writeCheckpointPositionTransform(
+  node: CheckpointPositionTransformNode | null,
+  low: number,
+  high: number,
+  index: number,
+  atChar: number,
+  delta: number,
+  normalizedThreshold: number,
+): CheckpointPositionTransformNode {
+  if (low === high) {
+    return {
+      atChar,
+      delta,
+      sumDelta: delta,
+      maxNormalizedThreshold: normalizedThreshold,
+      minRawThreshold: atChar,
+    };
+  }
+  const middle = low + Math.floor((high - low) / 2);
+  const left =
+    index <= middle
+      ? writeCheckpointPositionTransform(node?.left ?? null, low, middle, index, atChar, delta, normalizedThreshold)
+      : node?.left;
+  const right =
+    index > middle
+      ? writeCheckpointPositionTransform(
+          node?.right ?? null,
+          middle + 1,
+          high,
+          index,
+          atChar,
+          delta,
+          normalizedThreshold,
+        )
+      : node?.right;
+  return {
+    ...(left ? { left } : {}),
+    ...(right ? { right } : {}),
+    sumDelta: (left?.sumDelta ?? 0) + (right?.sumDelta ?? 0),
+    maxNormalizedThreshold: Math.max(
+      left?.maxNormalizedThreshold ?? Number.NEGATIVE_INFINITY,
+      right?.maxNormalizedThreshold ?? Number.NEGATIVE_INFINITY,
+    ),
+    minRawThreshold: Math.min(
+      left?.minRawThreshold ?? Number.POSITIVE_INFINITY,
+      right?.minRawThreshold ?? Number.POSITIVE_INFINITY,
+    ),
+  };
+}
+
+function appendCheckpointPositionTransforms(
+  prior: CheckpointPositionTransformLedger | null,
+  transforms: readonly LayoutPositionTransform[],
+): CheckpointPositionTransformLedger | null {
+  let root = prior?.root ?? null;
+  let count = prior?.count ?? 0;
+  for (const transform of transforms) {
+    if (!Number.isFinite(transform.atChar) || !Number.isFinite(transform.delta) || transform.delta === 0) continue;
+    count += 1;
+    if (count > MAX_CHECKPOINT_POSITION_TRANSFORMS) {
+      throw new Error('retained checkpoint transform ledger exceeded its exact version range');
+    }
+    const cumulativeBefore = root?.sumDelta ?? 0;
+    root = writeCheckpointPositionTransform(
+      root,
+      1,
+      MAX_CHECKPOINT_POSITION_TRANSFORMS,
+      count,
+      transform.atChar,
+      transform.delta,
+      transform.atChar - cumulativeBefore,
+    );
+  }
+  return root ? { root, count } : null;
+}
+
+function readCheckpointPositionTransform(
+  ledger: CheckpointPositionTransformLedger,
+  index: number,
+): { atChar: number; delta: number } | null {
+  let node: CheckpointPositionTransformNode | undefined = ledger.root;
+  let low = 1;
+  let high = MAX_CHECKPOINT_POSITION_TRANSFORMS;
+  while (node && low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (index <= middle) {
+      node = node.left;
+      high = middle;
+    } else {
+      node = node.right;
+      low = middle + 1;
     }
   }
+  return node?.atChar == null || node.delta == null ? null : { atChar: node.atChar, delta: node.delta };
+}
 
-  #admissiblePreviousCheckpoint(blockId: string): LayoutBlockResumeCheckpoint | null {
-    const previousBlockId = this.#input.currentToPreviousBlockId?.get(blockId) ?? blockId;
-    const previous = this.#input.previous.get(previousBlockId);
-    if (!previous) return null;
-    if (previous.pageIndex < this.#input.checkpointPageIndex) return previous;
-    // A PARTIAL (mid-page) checkpoint retains the checkpoint page's fragment
-    // prefix verbatim, so previous stamps whose state lies within that
-    // retained prefix remain exact (page-local cursor state; prefix pm
-    // positions precede the edit and are unshifted).
-    if (
-      previous.pageIndex === this.#input.checkpointPageIndex &&
-      this.#input.checkpointPagePrefixFragmentCount != null &&
-      Number.isInteger(previous.prefixFragmentCount) &&
-      previous.prefixFragmentCount <= this.#input.checkpointPagePrefixFragmentCount
-    ) {
-      return previous;
+function applyCheckpointPositionTransforms(value: number, ledger: CheckpointPositionTransformLedger | null): number {
+  if (!ledger) return value;
+  if (value >= ledger.root.maxNormalizedThreshold) return value + ledger.root.sumDelta;
+  if (value < ledger.root.minRawThreshold) return value;
+  let current = value;
+  for (let index = 1; index <= ledger.count; index += 1) {
+    const transform = readCheckpointPositionTransform(ledger, index);
+    if (transform && current >= transform.atChar) current += transform.delta;
+  }
+  return current;
+}
+
+function clipCheckpointPiece(
+  piece: BlockResumeCheckpointPiece,
+  currentPageStart: number,
+  currentPageEnd: number,
+  maxPrefixFragmentCount: number | null = piece.maxPrefixFragmentCount,
+): BlockResumeCheckpointPiece | null {
+  const sourcePageStart = Math.max(piece.sourcePageStart, currentPageStart - piece.pageIndexDelta);
+  const sourcePageEnd = Math.min(piece.sourcePageEnd, currentPageEnd - piece.pageIndexDelta);
+  if (sourcePageStart >= sourcePageEnd) return null;
+  return {
+    ...piece,
+    sourcePageStart,
+    sourcePageEnd,
+    maxPrefixFragmentCount:
+      piece.maxPrefixFragmentCount == null
+        ? maxPrefixFragmentCount
+        : maxPrefixFragmentCount == null
+          ? piece.maxPrefixFragmentCount
+          : Math.min(piece.maxPrefixFragmentCount, maxPrefixFragmentCount),
+  };
+}
+
+function composeCheckpointPieceBlockIds(
+  piece: BlockResumeCheckpointPiece,
+  previousToCurrent: ReadonlyMap<string, string> | null,
+  currentToPrevious: ReadonlyMap<string, string> | null,
+): BlockResumeCheckpointPiece {
+  if ((!previousToCurrent || previousToCurrent.size === 0) && (!currentToPrevious || currentToPrevious.size === 0)) {
+    return piece;
+  }
+  const sourceToCurrent = new Map(piece.sourceToCurrentBlockId ?? []);
+  const currentToSource = new Map(piece.currentToSourceBlockId ?? []);
+  const bind = (previousBlockId: string, currentBlockId: string): void => {
+    const sourceBlockId = currentToSource.get(previousBlockId) ?? previousBlockId;
+    if (previousBlockId !== sourceBlockId) currentToSource.delete(previousBlockId);
+    if (currentBlockId === sourceBlockId) {
+      sourceToCurrent.delete(sourceBlockId);
+      currentToSource.delete(currentBlockId);
+    } else {
+      sourceToCurrent.set(sourceBlockId, currentBlockId);
+      currentToSource.set(currentBlockId, sourceBlockId);
     }
-    return null;
+  };
+  for (const [previousBlockId, currentBlockId] of previousToCurrent ?? []) {
+    bind(previousBlockId, currentBlockId);
+  }
+  for (const [currentBlockId, previousBlockId] of currentToPrevious ?? []) {
+    bind(previousBlockId, currentBlockId);
+  }
+  return {
+    ...piece,
+    sourceToCurrentBlockId: sourceToCurrent.size > 0 ? sourceToCurrent : null,
+    currentToSourceBlockId: currentToSource.size > 0 ? currentToSource : null,
+  };
+}
+
+function checkpointPieceEquivalent(left: BlockResumeCheckpointPiece, right: BlockResumeCheckpointPiece): boolean {
+  return (
+    left.source === right.source &&
+    left.pageIndexDelta === right.pageIndexDelta &&
+    left.maxPrefixFragmentCount === right.maxPrefixFragmentCount &&
+    left.sourceToCurrentBlockId === right.sourceToCurrentBlockId &&
+    left.currentToSourceBlockId === right.currentToSourceBlockId &&
+    left.excludedSourceBlockIds === right.excludedSourceBlockIds &&
+    left.positionTransforms === right.positionTransforms
+  );
+}
+
+function coalesceCheckpointPieces(pieces: readonly BlockResumeCheckpointPiece[]): BlockResumeCheckpointPiece[] {
+  const result: BlockResumeCheckpointPiece[] = [];
+  for (const piece of pieces) {
+    const previous = result[result.length - 1];
+    if (previous && previous.sourcePageEnd === piece.sourcePageStart && checkpointPieceEquivalent(previous, piece)) {
+      result[result.length - 1] = { ...previous, sourcePageEnd: piece.sourcePageEnd };
+    } else {
+      result.push(piece);
+    }
+  }
+  return result;
+}
+
+class SplicedBlockResumeCheckpointMap implements ReadonlyMap<string, LayoutBlockResumeCheckpoint> {
+  readonly #pieces: readonly BlockResumeCheckpointPiece[];
+  readonly #cache = new Map<string, LayoutBlockResumeCheckpoint>();
+
+  constructor(pieces: readonly BlockResumeCheckpointPiece[]) {
+    this.#pieces = pieces;
+    splicedCheckpointPieces.set(this, pieces);
   }
 
   get size(): number {
@@ -6168,31 +6929,36 @@ class SplicedBlockResumeCheckpointMap implements ReadonlyMap<string, LayoutBlock
   }
 
   get(blockId: string): LayoutBlockResumeCheckpoint | undefined {
-    const local = this.#local.get(blockId);
-    if (local) return local;
     const cached = this.#cache.get(blockId);
     if (cached) return cached;
-    const previousBlockId = this.#input.currentToPreviousBlockId?.get(blockId) ?? blockId;
-    const previous = this.#input.previous.get(previousBlockId);
-    if (!previous) return undefined;
-    const retainedPrefix = previous.pageIndex < this.#input.checkpointPageIndex;
-    const retainedTail = previous.pageIndex >= this.#input.sourceTailStartPageIndex;
-    const retainedCheckpointPagePrefix =
-      !retainedPrefix && !retainedTail && this.#admissiblePreviousCheckpoint(blockId) != null;
-    if (!retainedPrefix && !retainedTail && !retainedCheckpointPagePrefix) return undefined;
-    const current: LayoutBlockResumeCheckpoint = {
-      ...previous,
-      blockId,
-      pageIndex: previous.pageIndex + (retainedTail ? this.#input.pageIndexDelta : 0),
-      footnoteAnchorsThisPage: retainedTail
-        ? previous.footnoteAnchorsThisPage.map((anchor) => ({
-            ...anchor,
-            pmPos: applyPositionTransforms(anchor.pmPos, this.#input.positionTransforms),
-          }))
-        : previous.footnoteAnchorsThisPage,
-    };
-    this.#cache.set(blockId, current);
-    return current;
+    for (const piece of this.#pieces) {
+      const sourceBlockId = piece.currentToSourceBlockId?.get(blockId) ?? blockId;
+      if (piece.excludedSourceBlockIds?.has(sourceBlockId)) continue;
+      const source = piece.source.get(sourceBlockId);
+      if (!source) continue;
+      if (source.pageIndex < piece.sourcePageStart || source.pageIndex >= piece.sourcePageEnd) continue;
+      if (
+        piece.maxPrefixFragmentCount != null &&
+        (!Number.isInteger(source.prefixFragmentCount) || source.prefixFragmentCount > piece.maxPrefixFragmentCount)
+      )
+        continue;
+      const currentBlockId = piece.sourceToCurrentBlockId?.get(sourceBlockId) ?? sourceBlockId;
+      if (currentBlockId !== blockId) continue;
+      const current: LayoutBlockResumeCheckpoint = {
+        ...source,
+        blockId,
+        pageIndex: source.pageIndex + piece.pageIndexDelta,
+        footnoteAnchorsThisPage: piece.positionTransforms
+          ? source.footnoteAnchorsThisPage.map((anchor) => ({
+              ...anchor,
+              pmPos: applyCheckpointPositionTransforms(anchor.pmPos, piece.positionTransforms),
+            }))
+          : source.footnoteAnchorsThisPage,
+      };
+      this.#cache.set(blockId, current);
+      return current;
+    }
+    return undefined;
   }
 
   has(blockId: string): boolean {
@@ -6201,17 +6967,15 @@ class SplicedBlockResumeCheckpointMap implements ReadonlyMap<string, LayoutBlock
 
   *entries(): MapIterator<[string, LayoutBlockResumeCheckpoint]> {
     const emitted = new Set<string>();
-    for (const entry of this.#local) {
-      emitted.add(entry[0]);
-      yield entry;
-    }
-    for (const [previousBlockId] of this.#input.previous) {
-      const currentBlockId = this.#input.previousToCurrentBlockId?.get(previousBlockId) ?? previousBlockId;
-      if (emitted.has(currentBlockId)) continue;
-      const checkpoint = this.get(currentBlockId);
-      if (!checkpoint) continue;
-      emitted.add(currentBlockId);
-      yield [currentBlockId, checkpoint];
+    for (const piece of this.#pieces) {
+      for (const [sourceBlockId] of piece.source) {
+        const currentBlockId = piece.sourceToCurrentBlockId?.get(sourceBlockId) ?? sourceBlockId;
+        if (emitted.has(currentBlockId)) continue;
+        const checkpoint = this.get(currentBlockId);
+        if (!checkpoint) continue;
+        emitted.add(currentBlockId);
+        yield [currentBlockId, checkpoint];
+      }
     }
   }
 
@@ -6253,7 +7017,100 @@ function createSplicedBlockResumeCheckpointMap(input: {
   checkpointPagePrefixFragmentCount: number | null;
 }): ReadonlyMap<string, LayoutBlockResumeCheckpoint> | undefined {
   if (!input.previous || !input.local) return undefined;
-  return new SplicedBlockResumeCheckpointMap({ ...input, previous: input.previous, local: input.local });
+  const priorPieces = splicedCheckpointPieces.get(input.previous as object) ?? [
+    {
+      source: input.previous,
+      sourcePageStart: 0,
+      sourcePageEnd: Number.POSITIVE_INFINITY,
+      pageIndexDelta: 0,
+      maxPrefixFragmentCount: null,
+      sourceToCurrentBlockId: null,
+      currentToSourceBlockId: null,
+      excludedSourceBlockIds: null,
+      positionTransforms: null,
+    } satisfies BlockResumeCheckpointPiece,
+  ];
+  const previousSuffixStartBlockId =
+    input.suffixStartBlockId == null
+      ? null
+      : (input.currentToPreviousBlockId?.get(input.suffixStartBlockId) ?? input.suffixStartBlockId);
+  const previousSuffixStart =
+    previousSuffixStartBlockId == null ? null : (input.previous.get(previousSuffixStartBlockId) ?? null);
+  const preferPreviousSuffixStart =
+    previousSuffixStart != null &&
+    (previousSuffixStart.pageIndex < input.checkpointPageIndex ||
+      (previousSuffixStart.pageIndex === input.checkpointPageIndex &&
+        input.checkpointPagePrefixFragmentCount != null &&
+        Number.isInteger(previousSuffixStart.prefixFragmentCount) &&
+        previousSuffixStart.prefixFragmentCount <= input.checkpointPagePrefixFragmentCount));
+  const localPiece: BlockResumeCheckpointPiece = {
+    source: input.local,
+    sourcePageStart: 0,
+    sourcePageEnd: input.relaidPageCount,
+    pageIndexDelta: input.checkpointPageIndex,
+    maxPrefixFragmentCount: null,
+    sourceToCurrentBlockId: null,
+    currentToSourceBlockId: null,
+    excludedSourceBlockIds:
+      preferPreviousSuffixStart && input.suffixStartBlockId ? new Set([input.suffixStartBlockId]) : null,
+    positionTransforms: null,
+  };
+  const retainedPieces: BlockResumeCheckpointPiece[] = [];
+  for (const priorPiece of priorPieces) {
+    const prefix = clipCheckpointPiece(priorPiece, Number.NEGATIVE_INFINITY, input.checkpointPageIndex);
+    if (prefix) {
+      retainedPieces.push(
+        composeCheckpointPieceBlockIds(prefix, input.previousToCurrentBlockId, input.currentToPreviousBlockId),
+      );
+    }
+    if (input.checkpointPagePrefixFragmentCount != null) {
+      const checkpointPrefix = clipCheckpointPiece(
+        priorPiece,
+        input.checkpointPageIndex,
+        input.checkpointPageIndex + 1,
+        input.checkpointPagePrefixFragmentCount,
+      );
+      if (checkpointPrefix) {
+        retainedPieces.push(
+          composeCheckpointPieceBlockIds(
+            checkpointPrefix,
+            input.previousToCurrentBlockId,
+            input.currentToPreviousBlockId,
+          ),
+        );
+      }
+    }
+    const tail = clipCheckpointPiece(priorPiece, input.sourceTailStartPageIndex, Number.POSITIVE_INFINITY);
+    if (tail) {
+      retainedPieces.push(
+        composeCheckpointPieceBlockIds(
+          {
+            ...tail,
+            pageIndexDelta: tail.pageIndexDelta + input.pageIndexDelta,
+            positionTransforms: appendCheckpointPositionTransforms(tail.positionTransforms, input.positionTransforms),
+          },
+          input.previousToCurrentBlockId,
+          input.currentToPreviousBlockId,
+        ),
+      );
+    }
+  }
+  return new SplicedBlockResumeCheckpointMap(coalesceCheckpointPieces([localPiece, ...retainedPieces]));
+}
+
+export function __test_only_splicedCheckpointStats(
+  map: ReadonlyMap<string, LayoutBlockResumeCheckpoint> | undefined,
+): { pieceCount: number; sourceCount: number; maximumTransformTreeDepth: number } | null {
+  if (!map) return null;
+  const pieces = splicedCheckpointPieces.get(map as object);
+  if (!pieces) return null;
+  const depth = (node: CheckpointPositionTransformNode | undefined): number =>
+    node ? 1 + Math.max(depth(node.left), depth(node.right)) : 0;
+  return {
+    pieceCount: pieces.length,
+    sourceCount: new Set(pieces.map((piece) => piece.source)).size,
+    maximumTransformTreeDepth: Math.max(0, ...pieces.map((piece) => depth(piece.positionTransforms?.root))),
+  };
 }
 
 interface LazyPageSegment {
@@ -6852,16 +7709,7 @@ function validateIncrementalPaginationProof(proof: IncrementalPaginationProof): 
 function hasCoherentNonFlowingPageRelativeAnchorProof(classes: unknown, proof: unknown): boolean {
   const admitted = Array.isArray(classes) && classes.includes('non-flowing-page-relative-body-anchors');
   if (!admitted) return proof == null;
-  if (!proof || typeof proof !== 'object') return false;
-  const value = proof as NonFlowingPageRelativeAnchorDependencyProof;
-  return (
-    value.version === 1 &&
-    Number.isInteger(value.sourceLayoutEpoch) &&
-    typeof value.inventoryFingerprint === 'string' &&
-    value.inventoryFingerprint.length > 0 &&
-    Array.isArray(value.entries) &&
-    value.entries.length > 0
-  );
+  return isValidNonFlowingPageRelativeAnchorDependencyProof(proof);
 }
 
 function validateNonFlowingPageRelativeAnchorDependency(input: {
@@ -6916,24 +7764,37 @@ function validateNonFlowingPageRelativeAnchorDependency(input: {
     }
     const blockIndex = input.currentBlockIndexById.get(currentBlockId);
     const block = Number.isInteger(blockIndex) ? input.blocks[blockIndex!] : null;
+    const anchoredBlock = block?.kind === 'image' || block?.kind === 'drawing' ? block : null;
+    const blockKindMatches =
+      entry.blockKind === 'image'
+        ? anchoredBlock?.kind === 'image'
+        : anchoredBlock?.kind === 'drawing' && anchoredBlock.drawingKind === entry.drawingKind;
     if (
-      !block ||
-      block.id !== currentBlockId ||
-      block.kind !== 'image' ||
-      block.anchor?.isAnchored !== true ||
-      !isPageRelativeAnchor(block) ||
-      block.wrap?.type !== 'None' ||
-      (block.attrs as { anchorParagraphId?: unknown } | undefined)?.anchorParagraphId !== currentCarrierParagraphId
+      !anchoredBlock ||
+      anchoredBlock.id !== currentBlockId ||
+      !blockKindMatches ||
+      anchoredBlock.anchor?.isAnchored !== true ||
+      !isPageRelativeAnchor(anchoredBlock) ||
+      anchoredBlock.wrap?.type !== 'None' ||
+      (anchoredBlock.attrs as { anchorParagraphId?: unknown } | undefined)?.anchorParagraphId !==
+        currentCarrierParagraphId
     ) {
       return 'page-relative-anchor-current-shape-mismatch';
     }
     const pageRange = input.previousBlockPageIndex.get(entry.blockId);
     const sourcePage = input.previousLayout.pages[entry.sourcePageIndex];
+    const matchingFragments = sourcePage?.fragments.filter((fragment) => fragment.blockId === entry.blockId) ?? [];
+    const sourceFragment = matchingFragments[0];
+    const fragmentKindMatches =
+      entry.blockKind === 'image'
+        ? sourceFragment?.kind === 'image'
+        : sourceFragment?.kind === 'drawing' && sourceFragment.drawingKind === entry.drawingKind;
     if (
       !pageRange ||
       pageRange.firstPage !== entry.sourcePageIndex ||
       pageRange.lastPage !== entry.sourcePageIndex ||
-      !sourcePage?.fragments.some((fragment) => fragment.blockId === entry.blockId) ||
+      matchingFragments.length !== 1 ||
+      !fragmentKindMatches ||
       (sourcePage.sectionIndex ?? 0) !== entry.sectionIndex
     ) {
       return 'page-relative-anchor-source-page-mismatch';
@@ -7040,6 +7901,19 @@ function validateProvedWarmPaginationInputs(
       return 'structural-block-id-rewrite-proof-missing';
     }
     const { previousToCurrent, currentToPrevious } = reuse.blockIdRewrites;
+    const insertedReplacementId = dirty.insertedBlockIds.length === 1 ? dirty.insertedBlockIds[0]! : null;
+    const deletedReplacementIndexes =
+      insertedReplacementId == null || dirty.deletedBlockIds.length === 0
+        ? []
+        : dirty.deletedBlockIds.map((blockId) => reuse.previousBlockIndexById!.get(blockId));
+    const collapsedReplacementStartIndex =
+      insertedReplacementId != null &&
+      deletedReplacementIndexes.length > 0 &&
+      deletedReplacementIndexes.every((index) => Number.isInteger(index)) &&
+      deletedReplacementIndexes.every((index, offset) => index === deletedReplacementIndexes[0]! + offset) &&
+      reuse.currentBlockIndexById.get(insertedReplacementId) === deletedReplacementIndexes[0]
+        ? deletedReplacementIndexes[0]!
+        : null;
     const structuralRewriteProof = validateStructuralBlockIdRewritePair(
       previousToCurrent,
       currentToPrevious,
@@ -7047,12 +7921,22 @@ function validateProvedWarmPaginationInputs(
       reuse.currentBlockIndexById.size,
     );
     if (!structuralRewriteProof) {
+      const collapsedReplacementRepresentative =
+        insertedReplacementId == null ? null : (currentToPrevious.get(insertedReplacementId) ?? null);
       for (const [previousId, currentId] of previousToCurrent) {
+        const exactReplacementPair =
+          collapsedReplacementStartIndex != null &&
+          insertedReplacementId === currentId &&
+          dirty.deletedBlockIds.includes(previousId) &&
+          collapsedReplacementRepresentative != null &&
+          dirty.deletedBlockIds.includes(collapsedReplacementRepresentative) &&
+          reuse.previousBlockIndexById.get(previousId) ===
+            collapsedReplacementStartIndex + dirty.deletedBlockIds.indexOf(previousId);
         if (
-          currentToPrevious.get(currentId) !== previousId ||
+          (!exactReplacementPair && currentToPrevious.get(currentId) !== previousId) ||
           !reuse.previousBlockIndexById.has(previousId) ||
           !reuse.currentBlockIndexById.has(currentId) ||
-          !dirty.stableBlockIds.has(currentId)
+          (!dirty.stableBlockIds.has(currentId) && !exactReplacementPair)
         ) {
           return 'structural-block-id-rewrite-proof-invalid';
         }
@@ -7452,6 +8336,12 @@ const DEFAULT_MARGINS = { top: 72, right: 72, bottom: 72, left: 72 };
 export const normalizeMargin = (value: number | undefined, fallback: number): number =>
   Number.isFinite(value) ? (value as number) : fallback;
 
+const hasExplicitColumnWidths = (columns: ColumnLayout | undefined): boolean =>
+  Array.isArray(columns?.widths) && columns.widths.some((width) => Number.isFinite(width) && width > 0);
+
+const shouldPreserveSemanticFlowColumns = (block: SectionBreakBlock): boolean =>
+  block.type === 'nextColumn' || hasExplicitColumnWidths(block.columns);
+
 /**
  * Rewrites section break blocks so that `layoutDocument` uses the semantic page
  * dimensions instead of the per-section DOCX page sizes. Without this, each
@@ -7471,6 +8361,7 @@ function rewriteSectionBreaksForSemanticFlow(blocks: FlowBlock[], options: Layou
   return blocks.map((block) => {
     if (block.kind !== 'sectionBreak') return block;
     const sb = block as SectionBreakBlock;
+    const preserveColumns = shouldPreserveSemanticFlowColumns(sb);
     return {
       ...sb,
       pageSize: { w: semanticPageSize.w, h: semanticPageSize.h },
@@ -7481,7 +8372,7 @@ function rewriteSectionBreaksForSemanticFlow(blocks: FlowBlock[], options: Layou
         bottom: semanticMargins?.bottom,
         left: semanticMargins?.left,
       },
-      columns: { count: 1, gap: 0 },
+      columns: preserveColumns ? cloneColumnLayout(sb.columns) : { count: 1, gap: 0 },
     };
   });
 }
@@ -7495,8 +8386,10 @@ function rewriteSectionBreaksForSemanticFlow(blocks: FlowBlock[], options: Layou
  * text clipping in table cells with `overflow: hidden` (SD-1962).
  *
  * This function returns a per-block constraint array so each block is measured at its own
- * section's content width. Section breaks act as state transitions: each break defines the
- * constraints for subsequent content blocks until the next break.
+ * section column width. Section breaks act as state transitions: each break defines the
+ * constraints for subsequent content blocks until the next break. `nextColumn` / explicit
+ * `columnBreak` advance the active column index so unequal columns are measured at the
+ * destination column width, not the section max.
  *
  * @param options - Layout options containing default page size, margins, and columns
  * @param blocks - Array of flow blocks (content + section breaks)
@@ -7514,35 +8407,75 @@ function computePerSectionConstraints(
     bottom: normalizeMargin(options.margins?.bottom, DEFAULT_MARGINS.bottom),
     left: normalizeMargin(options.margins?.left, DEFAULT_MARGINS.left),
   };
-  const defaultContentWidth = pageSize.w - (defaultMargins.left + defaultMargins.right);
-  const defaultContentHeight = pageSize.h - (defaultMargins.top + defaultMargins.bottom);
-  const defaultConstraints = {
-    maxWidth: resolveMaxColumnWidth(defaultContentWidth, options.columns),
-    maxHeight: defaultContentHeight,
+  let currentPageSize = pageSize;
+  let currentMargins = defaultMargins;
+  let currentColumns: ColumnLayout | undefined = options.columns;
+  let currentColumnIndex = 0;
+  const contentWidthOf = () => currentPageSize.w - (currentMargins.left + currentMargins.right);
+  const contentHeightOf = () => currentPageSize.h - (currentMargins.top + currentMargins.bottom);
+  let current = {
+    maxWidth: measurementWidthForColumn(contentWidthOf(), currentColumns, currentColumnIndex),
+    maxHeight: contentHeightOf(),
   };
 
-  let current = defaultConstraints;
   const result: Array<{ maxWidth: number; maxHeight: number }> = [];
 
   for (const block of blocks) {
     if (block.kind === 'sectionBreak') {
       const sb = block as SectionBreakBlock;
-      const sectionPageSize = sb.pageSize ?? pageSize;
-      const sectionMargins = {
-        top: normalizeMargin(sb.margins?.top, defaultMargins.top),
-        right: normalizeMargin(sb.margins?.right, defaultMargins.right),
-        bottom: normalizeMargin(sb.margins?.bottom, defaultMargins.bottom),
-        left: normalizeMargin(sb.margins?.left, defaultMargins.left),
+      const previousColumns = currentColumns;
+      if (sb.pageSize) currentPageSize = sb.pageSize;
+      currentMargins = {
+        top: normalizeMargin(sb.margins?.top, currentMargins.top),
+        right: normalizeMargin(sb.margins?.right, currentMargins.right),
+        bottom: normalizeMargin(sb.margins?.bottom, currentMargins.bottom),
+        left: normalizeMargin(sb.margins?.left, currentMargins.left),
       };
-      const contentWidth = sectionPageSize.w - (sectionMargins.left + sectionMargins.right);
-      const contentHeight = sectionPageSize.h - (sectionMargins.top + sectionMargins.bottom);
+      currentColumns = ooXmlSectionColumns(sb.columns);
+      const initialColumnIndex = sb.attrs?.isFirstSection
+        ? normalizeMeasurementColumnIndex(currentColumns, sb.attrs?.initialColumnIndex)
+        : null;
+      if (initialColumnIndex !== null) {
+        currentColumnIndex = initialColumnIndex;
+      } else if (sb.type === 'nextColumn') {
+        currentColumnIndex = advanceMeasurementColumnIndex(currentColumns, currentColumnIndex);
+      } else if (sb.type === 'nextPage' || sb.type === 'evenPage' || sb.type === 'oddPage') {
+        currentColumnIndex = 0;
+      } else if (!columnRenderLayoutsEqual(previousColumns, currentColumns)) {
+        currentColumnIndex = 0;
+      }
+      const contentWidth = contentWidthOf();
+      const contentHeight = contentHeightOf();
       if (contentWidth > 0 && contentHeight > 0) {
         current = {
-          maxWidth: resolveMaxColumnWidth(contentWidth, ooXmlSectionColumns(sb.columns)),
+          maxWidth: measurementWidthForColumn(contentWidth, currentColumns, currentColumnIndex),
           maxHeight: contentHeight,
         };
       }
+      result.push(current);
+      continue;
     }
+
+    if (block.kind === 'columnBreak') {
+      result.push(current);
+      currentColumnIndex = advanceMeasurementColumnIndex(currentColumns, currentColumnIndex);
+      current = {
+        maxWidth: measurementWidthForColumn(contentWidthOf(), currentColumns, currentColumnIndex),
+        maxHeight: current.maxHeight,
+      };
+      continue;
+    }
+
+    if (block.kind === 'pageBreak') {
+      result.push(current);
+      currentColumnIndex = 0;
+      current = {
+        maxWidth: measurementWidthForColumn(contentWidthOf(), currentColumns, currentColumnIndex),
+        maxHeight: current.maxHeight,
+      };
+      continue;
+    }
+
     result.push(current);
   }
 
@@ -8266,7 +9199,13 @@ async function remeasureAffectedBlocks(
 
     try {
       // Re-measure the block with its section's constraints
-      const newMeasure = await measureBlock(block, perBlockConstraints[i]);
+      const postBodyLayoutConstraints = { ...perBlockConstraints[i] };
+      Object.defineProperty(postBodyLayoutConstraints, V2_RENDER_DIAGNOSTIC_POST_BODY_LAYOUT_MEASUREMENT, {
+        configurable: true,
+        enumerable: true,
+        value: true,
+      });
+      const newMeasure = await measureBlock(block, postBodyLayoutConstraints);
 
       // Update in the measures array
       updatedMeasures[i] = newMeasure;
@@ -8279,6 +9218,7 @@ async function remeasureAffectedBlocks(
       measureCache?.set(block, blockConstraints.maxWidth, blockConstraints.maxHeight, newMeasure, fontSignature);
     } catch (error) {
       throwIfLayoutExecutionAborted(execution);
+      if (isPrivateV2SourceToLayoutFailure(error)) throw markPostBodyLayoutFailure(error);
       // Error handling per plan: log warning, keep prior layout for block
       console.warn(`[incrementalLayout] Failed to re-measure block ${block.id} after token resolution:`, error);
       // Keep the old measure - don't update updatedMeasures[i]

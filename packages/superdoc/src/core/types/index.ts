@@ -2661,7 +2661,11 @@ export type ViewLayout = 'print' | 'web';
  * Mirrors OOXML document view settings.
  */
 export interface ViewOptions {
-  /** Document view layout (OOXML ST_View compatible). */
+  /**
+   * Document view layout (OOXML ST_View compatible). In the browser editor,
+   * `'web'` selects the retained semantic DOM surface. Browser normal flow
+   * rewraps content as the editor container changes width.
+   */
   layout?: ViewLayout;
 }
 
@@ -3290,6 +3294,19 @@ export interface UIConfig {
   /** Built-in right-click and slash context menu. Enabled by default. */
   contextMenu?: boolean | ContextMenuConfig;
   /**
+   * Built-in loading overlay shown while a document opens. Enabled by default.
+   * Set to `false` to show your own loading UI instead.
+   *
+   * This only decides whether SuperDoc draws the overlay. It does not change
+   * how long a document takes to open, and it does not affect loading UI the
+   * host renders (such as `renderLoading` in `@superdoc/react`).
+   *
+   * The built-in overlay also masks the document while it opens. Turning it
+   * off hands that responsibility to your UI: keep yours up until `onReady`,
+   * and around a replacement await `superdoc.replaceFile(...)`.
+   */
+  loading?: boolean;
+  /**
    * Built-in find/replace surface. Disabled by default. Enabling it lets
    * SuperDoc intercept Cmd+F / Ctrl+F; `editor.ui.search` stays available to
    * custom UI either way.
@@ -3545,6 +3562,11 @@ export interface Config {
     unifiedHistory?: boolean;
     v2Host?: boolean;
     /**
+     * Temporary V2 web-surface rollout control. The value is snapshotted at
+     * mount and changing it requires a remount. This is not a stable renderer API.
+     */
+    v2WebSurface?: 'dense-control' | 'retained-dom';
+    /**
      * Derived-invalidation deferral for direct single-paragraph edits (v2
      * engine only). Field display text settles off the keystroke path under
      * the engine's settlement contract. DEFAULT TRUE — this is the engine's
@@ -3762,10 +3784,8 @@ export interface Config {
    */
   workerStartupTimeoutMs?: number;
   /**
-   * Opt-in toggle for the layout engine. Auto-disabled when web layout is
-   * requested without `layoutEngineOptions.flowMode === 'semantic'`; the
-   * loader logs a warning and falls back to the legacy ProseMirror render
-   * path in that case.
+   * Compatibility toggle retained for existing configurations. V2 always
+   * uses the OOXML kernel; `viewOptions.layout` selects the mounted renderer.
    */
   useLayoutEngine?: boolean;
   // V2 branch: `editorVersion`, `v2Integration`, and `v2` are intentionally NOT
@@ -3896,30 +3916,63 @@ export interface ProofingError {
 }
 
 export interface ProofingConfig {
-  /** Enable or disable proofing (default: false). */
+  /**
+   * Enables proofing. A provider is also required before SuperDoc runs checks.
+   * @defaultValue false
+   */
   enabled?: boolean;
-  /** Provider instance. */
+  /**
+   * Checks the text segments SuperDoc supplies and returns spelling, grammar,
+   * or style issues.
+   * @defaultValue null
+   */
   provider?: ProofingProvider | null;
-  /** Fallback language for segments without a resolved language. */
+  /**
+   * Fallback language passed to the provider when a text segment has no
+   * resolved language.
+   * @defaultValue null
+   */
   defaultLanguage?: string | null;
-  /** Debounce delay after edits before rechecking (default: 500). */
+  /**
+   * Delay in milliseconds between an edit and the next proofing check. Values
+   * at or below 0 run without a delay.
+   * @defaultValue 500
+   */
   debounceMs?: number;
-  /** Maximum replacement suggestions per issue. */
+  /** Suggestion limit passed to the provider. The provider decides how to apply it. */
   maxSuggestions?: number;
-  /** Prioritize checking visible pages first (default: true). */
+  /** Prioritize checking visible pages first. */
   visibleFirst?: boolean;
-  /** Show "Ignore" in context menu (default: true). */
+  /**
+   * Shows Ignore in the proofing context menu. Ignored words remain suppressed
+   * for this editor session.
+   * @defaultValue true
+   */
   allowIgnoreWord?: boolean;
-  /** Words to suppress from proofing results. */
+  /**
+   * Words whose proofing issues SuperDoc suppresses. Matching is
+   * case-insensitive after Unicode normalization.
+   * @defaultValue []
+   */
   ignoredWords?: string[];
-  /** Provider call timeout in milliseconds (default: 10000). */
+  /**
+   * Maximum provider call time in milliseconds. Non-positive or non-finite
+   * values use the default.
+   * @defaultValue 10000
+   */
   timeoutMs?: number;
-  /** Max concurrent provider requests (default: 2). */
+  /** Maximum concurrent provider requests. */
   maxConcurrentRequests?: number;
-  /** Max segments per provider call (default: 20). */
+  /** Maximum segments per provider call. */
   maxSegmentsPerBatch?: number;
-  /** Error callback for provider failures. */
+  /**
+   * Runs when a provider check fails or times out.
+   * @param error - The failure kind, message, affected segment IDs, and cause.
+   */
   onProofingError?: (error: ProofingError) => void;
-  /** Status change callback. */
+  /**
+   * Runs when the proofing lifecycle status changes.
+   * @param status - The current proofing status.
+   */
   onStatusChange?: (status: ProofingStatus) => void;
 }

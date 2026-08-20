@@ -154,7 +154,8 @@ export const INTENT_GROUP_META: Record<string, IntentGroupMeta> = {
       'Read document content in various formats. Call this first in any workflow to understand document structure before making edits. ' +
       'Action "blocks" returns structured block data with nodeId, nodeType, textPreview, optional full text when includeText:true, formatting properties (fontFamily, fontSize, color, bold, underline, alignment), and ref handles for immediate use with superdoc_edit or superdoc_format. ' +
       'When you need to evaluate or rewrite existing paragraphs or clauses, prefer action "blocks" with includeText:true so you can identify the correct block and then target it by nodeId. ' +
-      'Action "text" and "markdown" return the full document as plain text or Markdown. Action "html" returns HTML. ' +
+      'Actions "text", "markdown", and "html" return compact strings. Actions "markdown_projection" and "html_projection" return detailed async projections with review modes, scopes, diagnostics, annotations, block maps, and optional source maps. ' +
+      'Projection source targets use tracked coordinates and are valid only at evaluatedRevision; after any mutation, reproject before using them. Treat omitted or partially emitted annotations according to their status instead of guessing an anchor from rendered text. ' +
       'Action "info" returns document metadata: word count, paragraph count, page count, outline, available styles, and capability flags. ' +
       'The "blocks" action supports pagination via "offset" and "limit", and filtering via "nodeTypes". Other actions ignore these parameters. ' +
       'This tool never modifies the document. ' +
@@ -165,6 +166,13 @@ export const INTENT_GROUP_META: Record<string, IntentGroupMeta> = {
       { action: 'blocks', offset: 0, limit: 20, nodeTypes: ['heading', 'paragraph'] },
       { action: 'text' },
       { action: 'info' },
+      { action: 'html_projection', reviewMode: 'redline', includeSourceMap: true },
+      {
+        action: 'markdown_projection',
+        reviewMode: 'original',
+        scope: { kind: 'block', nodeType: 'paragraph', nodeId: 'paragraph-id' },
+        includeSourceMap: true,
+      },
     ],
   },
   edit: {
@@ -178,12 +186,14 @@ export const INTENT_GROUP_META: Record<string, IntentGroupMeta> = {
       'Each format.apply step accepts "inline" (fontFamily, fontSize, bold, underline, color), "alignment", and "scope" in the same step. ' +
       'Use scope: "block" so formatting covers the entire paragraph. ' +
       'Copy the exact property values from the existing get_content blocks (fontFamily, fontSize, color, alignment, bold, underline). Do NOT invent values: use what the blocks show. ' +
-      'Also supports replace, delete, and undo/redo. For replace and delete, pass a "ref" from superdoc_search or superdoc_get_content blocks. ' +
+      'Also supports replace, delete, and undo/redo. For ordinary replace and delete, pass a "ref" from superdoc_search or superdoc_get_content blocks. ' +
       'A search ref covers only the matched substring; a block ref covers the entire block text, so use block refs when rewriting or shortening whole paragraphs. ' +
+      'To replace every block in the main body, use action "replace" with target:{kind:"story",storyType:"body"}, one text/value/content payload, and changeMode:"direct". This replaces body content, not the DOCX package, and does not require a search first. Tracked whole-body replacement is unsupported. ' +
       'For multi-step redlines or whole-clause rewrites, prefer superdoc_mutations with where:{by:"block", nodeType, nodeId} from superdoc_get_content action "blocks" includeText:true rather than relying on text selectors. ' +
       'Refs expire after any mutation; always re-search before the next edit. ' +
       'For 2+ edits that must succeed or fail atomically, use superdoc_mutations instead. ' +
-      'Supports "dryRun" to preview changes and "changeMode: tracked" to record edits as tracked changes (not supported for markdown/html inserts). ' +
+      'Before an exact HTML or Markdown insert/replace that must be fidelity-checked, use action "check_support", review its outcome and diagnostics, then pass its guard back as "supportCheck" on the unchanged write. ' +
+      'Supports "dryRun" to preview changes and "changeMode: tracked" to record edits as tracked changes. ' +
       'Do NOT build "target" objects manually when a ref is available; prefer "ref" for simpler, more reliable targeting.',
     inputExamples: [
       {
@@ -192,6 +202,13 @@ export const INTENT_GROUP_META: Record<string, IntentGroupMeta> = {
         target: { kind: 'block', nodeType: 'paragraph', nodeId: '<nodeId>' },
         placement: 'before',
         value: '# Executive Summary\n\nThis agreement sets forth the principal terms...',
+        changeMode: 'direct',
+      },
+      {
+        action: 'insert',
+        type: 'html',
+        value: '<h2>Review heading</h2><p>Tracked rich content.</p>',
+        changeMode: 'tracked',
       },
       {
         action: 'insert',
@@ -200,6 +217,33 @@ export const INTENT_GROUP_META: Record<string, IntentGroupMeta> = {
           '# Section Title\n\nParagraph content here.\n\n# Another Section\n\nMore content with **bold** and *italic*.',
       },
       { action: 'replace', ref: '<handle.ref>', text: 'new text here' },
+      {
+        action: 'replace',
+        ref: '<handle.ref>',
+        value: '**Direct rich replacement**',
+        type: 'markdown',
+        changeMode: 'direct',
+      },
+      {
+        action: 'replace',
+        ref: '<handle.ref>',
+        value: '<strong>Tracked rich replacement</strong>',
+        type: 'html',
+        changeMode: 'tracked',
+      },
+      {
+        action: 'check_support',
+        operation: 'insert',
+        input: { type: 'markdown', value: '# Checked section' },
+        options: { changeMode: 'direct' },
+      },
+      {
+        action: 'replace',
+        target: { kind: 'story', storyType: 'body' },
+        value: '# Replacement\n\nComplete new body.',
+        type: 'markdown',
+        changeMode: 'direct',
+      },
       { action: 'delete', ref: '<handle.ref>' },
       { action: 'undo' },
     ],
@@ -538,6 +582,7 @@ function readOperation(
     possibleFailureCodes?: readonly ReceiptFailureCode[];
     deterministicTargetResolution?: boolean;
     remediationHints?: readonly string[];
+    returnsPromise?: boolean;
   } = {},
 ): CommandStaticMetadata {
   return {
@@ -552,6 +597,7 @@ function readOperation(
     },
     deterministicTargetResolution: options.deterministicTargetResolution ?? true,
     remediationHints: options.remediationHints,
+    returnsPromise: options.returnsPromise,
   };
 }
 function mutationOperation(options: {
@@ -809,6 +855,34 @@ export const OPERATION_DEFINITIONS = {
     intentGroup: 'get_content',
     intentAction: 'html',
   },
+  projectMarkdown: {
+    memberPath: 'projectMarkdown',
+    description: 'Project document content as Markdown with review, scope, diagnostics, and provenance metadata.',
+    expectedResult: 'Returns a Promise resolving to a detailed Markdown content projection result.',
+    requiresDocumentContext: true,
+    metadata: readOperation({
+      throws: ['INVALID_INPUT', 'CAPABILITY_UNAVAILABLE', ...T_STORY],
+      returnsPromise: true,
+    }),
+    referenceDocPath: 'project-markdown.mdx',
+    referenceGroup: 'core',
+    intentGroup: 'get_content',
+    intentAction: 'markdown_projection',
+  },
+  projectHtml: {
+    memberPath: 'projectHtml',
+    description: 'Project document content as HTML with review, scope, diagnostics, and provenance metadata.',
+    expectedResult: 'Returns a Promise resolving to a detailed HTML content projection result.',
+    requiresDocumentContext: true,
+    metadata: readOperation({
+      throws: ['INVALID_INPUT', 'CAPABILITY_UNAVAILABLE', ...T_STORY],
+      returnsPromise: true,
+    }),
+    referenceDocPath: 'project-html.mdx',
+    referenceGroup: 'core',
+    intentGroup: 'get_content',
+    intentAction: 'html_projection',
+  },
   markdownToFragment: {
     memberPath: 'markdownToFragment',
     description: 'Convert a Markdown string into an SDM/1 structural fragment.',
@@ -816,6 +890,15 @@ export const OPERATION_DEFINITIONS = {
     requiresDocumentContext: true,
     metadata: readOperation(),
     referenceDocPath: 'markdown-to-fragment.mdx',
+    referenceGroup: 'core',
+  },
+  htmlToFragment: {
+    memberPath: 'htmlToFragment',
+    description: 'Convert an HTML string into an SDM/1 structural fragment.',
+    expectedResult: 'Returns an SDHtmlToFragmentResult with the converted fragment, lossy flag, and diagnostics.',
+    requiresDocumentContext: true,
+    metadata: readOperation({ throws: ['CAPABILITY_UNAVAILABLE', 'INVALID_INPUT'] }),
+    referenceDocPath: 'html-to-fragment.mdx',
     referenceGroup: 'core',
   },
   info: {
@@ -868,7 +951,7 @@ export const OPERATION_DEFINITIONS = {
       'structural SDFragment (content) inserts one or more blocks as siblings relative to a BlockNodeAddress target. ' +
       'When target/ref is omitted, content appends at the end of the document. ' +
       'Text mode supports text (default), markdown, and html content types via the `type` field. ' +
-      'Structural mode uses `placement` (before/after/insideStart/insideEnd) to position relative to the target block.',
+      'Rich markdown/html and structural modes use `placement` (before/after/insideStart/insideEnd) to position relative to a block target.',
     expectedResult:
       'Returns an SDMutationReceipt with applied status; resolution reports the resolved insertion point/target. Created visible text and structural blocks are reported through effects.insertedText and effects.insertedBlocks when available. Receipt reports NO_OP if the insertion point is invalid or content is empty.',
     requiresDocumentContext: true,
@@ -891,6 +974,11 @@ export const OPERATION_DEFINITIONS = {
         'RAW_MODE_REQUIRED',
         'PRESERVE_ONLY_VIOLATION',
         'INVALID_INPUT',
+        'TARGET_NOT_FOUND',
+        'PRECONDITION_FAILED',
+        'REVISION_MISMATCH',
+        'CHECK_MISMATCH',
+        'INTERNAL_ERROR',
       ],
       throws: [
         ...T_NOT_FOUND_CAPABLE,
@@ -915,7 +1003,9 @@ export const OPERATION_DEFINITIONS = {
     description:
       'Replace content at a contiguous document selection. ' +
       'Text path accepts a SelectionTarget or ref plus replacement text. ' +
-      'Structural path accepts a BlockNodeAddress (replaces whole block), SelectionTarget (expands to full covered block boundaries), or ref plus SDFragment content.',
+      'Rich string path accepts HTML or Markdown plus a BlockNodeAddress, SelectionTarget, or ref. ' +
+      'Structural path accepts the same locator forms plus SDFragment content. ' +
+      "An explicit {kind:'story', storyType:'body'} target replaces the complete main body in direct mode while preserving the destination DOCX package.",
     expectedResult:
       'Returns an SDMutationReceipt with applied status; receipt reports NO_OP if the target range already contains identical content.',
     requiresDocumentContext: true,
@@ -936,6 +1026,11 @@ export const OPERATION_DEFINITIONS = {
         'RAW_MODE_REQUIRED',
         'PRESERVE_ONLY_VIOLATION',
         'INVALID_INPUT',
+        'TARGET_NOT_FOUND',
+        'PRECONDITION_FAILED',
+        'REVISION_MISMATCH',
+        'CHECK_MISMATCH',
+        'INTERNAL_ERROR',
       ],
       throws: [
         ...T_NOT_FOUND_CAPABLE,
@@ -2960,6 +3055,23 @@ export const OPERATION_DEFINITIONS = {
     }),
     referenceDocPath: 'capabilities/get.mdx',
     referenceGroup: 'capabilities',
+  },
+  'capabilities.check': {
+    memberPath: 'capabilities.check',
+    description:
+      'Check an exact HTML or Markdown insert, replace, or detailed projection against the current document without mutating it.',
+    expectedResult:
+      'Returns a Promise resolving to structured support, fidelity outcome, diagnostics, and a revision-bound guard for supported writes.',
+    requiresDocumentContext: true,
+    metadata: readOperation({
+      idempotency: 'conditional',
+      throws: ['INVALID_INPUT', 'CAPABILITY_UNAVAILABLE'],
+      returnsPromise: true,
+    }),
+    referenceDocPath: 'capabilities/check.mdx',
+    referenceGroup: 'capabilities',
+    intentGroup: 'edit',
+    intentAction: 'check_support',
   },
   // -------------------------------------------------------------------------
   // Create: table
@@ -6427,7 +6539,8 @@ export const OPERATION_DEFINITIONS = {
       'Omitted changeMode applies story content directly; explicit tracked mode governs all four story families (body, header/footer parts, footnotes, endnotes). Comments, styles, and numbering are always applied directly. ' +
       'Supported mixed full-diff payloads apply atomically across body, comments, styles, numbering, and header/footers. ' +
       'Unsupported/deferred families such as package-graph/media/hyperlink closure, settings/theme, and textboxes fail closed before mutation.',
-    expectedResult: 'Returns a DiffApplyResult with applied operation count and diagnostics.',
+    expectedResult:
+      'Returns a DiffApplyResult with per-operation review receipts, applied operation count, and diagnostics.',
     requiresDocumentContext: true,
     metadata: mutationOperation({
       idempotency: 'conditional',

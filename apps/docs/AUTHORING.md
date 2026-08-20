@@ -28,6 +28,12 @@ Use one of these shapes before adding custom structure.
 3. Include one minimal example.
 4. Link to a complete workflow instead of repeating it.
 
+## Give every concept one owner
+
+Every concept has exactly one owner page. When another guide needs that concept, state it in one sentence and link to the owner instead of teaching it again.
+
+Repeat a short safety reminder when the reader needs it at the point of action. For example, client configuration is not authorization, and a resolved command still requires its receipt to be checked. These reminders protect the task and do not create a second owner page.
+
 ## Use Markdown first
 
 Write headings, prose, links, lists, code, and images with standard Markdown. This keeps pages useful in HTML, per-page Markdown, `llms.txt`, and `llms-full.txt`.
@@ -132,9 +138,9 @@ Set `allowLocalFile` only when a task produces a DOCX that the reader should ins
 
 ### Runtime delivery
 
-The editor examples load exact, pinned browser bundles from jsDelivr as the embed approaches the viewport. This is a docs-only delivery choice for the static site, not the recommended product integration. The DOCX fixture is fetched from the docs origin and its bytes are not sent to jsDelivr.
+The editor examples load exact, pinned stable browser bundles from jsDelivr as the embed approaches the viewport. This is a docs-only delivery choice for the static site, not the recommended product integration. The DOCX fixture is fetched from the docs origin and its bytes are not sent to jsDelivr.
 
-Keep the package names, versions, and CDN origin in `config/editor-demo-runtime.json`. The content tests verify those versions against the public `superdoc` package manifest. Do not add another remote runtime or copy the same constants into a component.
+Keep the package names, versions, and CDN origin in `config/editor-demo-runtime.json`. Public examples use exact stable versions so their behavior matches the installation guidance while the repository advances through prereleases. Update the SuperDoc and DOCX Engine pins together after verifying every shared embed against the new stable release. The content tests reject prerelease versions, and the sync script keeps package names, the UI export path, and CSP URLs aligned. Do not add another remote runtime or copy the same constants into a component.
 
 Same-origin delivery would require publishing the editor shell, engine module, browser worker, styles, and manifest together. Move to that model when the docs deployment can publish the official build artifacts without committing generated or separately licensed engine bundles to the documentation source.
 

@@ -20,8 +20,10 @@
     "examples/content-controls": { "path": "examples/content-controls" },
     "examples/custom-ui": { "path": "examples/custom-ui" },
     "examples/document-modes": { "path": "examples/document-modes" },
+    "examples/proofing": { "path": "examples/proofing" },
     "examples/react": { "path": "examples/react" },
     "examples/search": { "path": "examples/search" },
+    "examples/sveltekit": { "path": "examples/sveltekit" },
     "examples/vanilla": { "path": "examples/vanilla" },
     "examples/version-history": { "path": "examples/version-history" },
     "grading-papers": { "path": "go-links/unavailable" },
@@ -33,6 +35,7 @@
     "nuxt": { "path": "go-links/unavailable" },
     "react": { "path": "examples/react" },
     "solid": { "path": "go-links/unavailable" },
+    "sveltekit": { "path": "examples/sveltekit" },
     "template-builder": {
       "repository": "superdoc-dev/demos",
       "path": "template-builder"

@@ -5,6 +5,7 @@ import { DocumentApiValidationError } from './errors.js';
 export * from './types/index.js';
 export * from './contract/index.js';
 export * from './capabilities/capabilities.js';
+export * from './capabilities/html-markdown-support.js';
 export * from './inline-semantics/index.js';
 export type { HistoryAdapter, HistoryApi } from './history/history.js';
 export { executeHistoryGet, executeHistoryUndo, executeHistoryRedo } from './history/history.js';
@@ -41,6 +42,12 @@ export type {
   MarkdownToFragmentAdapter,
 } from './markdown-to-fragment/markdown-to-fragment.js';
 export { executeMarkdownToFragment } from './markdown-to-fragment/markdown-to-fragment.js';
+export type { HtmlToFragmentInput, HtmlToFragmentAdapter } from './html-to-fragment/html-to-fragment.js';
+export { executeHtmlToFragment } from './html-to-fragment/html-to-fragment.js';
+export type { ProjectHtmlAdapter } from './project-html/project-html.js';
+export { executeProjectHtml } from './project-html/project-html.js';
+export type { ProjectMarkdownAdapter } from './project-markdown/project-markdown.js';
+export { executeProjectMarkdown } from './project-markdown/project-markdown.js';
 export type {
   HistoryState,
   HistoryActionResult,
@@ -137,13 +144,21 @@ import type { SDDocument } from './types/fragment.js';
 import { executeGetText, type GetTextAdapter, type GetTextInput } from './get-text/get-text.js';
 import { executeGetMarkdown, type GetMarkdownAdapter, type GetMarkdownInput } from './get-markdown/get-markdown.js';
 import { executeGetHtml, type GetHtmlAdapter, type GetHtmlInput } from './get-html/get-html.js';
+import { executeProjectHtml, type ProjectHtmlAdapter } from './project-html/project-html.js';
+import { executeProjectMarkdown, type ProjectMarkdownAdapter } from './project-markdown/project-markdown.js';
+import type { ProjectHtmlInput, ProjectMarkdownInput, SDContentProjectionResult } from './types/content-projection.js';
 import { validateStoryLocator } from './validation/story-validator.js';
 import {
   executeMarkdownToFragment,
   type MarkdownToFragmentAdapter,
   type MarkdownToFragmentInput,
 } from './markdown-to-fragment/markdown-to-fragment.js';
-import type { SDMarkdownToFragmentResult } from './types/sd-contract.js';
+import {
+  executeHtmlToFragment,
+  type HtmlToFragmentAdapter,
+  type HtmlToFragmentInput,
+} from './html-to-fragment/html-to-fragment.js';
+import type { SDHtmlToFragmentResult, SDMarkdownToFragmentResult } from './types/sd-contract.js';
 import { executeInfo, type InfoAdapter, type InfoInput } from './info/info.js';
 import { executeExtract, type ExtractAdapter, type ExtractInput } from './extract/extract.js';
 import {
@@ -367,13 +382,18 @@ export {
   executeTrackChangesList,
   executeTrackChangesDecide,
 } from './track-changes/track-changes.js';
-import type { MutationOptions, RevisionGuardOptions, WriteAdapter } from './write/write.js';
+import type { MutationOptions, RevisionGuardOptions, RichContentMutationOptions, WriteAdapter } from './write/write.js';
 import type { SelectionMutationAdapter } from './selection-mutation.js';
 import {
   executeCapabilities,
+  executeCapabilitiesCheck,
   type CapabilitiesAdapter,
   type DocumentApiCapabilities,
 } from './capabilities/capabilities.js';
+import type {
+  SDHtmlMarkdownSupportCheckInput,
+  SDHtmlMarkdownSupportCheckResult,
+} from './capabilities/html-markdown-support.js';
 import type { OperationId } from './contract/types.js';
 import type { DynamicInvokeRequest, InvokeRequest, InvokeResult } from './contract/operation-registry.js';
 import { buildDispatchTable } from './invoke/invoke.js';
@@ -403,6 +423,18 @@ import type {
   DiffCompareInput,
   DiffApplyInput,
   DiffApplyOptions,
+  DiffApplyOperationReceipt,
+  DiffApplyReviewItem,
+} from './diff/diff.types.js';
+export type {
+  DiffSnapshot,
+  DiffPayload,
+  DiffApplyResult,
+  DiffCompareInput,
+  DiffApplyInput,
+  DiffApplyOptions,
+  DiffApplyOperationReceipt,
+  DiffApplyReviewItem,
 } from './diff/diff.types.js';
 import type { ExportAdapter, ExportApi } from './export/export.js';
 import { executeExportToDocx } from './export/export.js';
@@ -1037,7 +1069,7 @@ export type { GetMarkdownAdapter, GetMarkdownInput } from './get-markdown/get-ma
 export type { GetHtmlAdapter, GetHtmlInput } from './get-html/get-html.js';
 export type { InfoAdapter, InfoInput } from './info/info.js';
 export type { ExtractAdapter, ExtractInput } from './extract/extract.js';
-export type { WriteAdapter, WriteRequest } from './write/write.js';
+export type { WriteAdapter, WriteRequest, RichContentMutationOptions } from './write/write.js';
 export type {
   FormatInlineAliasApi,
   FormatInlineAliasInput,
@@ -1676,12 +1708,18 @@ export {
 } from './lists/lists.js';
 export { DocumentApiValidationError } from './errors.js';
 export { textReceiptToSDReceipt, buildStructuralReceipt } from './receipt-bridge.js';
-export type { StructuralReceiptParams } from './receipt-bridge.js';
+export type { MutationReceiptBridgeContext, StructuralReceiptParams } from './receipt-bridge.js';
 export { isBlockNodeAddress } from './validation-primitives.js';
-export type { InsertInput, InsertContentType, TextInsertInput, LegacyInsertInput } from './insert/insert.js';
+export type {
+  InsertInput,
+  InsertContentType,
+  TextInsertInput,
+  RichContentInsertInput,
+  LegacyInsertInput,
+} from './insert/insert.js';
 export { isStructuralInsertInput } from './insert/insert.js';
-export type { ReplaceInput, TextReplaceInput } from './replace/replace.js';
-export { executeReplace, isStructuralReplaceInput } from './replace/replace.js';
+export type { ReplaceInput, TextReplaceInput, RichContentReplaceInput } from './replace/replace.js';
+export { executeReplace, isStructuralReplaceInput, isRichContentReplaceInput } from './replace/replace.js';
 export { executeFind } from './find/find.js';
 export { validateDocumentFragment, validateSDFragment } from './validation/fragment-validator.js';
 export type { DeleteInput } from './delete/delete.js';
@@ -1746,6 +1784,7 @@ export type TablesAdapter = Omit<TablesApi, 'moveRow'> & {
 export interface CapabilitiesApi {
   (): DocumentApiCapabilities;
   get(): DocumentApiCapabilities;
+  check(input: SDHtmlMarkdownSupportCheckInput): Promise<SDHtmlMarkdownSupportCheckResult>;
 }
 export interface QueryApi {
   /** Accepts canonical nested input or a selector shorthand normalized to `{ select: ... }` internally. */
@@ -1808,10 +1847,16 @@ export interface DocumentApi {
    * Return the full document content as an HTML string.
    */
   getHtml(input: GetHtmlInput): string;
+  projectHtml(input: ProjectHtmlInput): Promise<SDContentProjectionResult<'html'>>;
+  projectMarkdown(input: ProjectMarkdownInput): Promise<SDContentProjectionResult<'markdown'>>;
   /**
    * Convert a Markdown string into an SDM/1 structural fragment.
    */
   markdownToFragment(input: MarkdownToFragmentInput): SDMarkdownToFragmentResult;
+  /**
+   * Convert an HTML string into an SDM/1 structural fragment.
+   */
+  htmlToFragment(input: HtmlToFragmentInput): SDHtmlToFragmentResult;
   /**
    * Return document summary info including document counts and capabilities.
    */
@@ -1833,11 +1878,11 @@ export interface DocumentApi {
    * Insert content at a target location.
    * If target is omitted, inserts at the end of the document.
    */
-  insert(input: InsertInput, options?: MutationOptions): SDMutationReceipt;
+  insert(input: InsertInput, options?: RichContentMutationOptions): SDMutationReceipt;
   /**
    * Replace text at a target range.
    */
-  replace(input: ReplaceInput, options?: MutationOptions): SDMutationReceipt;
+  replace(input: ReplaceInput, options?: RichContentMutationOptions): SDMutationReceipt;
   /**
    * Delete text at a target range.
    */
@@ -2022,7 +2067,10 @@ export interface DocumentApiAdapters {
   getText: GetTextAdapter;
   getMarkdown: GetMarkdownAdapter;
   getHtml: GetHtmlAdapter;
+  projectHtml?: ProjectHtmlAdapter;
+  projectMarkdown?: ProjectMarkdownAdapter;
   markdownToFragment: MarkdownToFragmentAdapter;
+  htmlToFragment?: HtmlToFragmentAdapter;
   info: InfoAdapter;
   extract: ExtractAdapter;
   clearContent: ClearContentAdapter;
@@ -2220,7 +2268,10 @@ export function createDocumentApi(adapters: DocumentApiAdapters): DocumentApi {
     }
     return caps;
   };
-  const capabilities: CapabilitiesApi = Object.assign(capFn, { get: capFn });
+  const capabilities: CapabilitiesApi = Object.assign(capFn, {
+    get: capFn,
+    check: (input: SDHtmlMarkdownSupportCheckInput) => executeCapabilitiesCheck(adapters.capabilities, input),
+  });
   const inlineAliasApi = buildFormatInlineAliasApi(adapters.selectionMutation);
   const api: DocumentApi = {
     get(input: SDGetInput): SDDocument {
@@ -2244,8 +2295,17 @@ export function createDocumentApi(adapters: DocumentApiAdapters): DocumentApi {
     getHtml(input: GetHtmlInput): string {
       return executeGetHtml(adapters.getHtml, input);
     },
+    projectHtml(input: ProjectHtmlInput): Promise<SDContentProjectionResult<'html'>> {
+      return executeProjectHtml(adapters.projectHtml, input);
+    },
+    projectMarkdown(input: ProjectMarkdownInput): Promise<SDContentProjectionResult<'markdown'>> {
+      return executeProjectMarkdown(adapters.projectMarkdown, input);
+    },
     markdownToFragment(input: MarkdownToFragmentInput): SDMarkdownToFragmentResult {
       return executeMarkdownToFragment(adapters.markdownToFragment, input);
+    },
+    htmlToFragment(input: HtmlToFragmentInput): SDHtmlToFragmentResult {
+      return executeHtmlToFragment(adapters.htmlToFragment, input);
     },
     info(input: InfoInput): DocumentInfo {
       return executeInfo(adapters.info, input);
@@ -2273,10 +2333,10 @@ export function createDocumentApi(adapters: DocumentApiAdapters): DocumentApi {
         return executeListComments(adapters.comments, query);
       },
     },
-    insert(input: InsertInput, options?: MutationOptions): SDMutationReceipt {
+    insert(input: InsertInput, options?: RichContentMutationOptions): SDMutationReceipt {
       return executeInsert(adapters.selectionMutation, adapters.write, input, options);
     },
-    replace(input: ReplaceInput, options?: MutationOptions): SDMutationReceipt {
+    replace(input: ReplaceInput, options?: RichContentMutationOptions): SDMutationReceipt {
       return executeReplace(adapters.selectionMutation, adapters.write, input, options);
     },
     delete(input: DeleteInput, options?: MutationOptions): TextMutationReceipt {

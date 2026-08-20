@@ -20,7 +20,7 @@
 
 <div align="center">
   <a href="https://www.superdoc.dev" target="_blank">
-   <img width="800px" height="auto" alt="SuperDoc" src="https://github.com/user-attachments/assets/112339d3-446c-4320-8219-7ec7dbd6c8d4" />
+   <img width="800px" height="auto" alt="SuperDoc" src="https://github.com/user-attachments/assets/3d74b4a7-b112-4591-a3be-7c965721d22b" />
   </a>
 </div>
 
@@ -51,9 +51,9 @@ const superdoc = new SuperDoc({
 ```
 
 `document` accepts a URL, a `File`, or a `Blob`. Omit it to start with a blank
-DOCX. See the [documentation](https://docs.superdoc.dev),
-[React quick start](https://docs.superdoc.dev/editor/frameworks/react) for the
-next step.
+DOCX. See the [documentation](https://docs.superdoc.dev) or the
+[React quick start](https://docs.superdoc.dev/editor/frameworks/react) for next
+steps.
 
 ## What SuperDoc does
 
@@ -91,10 +91,9 @@ browse [open issues](https://github.com/superdoc/docx-editor/issues), or join
 
 ## Contributors
 
-<!-- contrib.rocks does not yet resolve the renamed superdoc/docx-editor repository, so the image uses the previous repository name. -->
-<a href="https://github.com/superdoc/docx-editor/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=superdoc-dev/superdoc" alt="SuperDoc contributors" />
-</a>
+Thank you to everyone who has helped us build and improve the SuperDoc editor.
+
+<img src="./assets/contributors.svg" alt="SuperDoc contributors across V1 and V2" />
 
 ## License
 

@@ -190,6 +190,147 @@ describe('computeFixedTableColumnWidths', () => {
     expect(result.totalWidth).toBe(190);
   });
 
+  // SD-3880: fixed 100%-width tables with an authored grid and repeated
+  // full-grid merged rows whose tcW restates the grid total must not skew
+  // width into the last logical column after preferred-table shrink.
+  it('keeps authored proportions when later full-grid spans restate the grid total under a pct table width', () => {
+    const preferredColumnWidths = [
+      55.93333333333333, 46.86666666666667, 56.266666666666666, 38.53333333333333, 41.666666666666664, 44,
+      45.666666666666664, 44.8, 45.733333333333334, 44.8, 45.666666666666664, 51.4, 51.333333333333336,
+      41.13333333333333, 41.333333333333336, 56.266666666666666, 34.93333333333333, 53.86666666666667,
+      56.666666666666664, 129.66666666666666,
+    ];
+    const authoredGridTotal = preferredColumnWidths.reduce((sum, width) => sum + width, 0);
+    const preferredTableWidth = 624;
+    const headerCells = preferredColumnWidths.map((preferredWidth, startColumn) => ({
+      startColumn,
+      span: 1,
+      preferredWidth,
+    }));
+    const fullSpanRow = {
+      skippedBefore: [],
+      skippedAfter: [],
+      skippedColumns: [],
+      logicalColumnCount: preferredColumnWidths.length,
+      cells: [{ startColumn: 0, span: preferredColumnWidths.length, preferredWidth: authoredGridTotal }],
+    };
+
+    const result = computeFixedTableColumnWidths(
+      buildFixedInput({
+        preferredColumnWidths,
+        preferredTableWidth,
+        rows: [
+          {
+            skippedBefore: [],
+            skippedAfter: [],
+            skippedColumns: [],
+            logicalColumnCount: preferredColumnWidths.length,
+            cells: headerCells,
+          },
+          fullSpanRow,
+          fullSpanRow,
+          fullSpanRow,
+          fullSpanRow,
+        ],
+      }),
+    );
+
+    const scale = preferredTableWidth / authoredGridTotal;
+    expect(result.totalWidth).toBe(preferredTableWidth);
+    expect(result.columnWidths).toHaveLength(20);
+    for (let index = 0; index < preferredColumnWidths.length; index++) {
+      expect(result.columnWidths[index]).toBeCloseTo(preferredColumnWidths[index]! * scale, 5);
+    }
+    expect(result.columnWidths.slice(0, 19).reduce((sum, width) => sum + width, 0)).toBeGreaterThan(500);
+    expect(result.columnWidths[19]).toBeCloseTo(preferredColumnWidths[19]! * scale, 5);
+  });
+
+  it('keeps authored proportions when a later remaining-grid span after gridBefore restates the grid total', () => {
+    const preferredColumnWidths = [200, 150, 150, 300];
+    const authoredGridTotal = 800;
+    const preferredTableWidth = 400;
+    const scale = preferredTableWidth / authoredGridTotal;
+    const result = computeFixedTableColumnWidths(
+      buildFixedInput({
+        preferredColumnWidths,
+        preferredTableWidth,
+        rows: [
+          {
+            skippedBefore: [],
+            skippedAfter: [],
+            skippedColumns: [],
+            logicalColumnCount: 4,
+            cells: preferredColumnWidths.map((preferredWidth, startColumn) => ({
+              startColumn,
+              span: 1,
+              preferredWidth,
+            })),
+          },
+          {
+            skippedBefore: [{ columnIndex: 0, preferredWidth: undefined, minContentWidth: 0, maxContentWidth: 0 }],
+            skippedAfter: [],
+            skippedColumns: [{ columnIndex: 0, preferredWidth: undefined, minContentWidth: 0, maxContentWidth: 0 }],
+            logicalColumnCount: 4,
+            cells: [{ startColumn: 1, span: 3, preferredWidth: authoredGridTotal }],
+          },
+        ],
+      }),
+    );
+
+    expect(result.totalWidth).toBe(preferredTableWidth);
+    expect(result.columnWidths).toHaveLength(4);
+    for (let index = 0; index < preferredColumnWidths.length; index++) {
+      expect(result.columnWidths[index]).toBeCloseTo(preferredColumnWidths[index]! * scale, 5);
+    }
+  });
+
+  it('keeps authored proportions when a later skipped column restates the grid total as wBefore', () => {
+    const preferredColumnWidths = [200, 150, 150, 300];
+    const authoredGridTotal = 800;
+    const preferredTableWidth = 400;
+    const scale = preferredTableWidth / authoredGridTotal;
+    const result = computeFixedTableColumnWidths(
+      buildFixedInput({
+        preferredColumnWidths,
+        preferredTableWidth,
+        rows: [
+          {
+            skippedBefore: [],
+            skippedAfter: [],
+            skippedColumns: [],
+            logicalColumnCount: 4,
+            cells: preferredColumnWidths.map((preferredWidth, startColumn) => ({
+              startColumn,
+              span: 1,
+              preferredWidth,
+            })),
+          },
+          {
+            skippedBefore: [
+              { columnIndex: 0, preferredWidth: authoredGridTotal, minContentWidth: 0, maxContentWidth: 0 },
+            ],
+            skippedAfter: [],
+            skippedColumns: [
+              { columnIndex: 0, preferredWidth: authoredGridTotal, minContentWidth: 0, maxContentWidth: 0 },
+            ],
+            logicalColumnCount: 4,
+            cells: [
+              { startColumn: 1, span: 1, preferredWidth: undefined },
+              { startColumn: 2, span: 1, preferredWidth: undefined },
+              { startColumn: 3, span: 1, preferredWidth: undefined },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(result.totalWidth).toBe(preferredTableWidth);
+    expect(result.columnWidths).toHaveLength(4);
+    for (let index = 0; index < preferredColumnWidths.length; index++) {
+      expect(result.columnWidths[index]).toBeCloseTo(preferredColumnWidths[index]! * scale, 5);
+    }
+  });
+
   it('accounts for skipped columns and their preferred widths', () => {
     const result = computeFixedTableColumnWidths(
       buildFixedInput({

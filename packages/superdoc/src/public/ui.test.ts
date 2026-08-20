@@ -2429,6 +2429,7 @@ describe('public ui — viewport + metadata geometry', () => {
       activeSeed?: 'bullet' | 'ordered' | null;
       enabled?: boolean;
       shippedStatus?: string;
+      mode?: 'editing' | 'viewing';
     } = {},
   ) {
     const apply = options.apply ?? vi.fn(() => Promise.resolve({ status: 'committed' }));
@@ -2452,7 +2453,7 @@ describe('public ui — viewport + metadata geometry', () => {
         },
         editCommands: { lists: { apply }, getSnapshot },
       },
-      config: { documentMode: 'editing' },
+      config: { documentMode: options.mode ?? 'editing' },
       on: vi.fn(),
       off: vi.fn(),
     };
@@ -2497,6 +2498,19 @@ describe('public ui — viewport + metadata geometry', () => {
       enabled: false,
       disabled: true,
     });
+  });
+
+  it('blocks the edit-command list fast path in viewing mode', async () => {
+    const { superdoc, apply } = makeListSuperdoc({ mode: 'viewing' });
+    const ui = createSuperDocUI({ superdoc });
+
+    expect(ui.commands.get('bullet-list').getState()).toMatchObject({
+      supported: true,
+      enabled: false,
+      reason: SUPERDOC_UI_REASONS.documentReadonly,
+    });
+    expect(await ui.toolbar.execute('bullet-list')).toBe(false);
+    expect(apply).not.toHaveBeenCalled();
   });
 
   it('keeps the command id list kind authoritative over payload overrides', async () => {
@@ -4567,6 +4581,39 @@ describe('public ui — viewport.scrollIntoView parity', () => {
     });
   });
 
+  it('forwards instant behavior to the host', async () => {
+    const scrollTargetIntoView = vi.fn(async () => ({ success: true }));
+    const { superdoc } = makeWorkflowSuperdoc({ host: { scrollTargetIntoView } });
+    const ui = createSuperDocUI({ superdoc });
+    const target = { kind: 'text', blockId: 'P1', range: { start: 0, end: 5 } } as const;
+
+    const result = await ui.viewport.scrollIntoView({ target, behavior: 'instant' });
+
+    expect(result).toEqual({ success: true });
+    expect(scrollTargetIntoView).toHaveBeenCalledWith({
+      target: { kind: 'text', segments: [{ blockId: 'P1', range: { start: 0, end: 5 } }] },
+      block: 'center',
+      behavior: 'instant',
+    });
+  });
+
+  it('maps one failed instant text-range attempt without retrying', async () => {
+    const scrollTargetIntoView = vi.fn(async () => ({ success: false, reason: 'target-not-visible' }));
+    const { superdoc } = makeWorkflowSuperdoc({ host: { scrollTargetIntoView } });
+    const ui = createSuperDocUI({ superdoc });
+    const target = { kind: 'text', blockId: 'P-far', range: { start: 0, end: 0 } } as const;
+
+    const result = await ui.viewport.scrollIntoView({ target, block: 'start', behavior: 'instant' });
+
+    expect(result).toEqual({ success: false });
+    expect(scrollTargetIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollTargetIntoView).toHaveBeenCalledWith({
+      target: { kind: 'text', segments: [{ blockId: 'P-far', range: { start: 0, end: 0 } }] },
+      block: 'start',
+      behavior: 'instant',
+    });
+  });
+
   it('scrolls a multi-segment text target (TextTarget) into view', async () => {
     const scrollTargetIntoView = vi.fn(async () => ({ success: true }));
     const { superdoc } = makeWorkflowSuperdoc({ host: { scrollTargetIntoView } });
@@ -4901,6 +4948,95 @@ describe('public ui — track changes workflow parity (row 748)', () => {
     stopObserving();
     ui.destroy();
     expect(detachReview).toHaveBeenCalledOnce();
+  });
+
+  it('keeps explicit focus when a document edit temporarily unpaints the tracked change', () => {
+    let activeReviewTarget: unknown = null;
+    let publishReviewSnapshot:
+      | ((snapshot: { activeReviewTarget: unknown; lastInteractionRejection: unknown }) => void)
+      | null = null;
+    const review = {
+      getActiveReviewTarget: () => activeReviewTarget,
+      subscribe: (listener: (snapshot: { activeReviewTarget: unknown; lastInteractionRejection: unknown }) => void) => {
+        publishReviewSnapshot = listener;
+        return () => undefined;
+      },
+      setActiveReviewTarget: (target: unknown) => {
+        activeReviewTarget = target;
+        publishReviewSnapshot?.({ activeReviewTarget, lastInteractionRejection: null });
+      },
+    };
+    const { superdoc } = makeWorkflowSuperdoc({
+      trackChanges: { list: () => ({ items }) },
+      host: { getHandles: () => ({ review, layout: { generation: 1 } }) },
+    });
+    const ui = createSuperDocUI({ superdoc });
+
+    expect(ui.trackChanges.setActive('tc-1')).toBe(true);
+    activeReviewTarget = null;
+    publishReviewSnapshot?.({
+      activeReviewTarget,
+      lastInteractionRejection: { code: 'review-target-invalidated', detail: 'not-painted' },
+    });
+
+    expect(ui.trackChanges.getSnapshot().activeId).toBe('tc-1');
+  });
+
+  it('clears explicit focus after a remote peer removes the tracked change', async () => {
+    vi.useFakeTimers();
+    try {
+      let currentItems = [...items];
+      let activeReviewTarget: unknown = null;
+      let publishReviewSnapshot:
+        | ((snapshot: { activeReviewTarget: unknown; lastInteractionRejection: unknown }) => void)
+        | null = null;
+      let publishHostEvent: ((event: Record<string, unknown>) => void) | null = null;
+      const review = {
+        getActiveReviewTarget: () => activeReviewTarget,
+        subscribe: (
+          listener: (snapshot: { activeReviewTarget: unknown; lastInteractionRejection: unknown }) => void,
+        ) => {
+          publishReviewSnapshot = listener;
+          return () => undefined;
+        },
+        setActiveReviewTarget: (target: unknown) => {
+          activeReviewTarget = target;
+          publishReviewSnapshot?.({ activeReviewTarget, lastInteractionRejection: null });
+        },
+      };
+      const { superdoc } = makeWorkflowSuperdoc({
+        trackChanges: { list: () => ({ items: currentItems }) },
+        host: {
+          getHandles: () => ({ review, layout: { generation: 1 } }),
+          events: {
+            subscribe: (listener: (event: Record<string, unknown>) => void) => {
+              publishHostEvent = listener;
+              return () => undefined;
+            },
+          },
+        },
+      });
+      const ui = createSuperDocUI({ superdoc });
+
+      expect(ui.trackChanges.setActive('tc-1')).toBe(true);
+      currentItems = currentItems.filter((item) => item.id !== 'tc-1');
+      activeReviewTarget = null;
+      publishReviewSnapshot?.({
+        activeReviewTarget,
+        lastInteractionRejection: { code: 'review-target-invalidated', detail: 'not-painted' },
+      });
+      publishHostEvent?.({
+        type: 'collaboration:remote-changed',
+        changedStoryIds: ['main:/word/document.xml'],
+        changedPartUris: ['/word/document.xml'],
+      });
+
+      await vi.advanceTimersByTimeAsync(7000);
+      expect(ui.trackChanges.getSnapshot().activeId).toBeNull();
+      ui.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('canonicalizes a story-scoped painted alias from the host review target before publishing activeId', () => {
@@ -11943,6 +12079,8 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
   it('routes the table cell-context family through tables.* once the host resolves a table context', async () => {
     const insertRow = vi.fn(() => ({ success: true }));
     const insertRowCommand = vi.fn(() => ({ success: true }));
+    const insertColumn = vi.fn(() => ({ success: true }));
+    const insertColumnCommand = vi.fn(() => ({ success: true }));
     const deleteRow = vi.fn(() => ({ success: true }));
     const deleteColumn = vi.fn(() => ({ success: true }));
     const mergeCells = vi.fn(() => ({ success: true }));
@@ -11961,7 +12099,7 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
         tables: {
           insertRow,
           deleteRow,
-          insertColumn: vi.fn(() => ({ success: true })),
+          insertColumn,
           deleteColumn,
           delete: deleteTable,
           mergeCells,
@@ -11974,7 +12112,9 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
         editorExtra: {
           host: {
             getTableContext,
-            getHandles: () => ({ editing: { tables: { insertRow: insertRowCommand } } }),
+            getHandles: () => ({
+              editing: { tables: { insertRow: insertRowCommand, insertColumn: insertColumnCommand } },
+            }),
           },
         },
       },
@@ -11998,6 +12138,9 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
     expect(await ui.toolbar.execute('table-add-row-after')).toMatchObject({ success: true });
     expect(insertRowCommand).toHaveBeenCalledWith({ nodeId: 'TBL1', rowIndex: 1, position: 'below' });
     expect(insertRow).not.toHaveBeenCalled();
+    expect(await ui.toolbar.execute('table-add-column-before')).toMatchObject({ success: true });
+    expect(insertColumnCommand).toHaveBeenCalledWith({ nodeId: 'TBL1', columnIndex: 0, position: 'left' }, 1);
+    expect(insertColumn).not.toHaveBeenCalled();
     expect(await ui.toolbar.execute('table-delete-row')).toMatchObject({ success: true });
     expect(deleteRow).toHaveBeenCalledWith({ nodeId: 'TBL1', rowIndex: 1 });
     expect(await ui.toolbar.execute('table-delete-column')).toMatchObject({ success: true });
@@ -12057,6 +12200,7 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
     const insertRowCommand = vi.fn(() => ({ success: true }));
     const deleteRow = vi.fn(() => ({ success: true }));
     const insertColumn = vi.fn(() => ({ success: true }));
+    const insertColumnCommand = vi.fn(() => ({ success: true }));
     const deleteColumn = vi.fn(() => ({ success: true }));
     const mergeCells = vi.fn(() => ({ success: true }));
     const splitCell = vi.fn(() => ({ success: true }));
@@ -12087,7 +12231,9 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
         editorExtra: {
           host: {
             getTableContext,
-            getHandles: () => ({ editing: { tables: { insertRow: insertRowCommand } } }),
+            getHandles: () => ({
+              editing: { tables: { insertRow: insertRowCommand, insertColumn: insertColumnCommand } },
+            }),
           },
         },
       },
@@ -12099,7 +12245,8 @@ describe('public ui — block / paragraph / list / link / create routing (row 74
     expect(insertRowCommand).toHaveBeenCalledWith({ nodeId: 'TBL1', rowIndex: 1, position: 'below' }, TRACKED);
     expect(insertRow).not.toHaveBeenCalled();
     expect(await ui.toolbar.execute('table-add-column-before')).toMatchObject({ success: true });
-    expect(insertColumn).toHaveBeenCalledWith({ nodeId: 'TBL1', columnIndex: 0, position: 'left' }, TRACKED);
+    expect(insertColumnCommand).toHaveBeenCalledWith({ nodeId: 'TBL1', columnIndex: 0, position: 'left' }, 1, TRACKED);
+    expect(insertColumn).not.toHaveBeenCalled();
     expect(await ui.toolbar.execute('table-delete-row')).toMatchObject({ success: true });
     expect(deleteRow).toHaveBeenCalledWith({ nodeId: 'TBL1', rowIndex: 1 }, TRACKED);
     expect(await ui.toolbar.execute('table-delete-column')).toMatchObject({ success: true });

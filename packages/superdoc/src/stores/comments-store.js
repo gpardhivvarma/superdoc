@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, shallowRef, reactive, computed, watch } from 'vue';
+import { ref, shallowRef, reactive, computed, watch, toRaw } from 'vue';
 import { comments_module_events } from '@superdoc/common';
 import { useSuperdocStore } from '@superdoc/stores/superdoc-store';
 import { syncCommentsToClients } from '../core/collaboration/helpers.js';
@@ -14,6 +14,7 @@ import {
 import { endInteractionSpan, startInteractionSpan, withInteractionSpan } from '../helpers/interaction-trace.js';
 import {
   buildTrackedChangeDecisionLinkIndex,
+  buildTrackedChangeThreadOwnerIndex,
   buildTrackedChangeThreadIndex,
 } from './helpers/tracked-change-thread-index.js';
 import { trackedChangeThreadParentIdForComment as resolveTrackedChangeThreadParentId } from '../components/CommentsLayer/tracked-change-threading.js';
@@ -158,6 +159,15 @@ const normalizeV2CommentDraftText = (value) => {
     .replace(/\n+$/, '');
 };
 
+const cloneV2TrackedChangeStory = (story) => {
+  if (!story || typeof story !== 'object') return null;
+  const rawStory = toRaw(story);
+  return {
+    ...rawStory,
+    ...(rawStory.section && typeof rawStory.section === 'object' ? { section: { ...toRaw(rawStory.section) } } : {}),
+  };
+};
+
 export const useCommentsStore = defineStore('comments', () => {
   const BODY_TRACKED_CHANGE_STORY = { kind: 'story', storyType: 'body' };
 
@@ -263,6 +273,7 @@ export const useCommentsStore = defineStore('comments', () => {
   const overlappedIds = new Set([]);
   const suppressInternalExternal = ref(true);
   const currentCommentText = ref('');
+  const currentCommentMentions = ref([]);
   const commentsList = ref([]);
   // Complete review inventory for the explicit document panel only. Floating
   // presentation and geometry continue to consume the bounded commentsList.
@@ -500,22 +511,22 @@ export const useCommentsStore = defineStore('comments', () => {
    */
   const getComment = (id) => {
     if (id === undefined || id === null) return null;
-    const directMatch = commentsList.value.find(
-      (c) =>
-        c.commentId == id ||
-        c.importedId == id ||
-        c.trackedChangeAnchorKey == id ||
-        (c?.trackedChange && buildTrackedChangeImportedPositionId(c.importedId) == id),
+    // Real Word comment ids and tracked-change rows' raw OOXML `w:id` (exposed
+    // here as `importedId`) are independent numbering sequences that commonly
+    // collide on the same small integer (e.g. comment "2" and tracked-change
+    // insert w:id="2" in the same document). Resolve primary ids before alias
+    // ids inside each backing list so a tracked-change alias never wins over a
+    // real comment that lives in that same list, while preserving the existing
+    // cross-list precedence of commentsList before reviewDirectoryList.
+    const byPrimaryId = (c) => c.commentId == id;
+    const byAliasId = (c) =>
+      c.importedId == id ||
+      c.trackedChangeAnchorKey == id ||
+      (c?.trackedChange && buildTrackedChangeImportedPositionId(c.importedId) == id);
+    const findIn = (list) => list.find(byPrimaryId) ?? list.find(byAliasId);
+    return (
+      findIn(commentsList.value) ?? findIn(reviewDirectoryList.value) ?? getTrackedChangeCommentByPositionAlias(id)
     );
-    if (directMatch) return directMatch;
-    const directoryMatch = reviewDirectoryList.value.find(
-      (c) =>
-        c.commentId == id ||
-        c.importedId == id ||
-        c.trackedChangeAnchorKey == id ||
-        (c?.trackedChange && buildTrackedChangeImportedPositionId(c.importedId) == id),
-    );
-    return directoryMatch || getTrackedChangeCommentByPositionAlias(id);
   };
 
   const getThreadParent = (comment) => {
@@ -527,13 +538,6 @@ export const useCommentsStore = defineStore('comments', () => {
     if (comment?.trackedChangeThreadParentId) return comment.trackedChangeThreadParentId;
     if (isV2SyntheticTrackedChangeRow(comment) && comment?.trackedChange === true) return null;
     return resolveTrackedChangeThreadParentId(comment);
-  };
-
-  const shouldThreadWithTrackedChange = (comment) => {
-    const trackedChangeParentId = trackedChangeThreadParentIdForComment(comment);
-    if (!trackedChangeParentId) return false;
-    const trackedChange = getComment(trackedChangeParentId);
-    return Boolean(trackedChange?.trackedChange);
   };
 
   /**
@@ -1693,12 +1697,11 @@ export const useCommentsStore = defineStore('comments', () => {
     const parentComments = [];
     const resolvedComments = [];
     const childCommentMap = new Map();
+    const trackedChangeThreadOwnerIndex = buildTrackedChangeThreadOwnerIndex(source);
 
     source.forEach((comment) => {
       if (!isThreadVisible(comment)) return;
-      const trackedChangeThreadParentId = shouldThreadWithTrackedChange(comment)
-        ? trackedChangeThreadParentIdForComment(comment)
-        : null;
+      const trackedChangeThreadParentId = trackedChangeThreadOwnerIndex.get(comment)?.commentId ?? null;
       const parentId = comment.trackedChange ? null : comment.parentCommentId || trackedChangeThreadParentId;
       // Track resolved comments
       if (comment.resolvedTime) {
@@ -1816,6 +1819,7 @@ export const useCommentsStore = defineStore('comments', () => {
   const removePendingComment = (superdoc) => {
     const hadPending = !!pendingComment.value;
     currentCommentText.value = '';
+    currentCommentMentions.value = [];
     pendingComment.value = null;
     pendingV2CommentTarget.value = null;
     superdocStore.selectionPosition = null;
@@ -1864,6 +1868,7 @@ export const useCommentsStore = defineStore('comments', () => {
       // `host.getHandles().comments.list()`. This keeps the sidebar
       // receipt-driven; rejected mutations never produce orphan sidebar rows.
       const text = normalizeV2CommentDraftText(pendingComment.value ? currentCommentText.value : comment.commentText);
+      const mentions = pendingComment.value ? currentCommentMentions.value : (comment.mentions ?? []);
       const target = pendingComment.value ? pendingV2CommentTarget.value : null;
       const parentCommentId = comment.parentCommentId
         ? String(comment.parentCommentId)
@@ -1873,8 +1878,8 @@ export const useCommentsStore = defineStore('comments', () => {
       const invocation = (async () => {
         try {
           return await (parentCommentId
-            ? v2Adapter.reply({ parentCommentId, text })
-            : v2Adapter.commitPendingComment({ text, target }));
+            ? v2Adapter.reply({ parentCommentId, text, ...(mentions.length ? { mentions } : {}) })
+            : v2Adapter.commitPendingComment({ text, target, ...(mentions.length ? { mentions } : {}) }));
         } catch (err) {
           return { ok: false, reason: 'adapter-threw', detail: err?.message ?? String(err) };
         }
@@ -1905,7 +1910,17 @@ export const useCommentsStore = defineStore('comments', () => {
           documentId: v2Adapter.documentId,
           items: outcome.items,
         });
-        if (pendingComment.value) removePendingComment(superdoc);
+        const hadPendingComment = !!pendingComment.value;
+        if (hadPendingComment) removePendingComment(superdoc);
+        // Hand off activeComment/instance to the newly created comment instead
+        // of leaving it null, so the floating sidebar keeps treating this row
+        // as active (viewport exemption, dialog mount, collision pinning) and
+        // never observes an intermediate null in the same reactive flush.
+        const createdId = reconciled?.added?.commentId ?? null;
+        if (hadPendingComment && createdId) {
+          setActiveComment(superdoc, createdId);
+          setActiveFloatingCommentInstance(createdId);
+        }
         if (broadcastChanges) {
           superdoc.emit('comments-update', {
             type: COMMENT_EVENTS.ADD,
@@ -1938,7 +1953,16 @@ export const useCommentsStore = defineStore('comments', () => {
     commentsList.value.push(newComment);
 
     // Clean up the pending comment
+    const hadPendingComment = !!pendingComment.value;
     removePendingComment(superdoc);
+    // Hand off activeComment/instance to the newly created comment instead of
+    // leaving it null, so the floating sidebar keeps treating this row as
+    // active (viewport exemption, dialog mount, collision pinning) and never
+    // observes an intermediate null in the same reactive flush.
+    if (hadPendingComment) {
+      activeComment.value = newComment.commentId;
+      setActiveFloatingCommentInstance(newComment.commentId);
+    }
 
     // If this is not a tracked change, and it belongs to a Super Editor, and its not a child comment
     // We need to let the editor know about the new comment
@@ -2445,16 +2469,18 @@ export const useCommentsStore = defineStore('comments', () => {
   };
 
   /**
-   * Reply to an existing comment through the v2 adapter.
+   * Reply to an existing comment or tracked-change review row through the v2 adapter.
    *
    * Plan §4.1 rules:
    *   - empty text rejects before mutation with `comment-text-empty`
    *   - missing parent rejects before mutation with `parent-comment-id-missing`
-   *   - successful reply refreshes from v2 list and reconciles
+   *   - a tracked-change row creates its first anchored root only after a
+   *     canonical-id reply reports `TARGET_NOT_FOUND`
+   *   - successful mutation refreshes from v2 list and reconciles
    *   - rejection preserves rows and emits a rejected `comments-update` event
    *   - committed-but-refresh-failed surfaces honestly (no reconcile with `[]`)
    */
-  const replyCommentV2 = async ({ superdoc, parentCommentId, text } = {}) => {
+  const replyCommentV2 = async ({ superdoc, parentCommentId, text, mentions = [], trackedChangeTarget } = {}) => {
     if (commentsAreReadOnly()) return readOnlyMutationOutcome();
 
     const v2Adapter = getV2CommentsAdapter(superdoc);
@@ -2467,14 +2493,51 @@ export const useCommentsStore = defineStore('comments', () => {
       return { ok: false, reason: 'comment-text-empty' };
     }
 
-    const parent = commentsList.value.find((c) => String(c.commentId) === normalizedParent);
+    let normalizedTrackedChangeTarget = null;
+    if (trackedChangeTarget != null) {
+      const trackedChangeId =
+        trackedChangeTarget?.trackedChangeId != null ? String(trackedChangeTarget.trackedChangeId) : null;
+      if (!trackedChangeId) return { ok: false, reason: 'tracked-change-id-missing' };
+      if (trackedChangeId !== normalizedParent) {
+        return { ok: false, reason: 'tracked-change-target-mismatch' };
+      }
+      const story = cloneV2TrackedChangeStory(trackedChangeTarget.story);
+      // AIDEV-NOTE: Review rows are reactive, but the mutation target crosses
+      // a worker boundary and must contain cloneable plain data only.
+      normalizedTrackedChangeTarget = {
+        kind: 'trackedChange',
+        trackedChangeId,
+        ...(trackedChangeTarget.side != null ? { side: trackedChangeTarget.side } : {}),
+        ...(story ? { story } : {}),
+      };
+    }
+
+    const parent = commentsList.value.find(
+      (c) =>
+        String(c.commentId) === normalizedParent ||
+        (c.trackedChange === true && String(c.trackedChangeCanonicalId) === normalizedParent),
+    );
     const fileId = parent?.fileId ?? v2Adapter.documentId ?? null;
 
     return runV2CommentMutation({
       superdoc,
       adapter: v2Adapter,
       fileId,
-      operation: () => v2Adapter.reply({ parentCommentId: normalizedParent, text: plainText }),
+      operation: async () => {
+        const replyOutcome = await v2Adapter.reply({
+          parentCommentId: normalizedParent,
+          text: plainText,
+          ...(mentions.length ? { mentions } : {}),
+        });
+        if (replyOutcome?.ok || replyOutcome?.code !== 'TARGET_NOT_FOUND' || !normalizedTrackedChangeTarget) {
+          return replyOutcome;
+        }
+        return v2Adapter.commitPendingComment({
+          text: plainText,
+          target: normalizedTrackedChangeTarget,
+          ...(mentions.length ? { mentions } : {}),
+        });
+      },
       eventType: COMMENT_EVENTS.ADD,
       rejectionFallbackReason: 'v2-reply-failed',
       rejectionEventExtras: parent ? { comment: getCommentEventPayload(parent) } : {},
@@ -3040,6 +3103,7 @@ export const useCommentsStore = defineStore('comments', () => {
 
         const applyUpdate = (existing, input) => {
           existing.commentText = input.commentText ?? existing.commentText;
+          existing.mentions = Array.isArray(input.mentions) ? input.mentions : [];
           existing.isInternal = typeof input.isInternal === 'boolean' ? input.isInternal : existing.isInternal;
           const hasResolvedTime = typeof input.resolvedTime === 'number';
           if (hasResolvedTime) {
@@ -3071,7 +3135,7 @@ export const useCommentsStore = defineStore('comments', () => {
           if (input.trackedChangeSide !== undefined) {
             existing.trackedChangeSide = input.trackedChangeSide;
           } else {
-            delete existing.trackedChangeSide;
+            existing.trackedChangeSide = undefined;
           }
           if (input.threadingParentCommentId !== undefined) {
             existing.threadingParentCommentId = input.threadingParentCommentId;
@@ -3122,6 +3186,54 @@ export const useCommentsStore = defineStore('comments', () => {
         return { added: addedComments[addedComments.length - 1] ?? null };
       },
     );
+
+  /**
+   * Reconcile and publish a root comment created by the private V2 context menu.
+   * That path owns selection capture, while this store remains the sole owner
+   * of shared comment rows and public comments-update events.
+   */
+  const announceV2CommentCreated = async ({ superdoc, commentId } = {}) => {
+    const id = normalizeCommentId(commentId);
+    const adapter = getV2CommentsAdapter(superdoc);
+    const commentsApi = superdoc?.activeEditor?.doc?.comments;
+    if (!id) return { ok: false, reason: 'comment-id-missing' };
+    if (!adapter || !isCurrentV2CommentsAdapter(adapter)) {
+      return { ok: false, reason: 'comments-adapter-stale' };
+    }
+    if (typeof commentsApi?.get !== 'function') {
+      return { ok: false, reason: 'document-api-unavailable' };
+    }
+
+    let item;
+    try {
+      item = await commentsApi.get({ commentId: id });
+    } catch (err) {
+      return { ok: false, reason: 'comment-read-failed', detail: err?.message ?? String(err) };
+    }
+    if (!isCurrentV2CommentsAdapter(adapter)) {
+      return { ok: false, reason: 'comments-adapter-stale' };
+    }
+
+    const reconciled = reconcileCommentsFromV2({
+      superdoc,
+      adapter,
+      documentId: adapter.documentId,
+      items: [item],
+      pruneStale: false,
+    });
+    const comment =
+      reconciled?.added ??
+      commentsList.value.find(
+        (candidate) => String(candidate?.commentId ?? '') === id || String(candidate?.importedId ?? '') === id,
+      ) ??
+      null;
+    const event = {
+      type: COMMENT_EVENTS.ADD,
+      comment: comment?.getValues?.() ?? null,
+    };
+    superdoc?.emit?.('comments-update', event);
+    return { ok: true, comment };
+  };
 
   /**
    * Cancel the pending comment
@@ -3383,7 +3495,7 @@ export const useCommentsStore = defineStore('comments', () => {
     commentsList.value = commentsList.value.filter((comment) => !removedComments.includes(comment));
 
     if (removedAliasIds.size) {
-      const nextPositions = { ...(editorCommentPositions.value || {}) };
+      const nextPositions = { ...editorCommentPositions.value };
       removedAliasIds.forEach((id) => {
         delete nextPositions[id];
       });
@@ -3987,7 +4099,7 @@ export const useCommentsStore = defineStore('comments', () => {
       if (!isLinked) return;
       delete linkedComment.trackedChangeParentId;
       linkedComment.trackedChangeThreadParentId = undefined;
-      delete linkedComment.trackedChangeSide;
+      linkedComment.trackedChangeSide = undefined;
       delete linkedComment.threadingParentCommentId;
       if (parentCommentId && trackedChangeIds.has(parentCommentId)) delete linkedComment.parentCommentId;
       detachedCount += 1;
@@ -5384,6 +5496,7 @@ export const useCommentsStore = defineStore('comments', () => {
     suppressInternalExternal,
     pendingComment,
     currentCommentText,
+    currentCommentMentions,
     commentsList,
     reviewDirectoryList,
     isCommentsListVisible,
@@ -5469,6 +5582,7 @@ export const useCommentsStore = defineStore('comments', () => {
     getV2CommentsAdapter,
     applyReviewWindowFromV2,
     reconcileCommentsFromV2,
+    announceV2CommentCreated,
     isV2EditorActive,
 
     // TCS Phase 0 / 004: store-owned v2 comment mutation helpers.

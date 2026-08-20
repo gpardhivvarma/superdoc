@@ -99,7 +99,7 @@ function createTestPainter(opts: { blocks?: FlowBlock[]; measures?: Measure[] } 
     },
   });
 
-  return {
+  const testPainter = {
     paint(layout: Layout, mount: HTMLElement, mapping?: unknown) {
       const effectiveResolved = resolvedLayoutOverridden
         ? currentResolved
@@ -143,6 +143,48 @@ function createTestPainter(opts: { blocks?: FlowBlock[]; measures?: Measure[] } 
       return painter.consumePositionValidationSummary();
     },
   };
+  const transactionSymbol = Symbol.for('superdoc.painter-dom.persistent-page-transaction.v1');
+  Object.defineProperty(testPainter, transactionSymbol, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: (painter as unknown as Record<PropertyKey, unknown>)[transactionSymbol],
+  });
+  return testPainter;
+}
+
+function paintWithPrivateTransaction(painter: unknown, paint: () => void): readonly unknown[] {
+  const begin = (painter as Record<PropertyKey, unknown>)[
+    Symbol.for('superdoc.painter-dom.persistent-page-transaction.v1')
+  ];
+  if (typeof begin !== 'function') throw new Error('expected private painter transaction');
+  const transaction = (
+    begin as () => {
+      readFragmentFailures(): readonly unknown[];
+      commit(): void;
+      rollback(): void;
+    }
+  )();
+  try {
+    paint();
+    const failures = transaction.readFragmentFailures();
+    transaction.commit();
+    return failures;
+  } catch (error) {
+    transaction.rollback();
+    throw error;
+  }
+}
+
+function expectSanitizedRenderPlaceholder(mount: HTMLElement, privateDetail: string): void {
+  const placeholder = mount.querySelector('.render-error-placeholder') as HTMLElement | null;
+  expect(placeholder).toBeTruthy();
+  expect(placeholder?.textContent).toBe('This content is unavailable.');
+  expect(placeholder?.title).toBe('');
+  expect(placeholder?.outerHTML).not.toContain(privateDetail);
+  expect(placeholder?.getAttribute('contenteditable')).toBe('false');
+  expect(placeholder?.getAttribute('tabindex')).toBe('-1');
+  expect(placeholder?.style.userSelect).toBe('none');
 }
 
 const block: FlowBlock = {
@@ -2179,6 +2221,120 @@ describe('DomPainter', () => {
     expect(() => painter.paint(missingTableLayout, mount)).toThrow(/Missing block\/measure/);
   });
 
+  it('contains a paragraph fragment failure with one sanitized private carrier', () => {
+    const detail = 'paragraph customer text and stack';
+    const renderLineSpy = vi.spyOn(DomPainter.prototype as any, 'renderLine').mockImplementation(() => {
+      throw new Error(detail);
+    });
+    try {
+      const painter = createTestPainter({ blocks: [block], measures: [measure] });
+      const failures = paintWithPrivateTransaction(painter, () => painter.paint(layout, mount));
+
+      expectSanitizedRenderPlaceholder(mount, detail);
+      expect(mount.innerHTML).not.toContain('block-1');
+      expect(failures).toEqual([{ blockId: 'block-1', code: 'painter-fragment-unavailable' }]);
+    } finally {
+      renderLineSpy.mockRestore();
+    }
+  });
+
+  it('contains an image fragment failure with one sanitized private carrier', () => {
+    const detail = 'image customer path and stack';
+    const imageBlock: FlowBlock = {
+      kind: 'image',
+      id: 'image-err',
+      src: 'data:image/png;base64,AA==',
+      width: 30,
+      height: 20,
+    };
+    const imageMeasure: Measure = { kind: 'image', width: 30, height: 20 };
+    const imageLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'image',
+              blockId: 'image-err',
+              x: 10,
+              y: 10,
+              width: 30,
+              height: 20,
+            },
+          ],
+        },
+      ],
+    };
+    const frameSpy = vi.spyOn(DomPainter.prototype as any, 'applyResolvedFragmentFrame').mockImplementation(() => {
+      throw new Error(detail);
+    });
+    try {
+      const painter = createTestPainter({ blocks: [imageBlock], measures: [imageMeasure] });
+      const failures = paintWithPrivateTransaction(painter, () => painter.paint(imageLayout, mount));
+
+      expectSanitizedRenderPlaceholder(mount, detail);
+      expect(mount.innerHTML).not.toContain('image-err');
+      expect(failures).toEqual([{ blockId: 'image-err', code: 'painter-fragment-unavailable' }]);
+    } finally {
+      frameSpy.mockRestore();
+    }
+  });
+
+  it('contains a drawing fragment failure atomically with one sanitized private carrier', () => {
+    const detail = 'positioned group child customer stack';
+    const drawingBlock: FlowBlock = {
+      kind: 'drawing',
+      id: 'drawing-err',
+      drawingKind: 'vectorShape',
+      geometry: { width: 30, height: 20 },
+    };
+    const drawingMeasure: Measure = {
+      kind: 'drawing',
+      drawingKind: 'vectorShape',
+      width: 30,
+      height: 20,
+      naturalWidth: 30,
+      naturalHeight: 20,
+      scale: 1,
+      geometry: { width: 30, height: 20 },
+    };
+    const drawingLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'drawing',
+              drawingKind: 'vectorShape',
+              blockId: 'drawing-err',
+              x: 10,
+              y: 10,
+              width: 30,
+              height: 20,
+              geometry: { width: 30, height: 20 },
+              scale: 1,
+            },
+          ],
+        },
+      ],
+    };
+    const contentSpy = vi.spyOn(DomPainter.prototype as any, 'renderDrawingContent').mockImplementation(() => {
+      throw new Error(detail);
+    });
+    try {
+      const painter = createTestPainter({ blocks: [drawingBlock], measures: [drawingMeasure] });
+      const failures = paintWithPrivateTransaction(painter, () => painter.paint(drawingLayout, mount));
+
+      expectSanitizedRenderPlaceholder(mount, detail);
+      expect(mount.innerHTML).not.toContain('drawing-err');
+      expect(failures).toEqual([{ blockId: 'drawing-err', code: 'painter-fragment-unavailable' }]);
+    } finally {
+      contentSpy.mockRestore();
+    }
+  });
+
   it('renders an error placeholder when table-cell line rendering throws', () => {
     const renderLineError = new Error('renderLine forced error');
     const tableBlock: TableBlock = {
@@ -2260,25 +2416,19 @@ describe('DomPainter', () => {
       ],
     };
 
-    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {
-      // Intentionally empty - suppress expected error logging during this regression test.
-    });
     const renderLineSpy = vi.spyOn(DomPainter.prototype as any, 'renderLine').mockImplementation(() => {
       throw renderLineError;
     });
 
     try {
       const painter = createTestPainter({ blocks: [tableBlock], measures: [tableMeasure] });
-      expect(() => painter.paint(tableLayout, mount)).not.toThrow();
+      const failures = paintWithPrivateTransaction(painter, () => painter.paint(tableLayout, mount));
 
-      const placeholder = mount.querySelector('.render-error-placeholder') as HTMLElement | null;
-      expect(placeholder).toBeTruthy();
-      expect(placeholder?.textContent).toContain('[Render Error: table-err]');
-      expect(placeholder?.title).toBe('renderLine forced error');
-      expect(consoleErrorSpy).toHaveBeenCalled();
+      expectSanitizedRenderPlaceholder(mount, 'renderLine forced error');
+      expect(mount.innerHTML).not.toContain('table-err');
+      expect(failures).toEqual([{ blockId: 'table-err', code: 'painter-fragment-unavailable' }]);
     } finally {
       renderLineSpy.mockRestore();
-      consoleErrorSpy.mockRestore();
     }
   });
 
@@ -7261,6 +7411,122 @@ describe('DomPainter', () => {
       expect(renderedPageTop).toBe((layout.pageSize?.h ?? 0) - 20 + footerFragment.y);
     });
 
+    it('limits page-positioned table coordinates to floating footer tables', () => {
+      const cellParagraph: FlowBlock = {
+        kind: 'paragraph',
+        id: 'footer-table-cell-paragraph',
+        runs: [{ text: 'Footer', fontFamily: 'Arial', fontSize: 12 }],
+      };
+      const footerTableBlock: TableBlock = {
+        kind: 'table',
+        id: 'footer-page-table',
+        rows: [{ id: 'footer-page-table-row', cells: [{ id: 'footer-page-table-cell', paragraph: cellParagraph }] }],
+        anchor: {
+          isAnchored: true,
+          hRelativeFrom: 'page',
+          vRelativeFrom: 'page',
+          alignH: 'right',
+          alignV: 'bottom',
+        },
+      };
+      const paragraphMeasure: ParagraphMeasure = {
+        kind: 'paragraph',
+        lines: [{ fromRun: 0, fromChar: 0, toRun: 0, toChar: 6, width: 40, ascent: 8, descent: 2, lineHeight: 12 }],
+        totalHeight: 12,
+      };
+      const footerTableMeasure: TableMeasure = {
+        kind: 'table',
+        rows: [{ height: 40, cells: [{ paragraph: paragraphMeasure, width: 100, height: 40 }] }],
+        columnWidths: [100],
+        totalWidth: 100,
+        totalHeight: 40,
+      };
+      const footerTableFragment: Fragment = {
+        kind: 'table',
+        blockId: footerTableBlock.id,
+        isAnchored: true,
+        fromRow: 0,
+        toRow: 1,
+        x: 300,
+        y: -20,
+        width: 100,
+        height: 40,
+      };
+      const inlineFooterTableBlock: TableBlock = {
+        ...footerTableBlock,
+        id: 'footer-inline-page-table',
+      };
+      const inlineFooterTableFragment: Fragment = {
+        kind: 'table',
+        blockId: inlineFooterTableBlock.id,
+        fromRow: 0,
+        toRow: 1,
+        x: 12,
+        y: 8,
+        width: 100,
+        height: 40,
+      };
+      const headerTableBlock: TableBlock = {
+        ...footerTableBlock,
+        id: 'header-page-table',
+      };
+      const headerTableFragment: Fragment = {
+        ...footerTableFragment,
+        blockId: headerTableBlock.id,
+        x: 200,
+        y: 360,
+      };
+      const footerOffset = 400;
+      const footerHeight = 80;
+      const footerContentHeight = 40;
+      const marginLeft = 96;
+      const painter = createTestPainter({
+        blocks: [footerTableBlock, inlineFooterTableBlock, headerTableBlock],
+        measures: [footerTableMeasure, footerTableMeasure, footerTableMeasure],
+        headerProvider: () => ({
+          fragments: [headerTableFragment],
+          height: 400,
+          offset: 40,
+          marginLeft,
+        }),
+        footerProvider: () => ({
+          fragments: [footerTableFragment, inlineFooterTableFragment],
+          height: footerHeight,
+          contentHeight: footerContentHeight,
+          offset: footerOffset,
+          marginLeft,
+        }),
+      });
+
+      painter.paint(
+        {
+          ...layout,
+          pages: [{ ...layout.pages[0], number: 1, margins: { left: marginLeft, right: 0, bottom: 100, footer: 20 } }],
+        },
+        mount,
+      );
+
+      const footerEl = mount.querySelector('.superdoc-page-footer') as HTMLElement;
+      const headerEl = mount.querySelector('.superdoc-page-header') as HTMLElement;
+      const tableEl = footerEl.querySelector('[data-block-id="footer-page-table"]') as HTMLElement;
+      const inlineTableEl = footerEl.querySelector('[data-block-id="footer-inline-page-table"]') as HTMLElement;
+      const headerTableEl = headerEl.querySelector('[data-block-id="header-page-table"]') as HTMLElement;
+      expect(parseFloat(footerEl.style.top) + parseFloat(tableEl.style.top)).toBe(
+        (layout.pageSize?.h ?? 0) - 20 + footerTableFragment.y,
+      );
+      expect(parseFloat(footerEl.style.left) + parseFloat(tableEl.style.left)).toBe(footerTableFragment.x);
+      expect(parseFloat(footerEl.style.top) + parseFloat(inlineTableEl.style.top)).toBe(
+        footerOffset + (footerHeight - footerContentHeight) + inlineFooterTableFragment.y,
+      );
+      expect(parseFloat(footerEl.style.left) + parseFloat(inlineTableEl.style.left)).toBe(
+        marginLeft + inlineFooterTableFragment.x,
+      );
+      expect(parseFloat(headerEl.style.top) + parseFloat(headerTableEl.style.top)).toBe(40 + headerTableFragment.y);
+      expect(parseFloat(headerEl.style.left) + parseFloat(headerTableEl.style.left)).toBe(
+        marginLeft + headerTableFragment.x,
+      );
+    });
+
     it('falls back to bottom margin origin when footer distance is missing', () => {
       const footerImageBlock: FlowBlock = {
         kind: 'image',
@@ -7670,6 +7936,113 @@ describe('DomPainter', () => {
     expect(inlineDrawingEl.style.zIndex).toBe('');
     expect(anchoredDrawingEl.classList.contains(DOM_CLASS_NAMES.FLOATING_FRAGMENT)).toBe(true);
     expect(inlineDrawingEl.classList.contains(DOM_CLASS_NAMES.FLOATING_FRAGMENT)).toBe(false);
+  });
+
+  it('paints behindDoc body media below text on both sides of its source anchor', () => {
+    const beforeBlock: FlowBlock = {
+      kind: 'paragraph',
+      id: 'body-before-background',
+      runs: [{ text: 'Before', fontFamily: 'Arial', fontSize: 16 }],
+    };
+    const backgroundBlock: FlowBlock = {
+      kind: 'image',
+      id: 'body-background',
+      src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      width: 200,
+      height: 100,
+      anchor: { isAnchored: true, behindDoc: true },
+    };
+    const afterBlock: FlowBlock = {
+      kind: 'paragraph',
+      id: 'body-after-background',
+      runs: [{ text: 'After', fontFamily: 'Arial', fontSize: 16 }],
+    };
+    const paragraphMeasure: Measure = {
+      kind: 'paragraph',
+      lines: [
+        {
+          fromRun: 0,
+          fromChar: 0,
+          toRun: 0,
+          toChar: 5,
+          width: 48,
+          ascent: 12,
+          descent: 4,
+          lineHeight: 20,
+        },
+      ],
+      totalHeight: 20,
+    };
+    const backgroundMeasure: Measure = { kind: 'image', width: 200, height: 100 };
+    const bodyLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'para',
+              blockId: beforeBlock.id,
+              fromLine: 0,
+              toLine: 1,
+              x: 30,
+              y: 40,
+              width: 300,
+            },
+            {
+              kind: 'image',
+              blockId: backgroundBlock.id,
+              x: 30,
+              y: 30,
+              width: 200,
+              height: 100,
+              isAnchored: true,
+              behindDoc: true,
+              zIndex: 0,
+            },
+            {
+              kind: 'para',
+              blockId: afterBlock.id,
+              fromLine: 0,
+              toLine: 1,
+              x: 30,
+              y: 80,
+              width: 300,
+            },
+          ],
+        },
+      ],
+    };
+    const painter = createTestPainter({
+      blocks: [beforeBlock, backgroundBlock, afterBlock],
+      measures: [paragraphMeasure, backgroundMeasure, paragraphMeasure],
+    });
+    const expectBackgroundFirst = () => {
+      const pageEl = mount.querySelector('.superdoc-page') as HTMLElement;
+      const bodyPaintOrder = Array.from(pageEl.querySelectorAll(':scope > .superdoc-fragment')).map(
+        (fragment) => (fragment as HTMLElement).dataset.blockId,
+      );
+      expect(bodyPaintOrder).toEqual(['body-background', 'body-before-background', 'body-after-background']);
+    };
+
+    painter.paint(bodyLayout, mount);
+    expectBackgroundFirst();
+
+    // The persistent-page patch path must preserve the same paint order when
+    // geometry changes and the source-order state is reconciled in place.
+    const shiftedLayout: Layout = {
+      ...bodyLayout,
+      pages: [
+        {
+          ...bodyLayout.pages[0],
+          fragments: bodyLayout.pages[0].fragments.map((fragment) =>
+            fragment.blockId === afterBlock.id ? { ...fragment, y: fragment.y + 4 } : fragment,
+          ),
+        },
+      ],
+    };
+    painter.paint(shiftedLayout, mount);
+    expectBackgroundFirst();
   });
 
   it('applies vector shape transforms to the shared drawing wrapper so text overlays rotate with the shape', () => {

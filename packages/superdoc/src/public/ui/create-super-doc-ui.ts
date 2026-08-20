@@ -4843,6 +4843,18 @@ export function createSuperDocUI(options: SuperDocUIOptions): SuperDocUI {
         const supported = shippedStatus !== 'not-shipped' && shippedStatus !== 'disabled';
         const enabled = supported && (typeof entry?.enabled === 'boolean' ? entry.enabled : true);
         const activeSeed = supported ? readListActiveSeed(entry) : null;
+        if (readonly) {
+          return normalizeCommandState(
+            {
+              enabled: false,
+              active: activeSeed === listKind,
+              supported,
+              value: entry?.value,
+              reason: SUPERDOC_UI_REASONS.documentReadonly,
+            },
+            'builtin',
+          );
+        }
         return normalizeCommandState(
           { enabled, active: activeSeed === listKind, supported, value: entry?.value },
           'builtin',
@@ -6290,14 +6302,13 @@ export function createSuperDocUI(options: SuperDocUIOptions): SuperDocUI {
   const syncTrackedChangeFocusFromHostReviewTarget = (rawTarget: unknown, rawSnapshot?: unknown): boolean => {
     const snapshot = rawSnapshot && typeof rawSnapshot === 'object' ? (rawSnapshot as LooseRecord) : null;
     const rejection = snapshot?.lastInteractionRejection;
-    const transientPaintInvalidation =
-      trackedChangeNavigationInFlight > 0 &&
+    const paintInvalidation =
       rawTarget == null &&
       rejection &&
       typeof rejection === 'object' &&
       (rejection as LooseRecord).code === 'review-target-invalidated' &&
       (rejection as LooseRecord).detail === 'not-painted';
-    if (transientPaintInvalidation) return false;
+    if (paintInvalidation && explicitActiveChange) return false;
     const target = rawTarget && typeof rawTarget === 'object' ? (rawTarget as LooseRecord) : null;
     let next: ExplicitActiveChange | null = null;
     if (target?.entityType === 'trackedChange' && typeof target.entityId === 'string' && target.entityId.length > 0) {
@@ -8121,11 +8132,22 @@ export function createSuperDocUI(options: SuperDocUIOptions): SuperDocUI {
       if (spec.action === 'insert-row-before' || spec.action === 'insert-row-after') {
         const host = getHost();
         const handles = typeof host?.getHandles === 'function' ? host.getHandles() : null;
-        const insertRow = (handles?.editing as LooseRecord | undefined)?.tables as LooseRecord | undefined;
-        if (typeof insertRow?.insertRow !== 'function') return false;
+        const tableCommands = (handles?.editing as LooseRecord | undefined)?.tables as LooseRecord | undefined;
+        if (typeof tableCommands?.insertRow !== 'function') return false;
         const options = editorMutationOptionsForRoute(descriptor.docRoute!);
         if (options && options.success === false) return options;
-        return options ? insertRow.insertRow(input, options) : insertRow.insertRow(input);
+        return options ? tableCommands.insertRow(input, options) : tableCommands.insertRow(input);
+      }
+      if (spec.action === 'insert-column-before' || spec.action === 'insert-column-after') {
+        const host = getHost();
+        const handles = typeof host?.getHandles === 'function' ? host.getHandles() : null;
+        const tableCommands = (handles?.editing as LooseRecord | undefined)?.tables as LooseRecord | undefined;
+        if (typeof tableCommands?.insertColumn !== 'function') return false;
+        const options = editorMutationOptionsForRoute(descriptor.docRoute!);
+        if (options && options.success === false) return options;
+        return options
+          ? tableCommands.insertColumn(input, context.rowIndex, options)
+          : tableCommands.insertColumn(input, context.rowIndex);
       }
       return callEditorMutation(descriptor.docRoute!, op, input);
     } catch {
@@ -8199,6 +8221,7 @@ export function createSuperDocUI(options: SuperDocUIOptions): SuperDocUI {
     }
     const listKind = listToggleKind(id);
     if (listKind) {
+      if (readDocumentMode() === 'viewing') return false;
       const editCommands = getEditCommands();
       const apply = (editCommands?.lists as LooseRecord | undefined)?.apply;
       if (typeof apply === 'function') return executeListToggleCommand(listKind, payload);

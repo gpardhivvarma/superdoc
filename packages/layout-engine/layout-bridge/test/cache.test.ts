@@ -126,6 +126,44 @@ const vectorShapeBlock = (id: string, width: number, height: number, fillColor: 
 });
 
 describe('MeasureCache', () => {
+  it('reuses one prepared content key across a miss and insertion', () => {
+    const cache = new MeasureCache<{ totalHeight: number }>();
+    const item = block('prepared-key', 'same content');
+    const key = cache.prepareKey(item, 400, 600, 'font-map-a');
+
+    expect(cache.getPrepared(key)).toBeUndefined();
+    cache.setPrepared(key, item.id, { totalHeight: 20 });
+    expect(cache.getPrepared(key)).toEqual({ totalHeight: 20 });
+    expect(cache.get(item, 400, 600, 'font-map-a')).toEqual({ totalHeight: 20 });
+    expect(cache.get(item, 400, 600, 'font-map-b')).toBeUndefined();
+    expect(cache.get(block('prepared-key', 'changed content'), 400, 600, 'font-map-a')).toBeUndefined();
+  });
+
+  it('keeps prepared-key insertions in the block invalidation index', () => {
+    const cache = new MeasureCache<{ totalHeight: number }>();
+    const item = block('prepared-invalidated', 'same content');
+    const key = cache.prepareKey(item, 400, 600, 'font-map-a');
+
+    cache.setPrepared(key, item.id, { totalHeight: 20 });
+    cache.invalidate([item.id]);
+
+    expect(cache.getPrepared(key)).toBeUndefined();
+  });
+
+  it('excludes measurer-stamped tab width from a prepared content key', () => {
+    const cache = new MeasureCache<{ totalHeight: number }>();
+    const item: ParagraphBlock = {
+      kind: 'paragraph',
+      id: 'prepared-tab-key',
+      runs: [{ kind: 'tab', text: '\t' }],
+    };
+    const keyBeforeMeasure = cache.prepareKey(item, 400, 600, 'font-map-a');
+
+    item.runs[0]!.width = 48;
+
+    expect(cache.prepareKey(item, 400, 600, 'font-map-a')).toBe(keyBeforeMeasure);
+  });
+
   let cache: MeasureCache<{ totalHeight: number }>;
 
   beforeEach(() => {
@@ -162,6 +200,22 @@ describe('MeasureCache', () => {
     cache.set(item, 400, 600, { totalHeight: 20 });
     cache.invalidate(['0-paragraph']);
     expect(cache.get(item, 400, 600)).toBeUndefined();
+  });
+
+  it('retires every stale variant for one repeatedly changed block without evicting unrelated blocks', () => {
+    const stable = block('stable-paragraph', 'stable');
+    cache.set(stable, 400, 600, { totalHeight: 10 });
+
+    for (let revision = 0; revision < 1_000; revision += 1) {
+      const current = block('edited-paragraph', `revision-${revision}`);
+      cache.invalidate([current.id]);
+      cache.set(current, 400, 600, { totalHeight: revision });
+    }
+
+    expect(cache.getSize()).toBe(2);
+    expect(cache.get(stable, 400, 600)).toEqual({ totalHeight: 10 });
+    expect(cache.get(block('edited-paragraph', 'revision-998'), 400, 600)).toBeUndefined();
+    expect(cache.get(block('edited-paragraph', 'revision-999'), 400, 600)).toEqual({ totalHeight: 999 });
   });
 
   it('does not share a measure between two documents that map the same block differently', () => {

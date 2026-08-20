@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createPinia, setActivePinia } from 'pinia';
+import { isProxy, reactive } from 'vue';
 import { useCommentsStore } from './comments-store.js';
 import { useSuperdocStore } from './superdoc-store.js';
 import useComment from '../components/CommentsLayer/use-comment.js';
@@ -230,6 +231,177 @@ afterEach(() => {
   if (typeof window !== 'undefined') {
     delete window.__labsSuperDocV2PreviewDebug;
   }
+});
+
+describe('comments-store v2 tracked-change comments', () => {
+  let store;
+
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    const superdocStore = useSuperdocStore();
+    superdocStore.documents = [
+      { id: 'doc-1', type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+    ];
+    store = useCommentsStore();
+  });
+
+  it('creates the first root at the canonical tracked-change target after reply reports TARGET_NOT_FOUND', async () => {
+    const trackedChangeId = 'tc|main%3A%2Fword%2Fdocument.xml|del|coalesced|2|4';
+    const reviewRowId = 'tc|main%3A%2Fword%2Fdocument.xml|del|source%7CwId%3A4';
+    const story = reactive({ kind: 'story', storyType: 'body' });
+    const createdItem = {
+      id: '0',
+      text: 'reply on <deletion>',
+      status: 'open',
+      trackedChangeParentId: trackedChangeId,
+      trackedChangeThreadParentId: trackedChangeId,
+      trackedChangeSide: 'deleted',
+    };
+    const adapter = {
+      documentId: 'doc-1',
+      reply: vi.fn(async () => ({
+        ok: false,
+        reason: 'receipt-failure',
+        code: 'TARGET_NOT_FOUND',
+      })),
+      commitPendingComment: vi.fn(async () => ({
+        ok: true,
+        items: [createdItem],
+        complete: false,
+        visibleWindowSource: 'mutation-targets',
+        mutationPath: 'document-api',
+      })),
+      mapV2CommentToUseCommentInput: vi.fn((item) => ({
+        commentId: item.id,
+        fileId: 'doc-1',
+        commentText: item.text,
+        resolvedTime: null,
+        trackedChangeParentId: item.trackedChangeParentId,
+        trackedChangeThreadParentId: item.trackedChangeThreadParentId,
+        trackedChangeSide: item.trackedChangeSide,
+      })),
+    };
+    const superdoc = makeSuperdoc(adapter);
+    store.setV2CommentsAdapter(adapter);
+    store.commentsList = [
+      makeTrackedChangeRow({
+        commentId: reviewRowId,
+        importedId: '4',
+        trackedChangeCanonicalId: trackedChangeId,
+      }),
+    ];
+
+    const trackedChangeTarget = { kind: 'trackedChange', trackedChangeId, story };
+    const mentions = [{ id: 'reviewer-1', name: 'Internal Reviewer', email: 'reviewer@example.com' }];
+    const result = await store.replyCommentV2({
+      superdoc,
+      parentCommentId: trackedChangeId,
+      trackedChangeTarget,
+      text: '<p>reply on &lt;deletion&gt;</p>',
+      mentions,
+    });
+
+    expect(adapter.reply).toHaveBeenCalledWith({
+      parentCommentId: trackedChangeId,
+      text: 'reply on <deletion>',
+      mentions,
+    });
+    expect(adapter.commitPendingComment).toHaveBeenCalledWith({
+      text: 'reply on <deletion>',
+      target: trackedChangeTarget,
+      mentions,
+    });
+    expect(isProxy(adapter.commitPendingComment.mock.calls[0][0].target.story)).toBe(false);
+    expect(result).toMatchObject({ ok: true, mutationPath: 'document-api' });
+    expect(store.commentsList).toEqual([
+      expect.objectContaining({ commentId: reviewRowId, trackedChange: true }),
+      expect.objectContaining({
+        commentId: '0',
+        trackedChangeThreadParentId: trackedChangeId,
+      }),
+    ]);
+    expect(superdoc.emit).toHaveBeenCalledWith(
+      'comments-update',
+      expect.objectContaining({
+        type: store.COMMENT_EVENTS.ADD,
+        comment: expect.objectContaining({ commentId: '0' }),
+      }),
+    );
+    expect(store.getTrackedChangeThread(store.commentsList[0]).map((comment) => comment.commentId)).toEqual([
+      reviewRowId,
+      '0',
+    ]);
+    expect(store.getGroupedComments.parentComments.map((comment) => comment.commentId)).toEqual([reviewRowId]);
+  });
+
+  it('replies through the canonical tracked-change id when an anchored root already exists', async () => {
+    const trackedChangeId = 'tc|main%3A%2Fword%2Fdocument.xml|del|coalesced|2|4';
+    const replyItem = {
+      id: '1',
+      parentCommentId: '0',
+      text: 'second note',
+      status: 'open',
+      trackedChangeThreadParentId: trackedChangeId,
+      trackedChangeSide: 'deleted',
+    };
+    const adapter = {
+      documentId: 'doc-1',
+      reply: vi.fn(async () => ({
+        ok: true,
+        items: [replyItem],
+        complete: false,
+        mutationPath: 'document-api',
+      })),
+      commitPendingComment: vi.fn(),
+      mapV2CommentToUseCommentInput: vi.fn((item) => ({
+        commentId: item.id,
+        parentCommentId: item.parentCommentId,
+        fileId: 'doc-1',
+        commentText: item.text,
+        resolvedTime: null,
+        trackedChangeThreadParentId: item.trackedChangeThreadParentId,
+        trackedChangeSide: item.trackedChangeSide,
+      })),
+    };
+    const superdoc = makeSuperdoc(adapter);
+    store.setV2CommentsAdapter(adapter);
+
+    const result = await store.replyCommentV2({
+      superdoc,
+      parentCommentId: trackedChangeId,
+      trackedChangeTarget: { kind: 'trackedChange', trackedChangeId },
+      text: 'second note',
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(adapter.reply).toHaveBeenCalledWith({ parentCommentId: trackedChangeId, text: 'second note' });
+    expect(adapter.commitPendingComment).not.toHaveBeenCalled();
+  });
+
+  it('does not create another root when canonical tracked-change reply is ambiguous', async () => {
+    const trackedChangeId = 'tc|main%3A%2Fword%2Fdocument.xml|del|coalesced|2|4';
+    const adapter = {
+      documentId: 'doc-1',
+      reply: vi.fn(async () => ({
+        ok: false,
+        reason: 'receipt-failure',
+        code: 'AMBIGUOUS_MATCH',
+      })),
+      commitPendingComment: vi.fn(),
+    };
+    const superdoc = makeSuperdoc(adapter);
+    store.setV2CommentsAdapter(adapter);
+
+    const result = await store.replyCommentV2({
+      superdoc,
+      parentCommentId: trackedChangeId,
+      trackedChangeTarget: { kind: 'trackedChange', trackedChangeId },
+      text: 'must not create another root',
+    });
+
+    expect(result).toMatchObject({ ok: false, code: 'AMBIGUOUS_MATCH' });
+    expect(adapter.commitPendingComment).not.toHaveBeenCalled();
+  });
 });
 
 describe('comments-store allowResolve policy', () => {
@@ -1912,6 +2084,48 @@ describe('comments-store v2 tracked-change hydration', () => {
     ]);
   });
 
+  it('shows comments created from each move side inside that visible review card', () => {
+    const canonicalId = 'tc|move|1%7C101';
+    const moveTo = makeTrackedChangeRow({
+      commentId: `${canonicalId}::move-to`,
+      trackedChangeCanonicalId: canonicalId,
+      semanticColorKey: 'move-to',
+    });
+    const moveFrom = makeTrackedChangeRow({
+      commentId: `${canonicalId}::move-from`,
+      trackedChangeCanonicalId: canonicalId,
+      semanticColorKey: 'move-from',
+    });
+    const sourceRoot = useComment({
+      commentId: 'source-root',
+      fileId: 'doc-1',
+      commentText: 'Source note',
+      trackedChangeThreadParentId: canonicalId,
+      trackedChangeSide: 'source',
+    });
+    const destinationRoot = useComment({
+      commentId: 'destination-root',
+      fileId: 'doc-1',
+      commentText: 'Destination note',
+      trackedChangeThreadParentId: canonicalId,
+      trackedChangeSide: 'destination',
+    });
+    store.commentsList = [moveTo, moveFrom, sourceRoot, destinationRoot];
+
+    expect(store.getGroupedComments.parentComments.map((comment) => comment.commentId).sort()).toEqual([
+      moveFrom.commentId,
+      moveTo.commentId,
+    ]);
+    expect(store.getTrackedChangeThread(moveFrom).map((comment) => comment.commentId)).toEqual([
+      moveFrom.commentId,
+      sourceRoot.commentId,
+    ]);
+    expect(store.getTrackedChangeThread(moveTo).map((comment) => comment.commentId)).toEqual([
+      moveTo.commentId,
+      destinationRoot.commentId,
+    ]);
+  });
+
   // TCS-LIST-005: the signed list vocabulary fields survive from adapter
   // params through the comment model to the serialized payload, and re-adds
   // with identical detail lines do not mark the row changed.
@@ -2408,6 +2622,74 @@ describe('comments-store v2 tracked-change hydration', () => {
   });
 });
 
+describe('comments-store getComment id resolution', () => {
+  let store;
+
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    const superdocStore = useSuperdocStore();
+    superdocStore.documents = [
+      { id: 'doc-1', type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+    ];
+    store = useCommentsStore();
+  });
+
+  // Real Word comment ids and tracked-change rows' raw OOXML `w:id` (exposed
+  // as `importedId`) are independent numbering sequences that can collide on
+  // the same small integer (e.g. comment "2" and a tracked-change insert with
+  // w:id="2" elsewhere in the same document). `getComment` must resolve the
+  // real comment, never the unrelated tracked-change row, regardless of which
+  // one happens to appear first in `commentsList`.
+  it('resolves a real comment over a colliding tracked-change importedId, even when the tracked-change row sorts first', () => {
+    const trackedChangeRow = makeTrackedChangeRow({
+      commentId: 'tc|main:document.xml|ins|wId:2',
+      importedId: '2',
+      trackedChangeText: '8 months',
+    });
+    const realComment = useComment(makeOpenRow({ commentId: '2', commentText: 'We should have a 1 month cushion...' }));
+    // Tracked-change row intentionally placed BEFORE the real comment: this
+    // is the exact array order that reproduced the misattribution bug (the
+    // old `.find()` matched importedId=='2' on the tracked-change row before
+    // ever reaching the real comment's commentId=='2').
+    store.commentsList = [trackedChangeRow, realComment];
+
+    const resolved = store.getComment('2');
+
+    expect(resolved.commentId).toBe('2');
+    expect(resolved.trackedChange).not.toBe(true);
+    expect(resolved.commentText).toBe('We should have a 1 month cushion...');
+  });
+
+  it('still resolves a tracked-change row by importedId when there is no commentId collision', () => {
+    const trackedChangeRow = makeTrackedChangeRow({
+      commentId: 'tc|main:document.xml|ins|wId:7',
+      importedId: '7',
+      trackedChangeText: 'no collision here',
+    });
+    store.commentsList = [trackedChangeRow];
+
+    expect(store.getComment('7')).toBe(trackedChangeRow);
+  });
+
+  it('keeps commentsList precedence when reviewDirectoryList contains a colliding alias', () => {
+    const trackedChangeRow = makeTrackedChangeRow({
+      commentId: 'tc|main:document.xml|ins|wId:2',
+      importedId: '2',
+      trackedChangeText: 'directory collision',
+    });
+    const realComment = useComment(makeOpenRow({ commentId: '2', commentText: 'Live sidebar comment' }));
+
+    store.commentsList = [realComment];
+    store.reviewDirectoryList = [trackedChangeRow];
+
+    const resolved = store.getComment('2');
+
+    expect(resolved).toBe(realComment);
+    expect(resolved.commentId).toBe('2');
+    expect(resolved.trackedChange).not.toBe(true);
+  });
+});
+
 describe('comments-store committed review-window apply', () => {
   let store;
   let superdoc;
@@ -2608,6 +2890,29 @@ describe('comments-store committed review-window apply', () => {
     );
   });
 
+  it('clears stale tracked-change provenance when a bounded window returns a retargeted comment', () => {
+    const trackedRow = makeTrackedChangeRow({ commentId: 'tc-1', trackedChangeCanonicalId: 'tc-1' });
+    const root = useComment({
+      commentId: 'comment-1',
+      fileId: 'doc-1',
+      commentText: 'Comment one',
+      trackedChangeParentId: 'tc-1',
+      trackedChangeThreadParentId: 'tc-1',
+      trackedChangeSide: 'inserted',
+    });
+    store.commentsList = [trackedRow, root];
+
+    expect(apply().ok).toBe(true);
+
+    const reconciledRoot = store.commentsList.find((row) => row.commentId === 'comment-1');
+    const reconciledTrackedRow = store.commentsList.find((row) => row.commentId === 'tc-1');
+    expect(reconciledRoot.trackedChangeParentId).toBeUndefined();
+    expect(reconciledRoot.trackedChangeThreadParentId).toBeUndefined();
+    expect(reconciledRoot.trackedChangeSide).toBeUndefined();
+    expect(store.getGroupedComments.parentComments.map((row) => row.commentId).sort()).toEqual(['comment-1', 'tc-1']);
+    expect(store.getTrackedChangeThread(reconciledTrackedRow).map((row) => row.commentId)).toEqual(['tc-1']);
+  });
+
   it('rejects stale adapters, document mismatch, and mapper failure before patching', () => {
     const patch = vi.fn();
     const staleComments = { ...commentsAdapter };
@@ -2654,6 +2959,7 @@ describe('comments-store v2 pending document comments', () => {
       documentId: 'doc-1',
       getCapabilityState: vi.fn(() => ({ canWrite: true, reason: null })),
       captureCurrentSelection: vi.fn(async () => ({ ok: true, target })),
+      setActiveComment: vi.fn(async () => ({ ok: true })),
       commitPendingComment: vi.fn(async (input) => {
         submittedTargets.push(input.target);
         return {
@@ -2678,16 +2984,140 @@ describe('comments-store v2 pending document comments', () => {
     expect(adapter.captureCurrentSelection).toHaveBeenCalledTimes(1);
 
     store.currentCommentText = '<p>Captured &lt;b&gt;target&lt;/b&gt; comment</p>';
+    store.currentCommentMentions = [{ id: 'u1', name: 'Internal Reviewer', email: 'internal@example.com' }];
     const result = await store.addComment({ superdoc, comment: store.pendingComment });
 
     expect(adapter.commitPendingComment).toHaveBeenCalledWith({
       text: 'Captured <b>target</b> comment',
       target,
+      mentions: [{ id: 'u1', name: 'Internal Reviewer', email: 'internal@example.com' }],
     });
     expect(submittedTargets[0]).toBe(target);
     expect(result.ok).toBe(true);
     expect(store.pendingComment).toBeNull();
+    expect(store.currentCommentMentions).toEqual([]);
+    expect(adapter.setActiveComment).toHaveBeenCalledWith('c-created');
+    expect(store.activeComment).toBe('c-created');
+    expect(store.activeFloatingCommentInstanceId).toBe('c-created');
     expect(store.commentsList.map((comment) => comment.commentId)).toEqual(['c-created']);
+  });
+
+  it('submits reply mentions and exposes them in the successful update event', async () => {
+    const mentions = [{ id: 'u1', name: 'Internal Reviewer', email: 'internal@example.com' }];
+    const items = [
+      { commentId: 'c1', fileId: 'doc-1', commentText: 'Root', mentions: [] },
+      { commentId: 'c2', parentCommentId: 'c1', fileId: 'doc-1', commentText: '@Internal Reviewer', mentions },
+    ];
+    const adapter = {
+      documentId: 'doc-1',
+      reply: vi.fn(async () => ({ ok: true, items })),
+      mapV2CommentToUseCommentInput: vi.fn((item) => item),
+    };
+    const superdoc = makeSuperdoc(adapter);
+    store.setV2CommentsAdapter(adapter);
+    store.commentsList = [useComment(items[0])];
+
+    const result = await store.replyCommentV2({
+      superdoc,
+      parentCommentId: 'c1',
+      text: '@Internal Reviewer',
+      mentions,
+    });
+
+    expect(adapter.reply).toHaveBeenCalledWith({
+      parentCommentId: 'c1',
+      text: '@Internal Reviewer',
+      mentions,
+    });
+    expect(result.ok).toBe(true);
+    expect(superdoc.emit).toHaveBeenCalledWith(
+      'comments-update',
+      expect.objectContaining({
+        type: 'add',
+        comment: expect.objectContaining({ commentId: 'c2', mentions }),
+      }),
+    );
+  });
+
+  it('reconciles a context-menu create and emits its structured mention event', async () => {
+    const mentions = [{ id: 'u1', name: 'Internal Reviewer', email: 'internal@example.com' }];
+    const detail = {
+      id: 'c-created',
+      text: '@Internal Reviewer',
+      status: 'open',
+      metadata: { mentions },
+    };
+    const adapter = {
+      documentId: 'doc-1',
+      mapV2CommentToUseCommentInput: vi.fn((item) => ({
+        commentId: item.id,
+        fileId: 'doc-1',
+        commentText: item.text,
+        mentions: item.metadata?.mentions ?? [],
+      })),
+    };
+    const superdoc = makeSuperdoc(adapter);
+    superdoc.activeEditor.doc = {
+      comments: { get: vi.fn(async () => detail) },
+    };
+    store.setV2CommentsAdapter(adapter);
+
+    const result = await store.announceV2CommentCreated({
+      superdoc,
+      commentId: 'c-created',
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(superdoc.activeEditor.doc.comments.get).toHaveBeenCalledWith({
+      commentId: 'c-created',
+    });
+    expect(store.commentsList[0]?.mentions).toEqual(mentions);
+    expect(superdoc.emit).toHaveBeenCalledWith(
+      'comments-update',
+      expect.objectContaining({
+        type: 'add',
+        comment: expect.objectContaining({ commentId: 'c-created', mentions }),
+      }),
+    );
+  });
+
+  it('hands off the active floating row to the created comment for non-v2 pending submit', () => {
+    const pendingDraft = useComment({
+      commentId: 'pending-new-comment',
+      fileId: 'doc-1',
+      commentText: '',
+      selection: {
+        source: 'editor',
+      },
+    });
+    const createdComment = useComment({
+      commentId: 'c-created-sync',
+      fileId: 'doc-1',
+      commentText: 'Created from pending draft',
+    });
+    const superdoc = {
+      activeEditor: {
+        editorVersion: 1,
+        commands: {
+          insertComment: vi.fn(),
+          removeComment: vi.fn(),
+        },
+      },
+      emit: vi.fn(),
+      config: { isInternal: true },
+    };
+
+    store.pendingComment = pendingDraft;
+    store.currentCommentText = '<p>Created from pending draft</p>';
+
+    const result = store.addComment({ superdoc, comment: createdComment, broadcastChanges: false });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(store.pendingComment).toBeNull();
+    expect(store.activeComment).toBe('c-created-sync');
+    expect(store.activeFloatingCommentInstanceId).toBe('c-created-sync');
+    expect(store.commentsList.map((comment) => comment.commentId)).toEqual(['c-created-sync']);
+    expect(superdoc.activeEditor.commands.removeComment).toHaveBeenCalledWith({ commentId: 'pending' });
   });
 });
 

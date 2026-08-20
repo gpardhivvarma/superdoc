@@ -292,10 +292,40 @@ function makeAdapters() {
     },
   };
 
+  const htmlToFragmentAdapter = {
+    htmlToFragment: mock(() => ({
+      fragment: [{ kind: 'paragraph' as const, paragraph: { inlines: [] } }],
+      lossy: false,
+      diagnostics: [],
+    })),
+  };
+  const projectionResult = {
+    content: '<p>Hello</p>',
+    status: 'success' as const,
+    outcome: 'preserved' as const,
+    reviewMode: 'final' as const,
+    evaluatedRevision: 'r1',
+    story: { kind: 'story' as const, storyType: 'body' as const },
+    scope: { kind: 'story' as const },
+    lossy: false,
+    diagnostics: [],
+    blocks: [],
+    annotations: [],
+  };
+  const projectHtmlAdapter = {
+    projectHtml: mock(async () => ({ ...projectionResult, format: 'html' as const })),
+  };
+  const projectMarkdownAdapter = {
+    projectMarkdown: mock(async () => ({ ...projectionResult, format: 'markdown' as const, content: 'Hello' })),
+  };
+
   const adapters: DocumentApiAdapters = {
     find: findAdapter,
     getNode: getNodeAdapter,
     getText: getTextAdapter,
+    htmlToFragment: htmlToFragmentAdapter,
+    projectHtml: projectHtmlAdapter,
+    projectMarkdown: projectMarkdownAdapter,
     info: infoAdapter,
     capabilities: capabilitiesAdapter,
     comments: commentsAdapter,
@@ -311,7 +341,15 @@ function makeAdapters() {
     mutations: mutationsAdapter,
   };
 
-  return { adapters, findAdapter, writeAdapter, commentsAdapter, trackChangesAdapter };
+  return {
+    adapters,
+    findAdapter,
+    writeAdapter,
+    commentsAdapter,
+    trackChangesAdapter,
+    htmlToFragmentAdapter,
+    projectHtmlAdapter,
+  };
 }
 
 describe('invoke', () => {
@@ -351,6 +389,34 @@ describe('invoke', () => {
       const direct = api.insert(input);
       const invoked = api.invoke({ operationId: 'insert', input });
       expect(invoked).toEqual(direct);
+    });
+
+    it('htmlToFragment: invoke returns the same strict conversion result as the direct method', () => {
+      const { adapters, htmlToFragmentAdapter } = makeAdapters();
+      const api = createDocumentApi(adapters);
+      const input = { html: '<p>Hello</p>' };
+
+      expect(api.invoke({ operationId: 'htmlToFragment', input })).toEqual(api.htmlToFragment(input));
+      expect(htmlToFragmentAdapter.htmlToFragment).toHaveBeenCalledWith(input);
+    });
+
+    it('htmlToFragment: invoke preserves the typed missing-capability failure', () => {
+      const { adapters } = makeAdapters();
+      const api = createDocumentApi({ ...adapters, htmlToFragment: undefined });
+
+      expect(() => api.invoke({ operationId: 'htmlToFragment', input: { html: '<p>Hello</p>' } })).toThrow(
+        expect.objectContaining({ code: 'CAPABILITY_UNAVAILABLE' }),
+      );
+    });
+
+    it('projectHtml: direct and invoke both infer and resolve the detailed result', async () => {
+      const { adapters, projectHtmlAdapter } = makeAdapters();
+      const api = createDocumentApi(adapters);
+      const input = { reviewMode: 'redline' as const, includeSourceMap: true };
+      const direct = api.projectHtml(input);
+      const invoked = api.invoke({ operationId: 'projectHtml', input });
+      await expect(invoked).resolves.toEqual(await direct);
+      expect(projectHtmlAdapter.projectHtml).toHaveBeenCalledWith(input);
     });
 
     it('insert: invoke forwards options through to adapter-backed execution', () => {
@@ -397,6 +463,25 @@ describe('invoke', () => {
       const api = createDocumentApi(adapters);
       const direct = api.capabilities();
       const invoked = api.invoke({ operationId: 'capabilities.get', input: undefined });
+      expect(invoked).toEqual(direct);
+    });
+
+    it('capabilities.check: invoke resolves the same support result as the direct async member', async () => {
+      const { adapters, projectHtmlAdapter } = makeAdapters();
+      const projection = await projectHtmlAdapter.projectHtml({ reviewMode: 'final' });
+      const result = {
+        operation: 'projectHtml' as const,
+        format: 'html' as const,
+        supported: true,
+        outcome: 'preserved' as const,
+        evaluatedRevision: 'r1',
+        projection,
+      };
+      adapters.capabilities.check = mock(async () => result);
+      const api = createDocumentApi(adapters);
+      const input = { operation: 'projectHtml' as const, input: { reviewMode: 'final' as const } };
+      const direct = await api.capabilities.check(input);
+      const invoked = await api.invoke({ operationId: 'capabilities.check', input });
       expect(invoked).toEqual(direct);
     });
 

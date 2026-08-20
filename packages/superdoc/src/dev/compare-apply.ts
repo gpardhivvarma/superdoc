@@ -14,7 +14,10 @@ export interface CompareApplyDebugSnapshot {
 
 export interface CompareApplyDocApi {
   readonly diff: {
-    apply(input: { diff: unknown }, options: { changeMode: 'tracked' | 'direct' }): CompareApplyResult;
+    apply(
+      input: { diff: unknown },
+      options: { changeMode: 'tracked' | 'direct' },
+    ): CompareApplyResult | Promise<CompareApplyResult>;
   };
   getText?(input: Record<string, never>): string;
   readonly doc?: {
@@ -43,89 +46,62 @@ export interface CompareApplyOutcome {
   readonly applyResult: CompareApplyResult;
   readonly changeMode: 'tracked' | 'direct';
   readonly fallbackFromTracked: boolean;
+  readonly fallbackReason: 'tracked-deferred' | 'table-topology' | null;
 }
 
-export function isWs09TrackedCompareDeferred(error: unknown): boolean {
-  const code =
-    typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: unknown }).code : null;
-  const message = error instanceof Error ? error.message : String(error ?? '');
-  return code === 'CAPABILITY_UNSUPPORTED' && /compare-apply-deferred \(ws09\)/i.test(message);
+export class CompareApplyFallbackError extends Error {
+  readonly changeMode = 'direct';
+
+  constructor(
+    readonly fallbackReason: Exclude<CompareApplyOutcome['fallbackReason'], null>,
+    options: { cause: unknown },
+  ) {
+    const causeMessage = options.cause instanceof Error ? options.cause.message : String(options.cause);
+    const context =
+      fallbackReason === 'table-topology' ? 'tracked table row replay was unsafe' : 'tracked mode was deferred';
+    super(`Direct compare apply failed after ${context}: ${causeMessage}`, options);
+    this.name = 'CompareApplyFallbackError';
+  }
 }
 
-export function compareApplyDeferredMessage(error: unknown): string | null {
-  if (!isWs09TrackedCompareDeferred(error)) return null;
+function isRelationshipBackedTrackedCompareDeferred(error: unknown, diff: unknown): boolean {
+  if (!error || typeof error !== 'object' || !diff || typeof diff !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    details?: { unsupportedReason?: unknown; changedFamilies?: unknown };
+  };
+  const payload = 'payload' in diff ? (diff as { payload?: unknown }).payload : null;
+  const relationshipBackedBody =
+    payload && typeof payload === 'object' && 'relationshipBackedBody' in payload
+      ? (payload as { relationshipBackedBody?: unknown }).relationshipBackedBody
+      : null;
+  const target =
+    relationshipBackedBody && typeof relationshipBackedBody === 'object' && 'target' in relationshipBackedBody
+      ? (relationshipBackedBody as { target?: unknown }).target
+      : null;
+  const targetMedia =
+    target && typeof target === 'object' && 'media' in target ? (target as { media?: unknown }).media : null;
   return (
-    'Tracked compare apply is deferred for ws09 table topology in this build. ' +
-    'SuperDoc Dev retried the same diff in direct mode.'
+    candidate.code === 'CAPABILITY_UNSUPPORTED' &&
+    candidate.details?.unsupportedReason === 'family-apply-lane-unavailable' &&
+    Array.isArray(candidate.details.changedFamilies) &&
+    candidate.details.changedFamilies.includes('media') &&
+    Array.isArray(targetMedia) &&
+    targetMedia.length > 0
   );
 }
 
-function isWs07VisualFamilyApplyBlock(error: unknown): boolean {
-  const code =
-    typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: unknown }).code : null;
-  const message = error instanceof Error ? error.message : String(error ?? '');
-  if (code !== 'CAPABILITY_UNSUPPORTED') return false;
-
-  const families = Array.from(
-    message.matchAll(/\b([a-z-]+)\s+\((?:deferred|blocked):\s+compare-apply-deferred \(ws07\)\)/gi),
-    (match) => match[1] ?? '',
-  ).filter((family) => family.length > 0);
-  if (families.length === 0) return false;
-
-  const allowedFamilies = new Set(['sections', 'settings', 'theme']);
-  return families.every((family) => allowedFamilies.has(family));
+export function compareApplyFallbackMessage(outcome: CompareApplyOutcome): string {
+  if (outcome.fallbackReason === 'table-topology') {
+    return 'Tracked compare apply could not safely replay the table topology, so SuperDoc Dev applied the diff in direct mode. ';
+  }
+  if (outcome.fallbackReason === 'tracked-deferred') {
+    return 'Tracked compare apply was deferred, so SuperDoc Dev applied the diff in direct mode. ';
+  }
+  return '';
 }
 
-function sanitizeWs07VisualFamiliesFromDiff(diff: unknown): unknown {
-  if (!diff || typeof diff !== 'object') return diff;
-  const payload = 'payload' in diff ? (diff as { payload?: unknown }).payload : null;
-  if (!payload || typeof payload !== 'object') return diff;
-
-  const next = structuredClone(diff as Record<string, unknown>) as {
-    payload?: {
-      analysis?: {
-        families?: Array<{ family?: unknown; state?: unknown; blockedReason?: unknown; excludedDecision?: unknown }>;
-      };
-      semanticAnalysis?: {
-        familyDeltas?: Array<{ family?: unknown; detectedChange?: unknown; reason?: unknown; owner?: unknown }>;
-      };
-    };
-  };
-
-  const strippedFamilies = new Set(['sections', 'settings', 'theme']);
-
-  const analysisFamilies = next.payload?.analysis?.families;
-  if (Array.isArray(analysisFamilies)) {
-    next.payload!.analysis!.families = analysisFamilies.map((family) =>
-      strippedFamilies.has(String(family?.family))
-        ? {
-            ...family,
-            state: 'unchanged',
-            blockedReason: undefined,
-            excludedDecision: undefined,
-          }
-        : family,
-    );
-  }
-
-  const familyDeltas = next.payload?.semanticAnalysis?.familyDeltas;
-  if (Array.isArray(familyDeltas)) {
-    next.payload!.semanticAnalysis!.familyDeltas = familyDeltas.map((delta) =>
-      strippedFamilies.has(String(delta?.family))
-        ? {
-            ...delta,
-            detectedChange: false,
-            reason: undefined,
-            owner: undefined,
-          }
-        : delta,
-    );
-  }
-
-  return next;
-}
-
-function prefersDirectWs09TableTopologyApply(diff: unknown): boolean {
+function hasDirectTableTopologyReplayPayload(diff: unknown): boolean {
   if (!diff || typeof diff !== 'object') return false;
   const payload = 'payload' in diff ? (diff as { payload?: unknown }).payload : null;
   if (!payload || typeof payload !== 'object') return false;
@@ -160,37 +136,49 @@ function prefersDirectWs09TableTopologyApply(diff: unknown): boolean {
   );
 }
 
-export function applyCompareWithWs09Fallback(docApi: CompareApplyDocApi, diff: unknown): CompareApplyOutcome {
-  if (prefersDirectWs09TableTopologyApply(diff)) {
-    try {
-      return {
-        applyResult: docApi.diff.apply({ diff }, { changeMode: 'direct' }),
-        changeMode: 'direct',
-        fallbackFromTracked: true,
-      };
-    } catch (error) {
-      if (!isWs07VisualFamilyApplyBlock(error)) throw error;
-      const sanitizedDiff = sanitizeWs07VisualFamiliesFromDiff(diff);
-      return {
-        applyResult: docApi.diff.apply({ diff: sanitizedDiff }, { changeMode: 'direct' }),
-        changeMode: 'direct',
-        fallbackFromTracked: true,
-      };
-    }
-  }
+function isTrackedTableRowReplayUnsafe(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    details?: { unsupportedReason?: unknown; changedFamilies?: unknown };
+  };
+  return (
+    candidate.code === 'CAPABILITY_UNSUPPORTED' &&
+    candidate.details?.unsupportedReason === 'tracked-table-row-replay-unsafe' &&
+    Array.isArray(candidate.details.changedFamilies) &&
+    candidate.details.changedFamilies.includes('tables')
+  );
+}
+
+export async function applyCompareWithWs09Fallback(
+  docApi: CompareApplyDocApi,
+  diff: unknown,
+): Promise<CompareApplyOutcome> {
   try {
     return {
-      applyResult: docApi.diff.apply({ diff }, { changeMode: 'tracked' }),
+      applyResult: await docApi.diff.apply({ diff }, { changeMode: 'tracked' }),
       changeMode: 'tracked',
       fallbackFromTracked: false,
+      fallbackReason: null,
     };
   } catch (error) {
-    if (!isWs09TrackedCompareDeferred(error)) throw error;
-    return {
-      applyResult: docApi.diff.apply({ diff }, { changeMode: 'direct' }),
-      changeMode: 'direct',
-      fallbackFromTracked: true,
-    };
+    const fallbackReason =
+      isTrackedTableRowReplayUnsafe(error) && hasDirectTableTopologyReplayPayload(diff)
+        ? 'table-topology'
+        : isRelationshipBackedTrackedCompareDeferred(error, diff)
+          ? 'tracked-deferred'
+          : null;
+    if (!fallbackReason) throw error;
+    try {
+      return {
+        applyResult: await docApi.diff.apply({ diff }, { changeMode: 'direct' }),
+        changeMode: 'direct',
+        fallbackFromTracked: true,
+        fallbackReason,
+      };
+    } catch (directError) {
+      throw new CompareApplyFallbackError(fallbackReason, { cause: directError });
+    }
   }
 }
 

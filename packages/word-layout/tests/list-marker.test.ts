@@ -80,6 +80,77 @@ describe('computeWordListMarker', () => {
     expect(lvl2third.listRenderingAttrs.markerText).toBe('1.1.3');
   });
 
+  it('renders every legal multi-level placeholder as decimal', () => {
+    const manager = createNumberingManager();
+    computeWordListMarker({
+      definition: baseDef({
+        ilvl: 0,
+        numFmt: 'decimal',
+        levelNumberingFormats: [{ ilvl: 0, numFmt: 'decimal' }],
+      }),
+      manager,
+      paragraphOrdinal: 1,
+    });
+    const result = computeWordListMarker({
+      definition: baseDef({
+        ilvl: 1,
+        lvlText: '%1(%2)',
+        numFmt: 'lowerLetter',
+        isLegal: true,
+        levelNumberingFormats: [
+          { ilvl: 0, numFmt: 'decimal' },
+          { ilvl: 1, numFmt: 'lowerLetter' },
+        ],
+      }),
+      manager,
+      paragraphOrdinal: 2,
+    });
+    expect(result.path).toEqual([1, 1]);
+    expect(result.listRenderingAttrs.markerText).toBe('1(1)');
+  });
+
+  it('preserves none levels and resolves bullet templates under legal numbering', () => {
+    const hiddenAncestor = computeWordListMarker({
+      definition: baseDef({
+        ilvl: 1,
+        lvlText: '%1.%2',
+        numFmt: 'lowerLetter',
+        isLegal: true,
+        levelNumberingFormats: [
+          { ilvl: 0, numFmt: 'none' },
+          { ilvl: 1, numFmt: 'lowerLetter' },
+        ],
+      }),
+      manager: createNumberingManager(),
+      paragraphOrdinal: 1,
+    });
+    expect(hiddenAncestor.listRenderingAttrs.markerText).toBe('.1');
+
+    const legalBullet = computeWordListMarker({
+      definition: baseDef({
+        lvlText: '%1)',
+        numFmt: 'bullet',
+        isLegal: true,
+        levelNumberingFormats: [{ ilvl: 0, numFmt: 'bullet' }],
+      }),
+      manager: createNumberingManager(),
+      paragraphOrdinal: 1,
+    });
+    expect(legalBullet.listRenderingAttrs.markerText).toBe('1)');
+
+    const legalGlyph = computeWordListMarker({
+      definition: baseDef({
+        lvlText: '',
+        numFmt: 'bullet',
+        isLegal: true,
+        levelNumberingFormats: [{ ilvl: 0, numFmt: 'bullet' }],
+      }),
+      manager: createNumberingManager(),
+      paragraphOrdinal: 1,
+    });
+    expect(legalGlyph.listRenderingAttrs.markerText).toBe('•');
+  });
+
   it('restarts nested counters when the parent level fires (v1 parity)', () => {
     const manager = createNumberingManager();
     const lvl0 = baseDef({ ilvl: 0, lvlText: '%1.' });
@@ -282,6 +353,49 @@ describe('computeWordListMarker', () => {
     // counter), so it falls back to the scoped start 7, ignoring numId 10.
     expect(b.path).toEqual([7, 1]);
     expect(b.listRenderingAttrs.markerText).toBe('7.1');
+  });
+
+  // SD-4342: Chinese formats through the levelNumberingFormats branch — the
+  // path the v2 adapter always takes. Before the fix this rendered only the
+  // punctuation from lvlText. Zero glyph is U+25CB (○) per Word.
+  it('renders chineseCounting markers via level placeholder formats', () => {
+    const manager = createNumberingManager();
+    const def = baseDef({
+      numFmt: 'chineseCounting',
+      start: 99,
+      levelNumberingFormats: [{ ilvl: 0, numFmt: 'chineseCounting' }],
+    });
+    const a = computeWordListMarker({ definition: def, manager, paragraphOrdinal: 1 });
+    const b = computeWordListMarker({ definition: def, manager, paragraphOrdinal: 2 });
+    expect(a.listRenderingAttrs.markerText).toBe('九十九.');
+    expect(b.listRenderingAttrs.markerText).toBe('一○○.');
+  });
+
+  it('renders chineseCountingThousand markers via level placeholder formats', () => {
+    const manager = createNumberingManager();
+    const def = baseDef({
+      numFmt: 'chineseCountingThousand',
+      start: 12345,
+      levelNumberingFormats: [{ ilvl: 0, numFmt: 'chineseCountingThousand' }],
+    });
+    const a = computeWordListMarker({ definition: def, manager, paragraphOrdinal: 1 });
+    const b = computeWordListMarker({ definition: def, manager, paragraphOrdinal: 2 });
+    expect(a.listRenderingAttrs.markerText).toBe('一万二千三百四十五.');
+    expect(b.listRenderingAttrs.markerText).toBe('一万二千三百四十六.');
+  });
+
+  it('renders mixed multilevel templates where one referenced level is chineseCounting', () => {
+    const manager = createNumberingManager();
+    const levelNumberingFormats = [
+      { ilvl: 0, numFmt: 'decimal' },
+      { ilvl: 1, numFmt: 'chineseCounting' },
+    ];
+    const lvl0 = baseDef({ ilvl: 0, lvlText: '%1.', numFmt: 'decimal', levelNumberingFormats });
+    const lvl1 = baseDef({ ilvl: 1, lvlText: '%1.%2', numFmt: 'chineseCounting', levelNumberingFormats });
+    computeWordListMarker({ definition: lvl0, manager, paragraphOrdinal: 1 });
+    const r = computeWordListMarker({ definition: lvl1, manager, paragraphOrdinal: 2 });
+    expect(r.path).toEqual([1, 1]);
+    expect(r.listRenderingAttrs.markerText).toBe('1.一');
   });
 
   it('formats decimalZero custom zero-padding (path > 1 entry)', () => {

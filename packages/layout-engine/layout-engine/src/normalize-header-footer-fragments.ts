@@ -2,12 +2,19 @@ import type {
   FlowBlock,
   ImageBlock,
   DrawingBlock,
+  TableBlock,
   Fragment,
   Measure,
   ImageMeasure,
   DrawingMeasure,
 } from '@superdoc/contracts';
-import { isPagePositionedParagraphFrame, resolveFooterPageFrameOriginY } from '@superdoc/contracts';
+import {
+  isPagePositionedFloatingTable,
+  isPagePositionedParagraphFrame,
+  resolveAnchoredGraphicX,
+  resolveAnchoredGraphicY,
+  resolveFooterPageFrameOriginY,
+} from '@superdoc/contracts';
 /**
  * Subset of HeaderFooterConstraints needed for fragment normalization.
  * Defined locally to avoid circular imports with index.ts.
@@ -25,6 +32,13 @@ export type RegionConstraints = {
     footer?: number;
   };
 };
+
+// Word-authored header backgrounds can carry a small positive edge offset even
+// when their extent is the full physical page. Word paints those shapes as a
+// page cover. Keep this tolerance narrower than ordinary shape placement: the
+// two known Word encodings are 1 pt and 1.2 pt (1.333 px and 1.6 px).
+const PAGE_COVER_EDGE_TOLERANCE_PX = 2;
+const PAGE_COVER_SIZE_TOLERANCE_PX = 0.5;
 
 /**
  * Compute the physical-page Y coordinate for a page-relative anchored drawing,
@@ -72,11 +86,102 @@ function isPageRelativeBlock(block: FlowBlock): block is ImageBlock | DrawingBlo
   return (block.kind === 'image' || block.kind === 'drawing') && block.anchor?.vRelativeFrom === 'page';
 }
 
+function normalizeFloatingFooterTableFragment(
+  fragment: Extract<Fragment, { kind: 'table' }>,
+  block: TableBlock,
+  pageNumber: number,
+  constraints: RegionConstraints,
+  bandOrigin: number,
+): void {
+  if (isPagePositionedFloatingTable(block)) {
+    const pageHeight = constraints.pageHeight ?? 0;
+    const physicalY = resolveAnchoredGraphicY({
+      anchor: block.anchor as Parameters<typeof resolveAnchoredGraphicY>[0]['anchor'],
+      objectHeight: fragment.height,
+      contentTop: 0,
+      contentBottom: pageHeight,
+      pageBottomMargin: 0,
+      pageNumber,
+    });
+    fragment.y = physicalY - bandOrigin;
+  }
+
+  const pageWidth = constraints.pageWidth;
+  if (
+    block.anchor?.hRelativeFrom !== 'page' ||
+    typeof pageWidth !== 'number' ||
+    !Number.isFinite(pageWidth) ||
+    pageWidth <= 0
+  ) {
+    return;
+  }
+  fragment.x = resolveAnchoredGraphicX(
+    block.anchor,
+    0,
+    { width: constraints.width ?? pageWidth, gap: 0, count: 1 },
+    fragment.width,
+    constraints.margins,
+    pageWidth,
+    { pageNumber },
+  );
+}
+
 function isHeaderMarginContentBlock(block: FlowBlock): block is ImageBlock | DrawingBlock {
   if (block.kind !== 'image' && block.kind !== 'drawing') return false;
   if (block.anchor?.vRelativeFrom !== 'margin') return false;
   if (block.anchor.behindDoc === true) return false;
   return block.wrap?.type !== 'None';
+}
+
+function normalizePageCoveringHeaderOverlay(
+  fragment: Fragment,
+  block: FlowBlock,
+  constraints: RegionConstraints,
+): void {
+  if (!isAnchoredFragment(fragment) || (block.kind !== 'image' && block.kind !== 'drawing')) return;
+  if (block.anchor?.behindDoc !== true || block.wrap?.type !== 'None') return;
+
+  const horizontalAnchor = block.anchor.hRelativeFrom;
+  const verticalAnchor = block.anchor.vRelativeFrom;
+  if (
+    (horizontalAnchor !== 'page' && horizontalAnchor !== 'column') ||
+    (verticalAnchor !== 'page' && verticalAnchor !== 'paragraph')
+  ) {
+    return;
+  }
+
+  const pageWidth = constraints.pageWidth;
+  const pageHeight = constraints.pageHeight;
+  const fragmentWidth = (fragment as { width?: number }).width;
+  const fragmentHeight = (fragment as { height?: number }).height;
+  if (
+    typeof pageWidth !== 'number' ||
+    !Number.isFinite(pageWidth) ||
+    typeof pageHeight !== 'number' ||
+    !Number.isFinite(pageHeight) ||
+    typeof fragmentWidth !== 'number' ||
+    !Number.isFinite(fragmentWidth) ||
+    typeof fragmentHeight !== 'number' ||
+    !Number.isFinite(fragmentHeight) ||
+    Math.abs(fragmentWidth - pageWidth) > PAGE_COVER_SIZE_TOLERANCE_PX ||
+    Math.abs(fragmentHeight - pageHeight) > PAGE_COVER_SIZE_TOLERANCE_PX
+  ) {
+    return;
+  }
+
+  const marginLeft = constraints.margins?.left ?? 0;
+  const headerOffset = constraints.margins?.header ?? 0;
+  const pageRelativeX = horizontalAnchor === 'page';
+  const pageRelativeY = verticalAnchor === 'page';
+  const physicalX = fragment.x + (pageRelativeX ? 0 : marginLeft);
+  const physicalY = fragment.y + (pageRelativeY ? 0 : headerOffset);
+
+  if (Math.abs(physicalX) <= PAGE_COVER_EDGE_TOLERANCE_PX) {
+    fragment.x = pageRelativeX ? 0 : -marginLeft;
+  }
+  if (Math.abs(physicalY) <= PAGE_COVER_EDGE_TOLERANCE_PX) {
+    fragment.y = pageRelativeY ? 0 : -headerOffset;
+  }
 }
 
 /**
@@ -95,9 +200,9 @@ function isHeaderMarginContentBlock(block: FlowBlock): block is ImageBlock | Dra
  * offset so they do not inflate the reserved header height by carrying
  * body-canvas coordinates.
  *
- * Page-anchored paragraph frames are likewise converted from physical-page
- * coordinates; other paragraphs, inline images, and absolute overlays pass
- * through unchanged.
+ * Page-anchored paragraph frames and floating footer tables are likewise
+ * converted from physical-page coordinates; other paragraphs, inline images,
+ * and absolute overlays pass through unchanged.
  */
 export function normalizeFragmentsForRegion(
   pages: Array<{ number: number; fragments: Fragment[] }>,
@@ -156,6 +261,17 @@ export function normalizeFragmentsForRegion(
         continue;
       }
 
+      if (
+        kind === 'footer' &&
+        fragment.kind === 'table' &&
+        fragment.isAnchored === true &&
+        block.kind === 'table' &&
+        (isPagePositionedFloatingTable(block) || block.anchor?.hRelativeFrom === 'page')
+      ) {
+        normalizeFloatingFooterTableFragment(fragment, block, page.number, constraints, bandOrigin);
+        continue;
+      }
+
       if (!isAnchoredFragment(fragment)) continue;
 
       if (kind === 'header' && isHeaderMarginContentBlock(block)) {
@@ -163,11 +279,15 @@ export function normalizeFragmentsForRegion(
         continue;
       }
 
-      if (!isPageRelativeBlock(block)) continue;
+      if (!isPageRelativeBlock(block)) {
+        if (kind === 'header') normalizePageCoveringHeaderOverlay(fragment, block, constraints);
+        continue;
+      }
 
       const fragmentHeight = (fragment as { height?: number }).height ?? 0;
       const physicalY = computePhysicalAnchorY(block, fragmentHeight, pageHeight);
       fragment.y = kind === 'header' ? physicalY : physicalY - bandOrigin;
+      if (kind === 'header') normalizePageCoveringHeaderOverlay(fragment, block, constraints);
     }
   }
 

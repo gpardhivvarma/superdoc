@@ -57,7 +57,10 @@ export function buildDispatchTable(api: DocumentApi): TypedDispatchTable {
     getText: (input) => api.getText(input),
     getMarkdown: (input) => api.getMarkdown(input),
     getHtml: (input) => api.getHtml(input),
+    projectMarkdown: (input) => api.projectMarkdown(input),
+    projectHtml: (input) => api.projectHtml(input),
     markdownToFragment: (input) => api.markdownToFragment(input),
+    htmlToFragment: (input) => api.htmlToFragment(input),
     info: (input) => api.info(input),
     extract: (input) => api.extract(input),
     // --- Singleton mutations ---
@@ -201,6 +204,7 @@ export function buildDispatchTable(api: DocumentApi): TypedDispatchTable {
     'plan.execute': (input) => api.plan.execute(input),
     // --- capabilities ---
     'capabilities.get': () => api.capabilities(),
+    'capabilities.check': (input) => api.capabilities.check(input),
     // --- history.* ---
     'history.get': () => api.history.get(),
     'history.undo': () => api.history.undo(),

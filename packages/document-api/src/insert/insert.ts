@@ -1,4 +1,9 @@
-import { executeWrite, normalizeMutationOptions, type MutationOptions, type WriteAdapter } from '../write/write.js';
+import {
+  executeWrite,
+  normalizeMutationOptions,
+  type RichContentMutationOptions,
+  type WriteAdapter,
+} from '../write/write.js';
 import type { SelectionTarget, TargetLocator, SDMutationReceipt } from '../types/index.js';
 import type { SDInsertInput } from '../types/structural-input.js';
 import type { SDFragment } from '../types/fragment.js';
@@ -44,7 +49,6 @@ export type TextInsertInput = OptionalInsertLocator & {
 /**
  * Type-safe input for markdown/html inserts with block-level positioning.
  * Accepts BlockNodeAddress targets and placement (routed through the structural insert path).
- * Standalone export: not part of the InsertInput union to avoid type narrowing issues in the runtime.
  */
 export type RichContentInsertInput = {
   target?: SelectionTarget | BlockNodeAddress;
@@ -68,7 +72,11 @@ export type LegacyInsertInput = TextInsertInput;
  * Discrimination: presence of `content` (structural) vs `value` (text string).
  * These are mutually exclusive: providing both is an error.
  */
-export type InsertInput = TextInsertInput | SDInsertInput;
+export type InsertInput = TextInsertInput | RichContentInsertInput | SDInsertInput;
+
+export function isRichContentInsertInput(input: InsertInput): input is RichContentInsertInput {
+  return 'value' in input && (input.type === 'html' || input.type === 'markdown');
+}
 
 // ---------------------------------------------------------------------------
 // Allowlists for strict field validation
@@ -99,7 +107,7 @@ export function isStructuralInsertInput(input: InsertInput): input is SDInsertIn
  * 1. Union conflict detection (mutually exclusive discriminants)
  * 2. Shape-specific field and type validation
  */
-function validateInsertInput(input: unknown): asserts input is InsertInput {
+export function validateInsertInput(input: unknown): asserts input is InsertInput {
   if (!isRecord(input)) {
     throw new DocumentApiValidationError('INVALID_TARGET', 'Insert input must be a non-null object.');
   }
@@ -281,7 +289,7 @@ export function executeInsert(
   selectionAdapter: SelectionMutationAdapter,
   writeAdapter: WriteAdapter,
   input: InsertInput,
-  options?: MutationOptions,
+  options?: RichContentMutationOptions,
 ): SDMutationReceipt {
   validateInsertInput(input);
 
@@ -291,16 +299,16 @@ export function executeInsert(
   }
 
   // Text string path
-  const { target, ref, value } = input;
+  const { value } = input;
   const contentType = input.type ?? 'text';
 
   // For non-text content types, delegate to the adapter's structured insert path.
   if (contentType !== 'text') {
-    return writeAdapter.insertStructured(input, normalizeMutationOptions(options));
+    return writeAdapter.insertStructured(input, normalizeMutationOptions(options, 'insert'));
   }
 
   // Text path with target/ref → route through SelectionMutationAdapter
-  const storyIn = input.in;
+  const { target, ref, in: storyIn } = input as TextInsertInput;
   if (target || ref) {
     const request = target
       ? { kind: 'insert' as const, target, text: value, ...(storyIn ? { in: storyIn } : {}) }

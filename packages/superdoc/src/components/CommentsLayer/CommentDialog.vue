@@ -76,6 +76,7 @@ const {
   floatingCommentsOffset,
   pendingComment,
   currentCommentText,
+  currentCommentMentions,
   isDebugging,
   editingCommentId,
   editorCommentPositions,
@@ -191,9 +192,23 @@ const getCommentFocusThreadId = (comment) => {
 
 const getV2ExistingReplyParentId = (comment) => {
   if (!comment) return null;
-  if (comment.trackedChange && comment.importedId != null) return String(comment.importedId);
+  if (comment.trackedChange && comment.trackedChangeCanonicalId != null) {
+    return String(comment.trackedChangeCanonicalId);
+  }
   if (comment.commentId != null) return String(comment.commentId);
   return null;
+};
+
+const getV2TrackedChangeCommentTarget = (comment) => {
+  if (!comment?.trackedChange) return null;
+  const trackedChangeId = getV2ExistingReplyParentId(comment);
+  if (!trackedChangeId) return null;
+
+  const target = { kind: 'trackedChange', trackedChangeId };
+  if (comment.trackedChangeStory) target.story = comment.trackedChangeStory;
+  if (comment.semanticColorKey === 'move-from') target.side = 'source';
+  if (comment.semanticColorKey === 'move-to') target.side = 'destination';
+  return target;
 };
 
 const getEntryBoundsCoordinate = (entry, coordinate) => {
@@ -330,6 +345,7 @@ const commentsAreReadOnly = () => getConfig.value?.readOnly === true;
 // Reply pill → expanded editor toggle
 const isReplying = ref(false);
 const isSubmittingReply = ref(false);
+const isSubmittingNewComment = ref(false);
 const startReply = () => {
   if (commentsAreReadOnly()) return readOnlyMutationOutcome();
   if (isV2WriteDisabled.value) {
@@ -417,6 +433,7 @@ watch(isDialogActive, (active) => {
   if (!active) {
     if (isReplying.value || isEditingCommentInThisThread()) {
       currentCommentText.value = '';
+      currentCommentMentions.value = [];
       editingCommentId.value = null;
     }
     textExpanded.value = false;
@@ -718,10 +735,9 @@ const handleAddComment = async () => {
     return { ok: false, reason: v2WriteCapability.value?.reason ?? 'v2-write-unavailable' };
   }
 
-  // TCS Phase 0 / 004 §4.1: in v2 mode route an existing-thread reply through
-  // the store-owned `replyCommentV2` helper. The decision is scoped to this
-  // dialog; an unrelated pending new-comment row must not divert the reply
-  // into the local tracked-change fallback.
+  // AIDEV-NOTE: A tracked-change review row is not a comment entity. Address
+  // it by the canonical change id and let the store create the first anchored
+  // root only when the Document API confirms that no thread exists yet.
   if (isV2Mode.value && v2CommentsAdapter.value && !isPendingNewComment.value) {
     if (isSubmittingReply.value) {
       return { ok: false, reason: 'reply-submit-in-flight' };
@@ -730,10 +746,13 @@ const handleAddComment = async () => {
     isSubmittingReply.value = true;
     try {
       const parentCommentId = getV2ExistingReplyParentId(props.comment);
+      const trackedChangeTarget = getV2TrackedChangeCommentTarget(props.comment);
       const outcome = await commentsStore.replyCommentV2({
         superdoc: proxy.$superdoc,
         parentCommentId,
         text: currentCommentText.value,
+        ...(currentCommentMentions.value.length ? { mentions: currentCommentMentions.value } : {}),
+        ...(trackedChangeTarget ? { trackedChangeTarget } : {}),
       });
       if (!outcome?.ok) {
         // Plan §4.1: keep reply editor open and typed text intact for retry.
@@ -742,11 +761,22 @@ const handleAddComment = async () => {
       }
       isReplying.value = false;
       currentCommentText.value = '';
+      currentCommentMentions.value = [];
       nextTick(() => emit('resize'));
       return outcome;
     } finally {
       isSubmittingReply.value = false;
     }
+  }
+
+  // Scoped to isPendingNewComment: this fallthrough is also reached by the
+  // legacy (non-v2) reply-to-existing-thread path, which has its own
+  // disabled-state handling and must not be silently no-op'd by this flag.
+  if (isPendingNewComment.value) {
+    if (isSubmittingNewComment.value) {
+      return { ok: false, reason: 'comment-submit-in-flight' };
+    }
+    isSubmittingNewComment.value = true;
   }
 
   const options = {
@@ -768,10 +798,18 @@ const handleAddComment = async () => {
   if (!pendingComment.value && currentCommentText.value) {
     comment.setText({ text: currentCommentText.value, suppressUpdate: true });
   }
-  Promise.resolve(addComment({ superdoc: proxy.$superdoc, comment })).finally(() => {
-    isReplying.value = false;
-    nextTick(() => emit('resize'));
-  });
+  // Deferred into .then() so a synchronous throw from addComment (e.g. the
+  // legacy/v1 branch) rejects instead of escaping before the flag resets.
+  Promise.resolve()
+    .then(() => addComment({ superdoc: proxy.$superdoc, comment }))
+    .catch((err) => {
+      console.error('[SuperDoc] addComment failed', err);
+    })
+    .finally(() => {
+      isSubmittingNewComment.value = false;
+      isReplying.value = false;
+      nextTick(() => emit('resize'));
+    });
 };
 
 const isV2Mode = computed(() => proxy.$superdoc?.activeEditor?.editorVersion === 2);
@@ -1096,6 +1134,7 @@ const handleOverflowSelect = (value, comment) => {
   switch (value) {
     case 'edit':
       currentCommentText.value = comment?.commentText?.value ?? comment?.commentText ?? '';
+      currentCommentMentions.value = Array.isArray(comment?.mentions) ? [...comment.mentions] : [];
       activeComment.value = props.comment.commentId;
       if (props.floatingInstanceId) {
         setActiveFloatingCommentInstance(props.floatingInstanceId);
@@ -1171,7 +1210,7 @@ const usersFiltered = computed(() => {
   const users = proxy.$superdoc.users;
 
   if (props.comment.isInternal === true) {
-    return users.filter((user) => user.access?.role === 'internal');
+    return users.filter((user) => user.access === 'internal' || user.access?.role === 'internal');
   }
 
   return users;
@@ -1185,7 +1224,7 @@ onMounted(() => {
   // Auto-focus the input for pending new comments
   if (isPendingNewComment.value) {
     nextTick(() => {
-      commentInput.value?.focus?.();
+      commentInput.value?.focus?.({ preventScroll: true });
     });
   }
 
@@ -1203,7 +1242,7 @@ watch(
   (isVisible) => {
     if (!isVisible) return;
     nextTick(() => {
-      commentInput.value?.focus?.();
+      commentInput.value?.focus?.(isPendingNewComment.value ? { preventScroll: true } : undefined);
     });
   },
   { immediate: true },
@@ -1291,8 +1330,8 @@ watch(isV2WriteDisabled, (isDisabled) => {
         <button
           class="sd-button primary reply-btn-primary"
           @click.stop.prevent="handleAddComment"
-          :disabled="!hasTextContent"
-          :class="{ 'sd-is-disabled': !hasTextContent }"
+          :disabled="!hasTextContent || isSubmittingNewComment"
+          :class="{ 'sd-is-disabled': !hasTextContent || isSubmittingNewComment }"
         >
           Comment
         </button>
@@ -1447,7 +1486,7 @@ watch(isV2WriteDisabled, (isDisabled) => {
             <div class="reply-input-wrapper">
               <CommentInput
                 :ref="setEditCommentInputRef(comment.commentId)"
-                :users="usersFiltered"
+                :users="[]"
                 :config="getConfig"
                 :include-header="false"
                 :comment="comment"
@@ -1766,7 +1805,7 @@ watch(isV2WriteDisabled, (isDisabled) => {
   background: var(--sd-ui-comments-input-bg, #ffffff);
   margin-top: 4px;
   max-height: 150px;
-  overflow-y: auto;
+  overflow: visible;
 }
 .new-comment-input-wrapper:focus-within {
   border-color: var(--sd-ui-comments-input-focus-border, #4f7cff);
@@ -1829,7 +1868,7 @@ watch(isV2WriteDisabled, (isDisabled) => {
   padding: 8.5px 10.5px;
   background: var(--sd-ui-comments-input-bg, #ffffff);
   max-height: 150px;
-  overflow-y: auto;
+  overflow: visible;
 }
 .reply-input-wrapper:focus-within {
   border-color: var(--sd-ui-comments-input-focus-border, #4f7cff);

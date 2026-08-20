@@ -2,11 +2,22 @@
 set -euo pipefail
 
 apt_timeout="${APT_COMMAND_TIMEOUT:-10m}"
+apt_mirror_file="${APT_MIRROR_FILE:-/etc/apt/apt-mirrors.txt}"
 export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
 
 apt_opts=(
   -o Acquire::Retries=3
   -o Dpkg::Use-Pty=0
+)
+
+canvas_packages=(
+  build-essential
+  libcairo2-dev
+  libpango1.0-dev
+  libjpeg-dev
+  libgif-dev
+  librsvg2-dev
+  libpixman-1-dev
 )
 
 if [ -n "${APT_ARCHIVE_CACHE_DIR:-}" ]; then
@@ -47,12 +58,39 @@ run_apt() {
   exit "${status}"
 }
 
+stabilize_github_apt_mirrors() {
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ ! -f "${apt_mirror_file}" ]; then
+    return 0
+  fi
+  if ! grep -qF 'azure.archive.ubuntu.com' "${apt_mirror_file}"; then
+    return 0
+  fi
+  if ! grep -Eq 'https?://(archive|security)\.ubuntu\.com/ubuntu/' "${apt_mirror_file}"; then
+    echo "::warning::Azure apt mirror is configured without an official Ubuntu fallback; leaving it unchanged."
+    return 0
+  fi
+
+  local filtered_mirrors
+  filtered_mirrors="$(mktemp)"
+  awk '!/azure\.archive\.ubuntu\.com/' "${apt_mirror_file}" > "${filtered_mirrors}"
+  sudo cp "${filtered_mirrors}" "${apt_mirror_file}"
+  rm -f "${filtered_mirrors}"
+  echo "::notice::Bypassing the unhealthy Azure apt mirror; using the configured official Ubuntu fallbacks."
+}
+
+missing_packages=()
+for package in "${canvas_packages[@]}"; do
+  if ! dpkg-query --show --showformat='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]} == 0)); then
+  echo "Canvas system dependencies are already installed."
+  exit 0
+fi
+
+stabilize_github_apt_mirrors
 run_apt "apt-get update" update
 run_apt "apt-get install canvas system dependencies" install -y --no-install-recommends \
-  build-essential \
-  libcairo2-dev \
-  libpango1.0-dev \
-  libjpeg-dev \
-  libgif-dev \
-  librsvg2-dev \
-  libpixman-1-dev
+  "${missing_packages[@]}"

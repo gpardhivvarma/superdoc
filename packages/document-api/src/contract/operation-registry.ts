@@ -9,7 +9,7 @@ import type { OperationId } from './types.js';
 import type { NodeAddress } from '../types/index.js';
 import type { SDNodeResult, SDFindInput, SDFindResult, SDGetInput } from '../types/sd-envelope.js';
 import type { TextMutationReceipt, Receipt } from '../types/receipt.js';
-import type { SDMutationReceipt, SDMarkdownToFragmentResult } from '../types/sd-contract.js';
+import type { SDHtmlToFragmentResult, SDMutationReceipt, SDMarkdownToFragmentResult } from '../types/sd-contract.js';
 import type { DocumentInfo } from '../types/info.types.js';
 import type { SDDocument } from '../types/fragment.js';
 import type {
@@ -36,7 +36,9 @@ import type { GetNodeByIdInput } from '../get-node/get-node.js';
 import type { GetTextInput } from '../get-text/get-text.js';
 import type { GetMarkdownInput } from '../get-markdown/get-markdown.js';
 import type { GetHtmlInput } from '../get-html/get-html.js';
+import type { ProjectHtmlInput, ProjectMarkdownInput, SDContentProjectionResult } from '../types/content-projection.js';
 import type { MarkdownToFragmentInput } from '../markdown-to-fragment/markdown-to-fragment.js';
+import type { HtmlToFragmentInput } from '../html-to-fragment/html-to-fragment.js';
 import type { InfoInput } from '../info/info.js';
 import type { ExtractInput } from '../extract/extract.js';
 import type { ExtractResult } from '../types/extract.types.js';
@@ -44,7 +46,7 @@ import type { ClearContentInput } from '../clear-content/clear-content.js';
 import type { InsertInput } from '../insert/insert.js';
 import type { ReplaceInput } from '../replace/replace.js';
 import type { DeleteInput } from '../delete/delete.js';
-import type { MutationOptions, RevisionGuardOptions } from '../write/write.js';
+import type { MutationOptions, RevisionGuardOptions, RichContentMutationOptions } from '../write/write.js';
 import type { FormatInlineAliasInput, FormatRangeInput, StyleApplyInput } from '../format/format.js';
 import type { InlineRunPatchKey } from '../format/inline-run-patch.js';
 import type {
@@ -66,6 +68,10 @@ import type { CommentInfo, CommentsListQuery, CommentsListResult } from '../comm
 import type { TrackChangesListInput, TrackChangesGetInput, ReviewDecideInput } from '../track-changes/track-changes.js';
 import type { TrackChangeInfo, TrackChangesListResult } from '../types/track-changes.types.js';
 import type { DocumentApiCapabilities } from '../capabilities/capabilities.js';
+import type {
+  SDHtmlMarkdownSupportCheckInput,
+  SDHtmlMarkdownSupportCheckResult,
+} from '../capabilities/html-markdown-support.js';
 import type { HistoryState, HistoryActionResult } from '../history/history.types.js';
 import type {
   DiffSnapshot,
@@ -589,13 +595,24 @@ export interface OperationRegistry extends FormatInlineAliasOperationRegistry {
   getText: { input: GetTextInput; options: never; output: string };
   getMarkdown: { input: GetMarkdownInput; options: never; output: string };
   getHtml: { input: GetHtmlInput; options: never; output: string };
+  projectMarkdown: {
+    input: ProjectMarkdownInput;
+    options: never;
+    output: Promise<SDContentProjectionResult<'markdown'>>;
+  };
+  projectHtml: {
+    input: ProjectHtmlInput;
+    options: never;
+    output: Promise<SDContentProjectionResult<'html'>>;
+  };
   markdownToFragment: { input: MarkdownToFragmentInput; options: never; output: SDMarkdownToFragmentResult };
+  htmlToFragment: { input: HtmlToFragmentInput; options: never; output: SDHtmlToFragmentResult };
   info: { input: InfoInput; options: never; output: DocumentInfo };
   extract: { input: ExtractInput; options: never; output: ExtractResult };
   // --- Singleton mutations ---
   clearContent: { input: ClearContentInput; options: RevisionGuardOptions; output: Receipt };
-  insert: { input: InsertInput; options: MutationOptions; output: SDMutationReceipt };
-  replace: { input: ReplaceInput; options: MutationOptions; output: SDMutationReceipt };
+  insert: { input: InsertInput; options: RichContentMutationOptions; output: SDMutationReceipt };
+  replace: { input: ReplaceInput; options: RichContentMutationOptions; output: SDMutationReceipt };
   delete: { input: DeleteInput; options: MutationOptions; output: TextMutationReceipt };
   formatRange: { input: FormatRangeInput; options: MutationOptions; output: TextMutationReceipt };
   // --- blocks.* ---
@@ -942,6 +959,11 @@ export interface OperationRegistry extends FormatInlineAliasOperationRegistry {
   'plan.execute': { input: PlanExecuteInput; options: never; output: PlanExecuteResult };
   // --- capabilities ---
   'capabilities.get': { input: undefined; options: never; output: DocumentApiCapabilities };
+  'capabilities.check': {
+    input: SDHtmlMarkdownSupportCheckInput;
+    options: never;
+    output: Promise<SDHtmlMarkdownSupportCheckResult>;
+  };
   // --- history.* ---
   'history.get': { input: undefined; options: never; output: HistoryState };
   'history.undo': { input: undefined; options: never; output: HistoryActionResult };

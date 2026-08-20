@@ -84,7 +84,7 @@ export function computeFixedTableColumnWidths(input: WorkingTableGridInput): Fix
   }
 
   for (const row of input.rows.slice(1)) {
-    applySubsequentRowRequests(columnWidths, row, defaultAddedColumnWidth);
+    applySubsequentRowRequests(columnWidths, row, defaultAddedColumnWidth, preferredTableWidth);
 
     if (preferredTableWidth != null) {
       shrinkToPreferredTableWidth(columnWidths, preferredTableWidth);
@@ -154,15 +154,16 @@ function applySubsequentRowRequests(
   columnWidths: number[],
   row: WorkingTableRowInput,
   defaultAddedColumnWidth: number,
+  preferredTableWidth: number | undefined,
 ): void {
   ensureGridWidth(columnWidths, row.logicalColumnCount, defaultAddedColumnWidth);
 
   for (const skippedColumn of row.skippedColumns) {
-    growSkippedColumnWidth(columnWidths, skippedColumn, defaultAddedColumnWidth);
+    growSkippedColumnWidth(columnWidths, skippedColumn, defaultAddedColumnWidth, preferredTableWidth);
   }
 
   for (const cell of row.cells) {
-    growCellSpanWidth(columnWidths, cell, defaultAddedColumnWidth);
+    growCellSpanWidth(columnWidths, cell, defaultAddedColumnWidth, preferredTableWidth);
   }
 }
 
@@ -184,17 +185,31 @@ function setSkippedColumnWidth(
 
 /**
  * Grow one skipped logical column's width for a subsequent-row conflict.
+ *
+ * Later-row `wBefore` / `wAfter` values that restate the authored table or grid
+ * total are capped the same way as full-grid `tcW` restatements (SD-3880).
  */
 function growSkippedColumnWidth(
   columnWidths: number[],
   skippedColumn: WorkingTableSkippedColumnInput,
   defaultAddedColumnWidth: number,
+  preferredTableWidth: number | undefined,
 ): void {
   const preferredWidth = sanitizeOptionalWidth(skippedColumn.preferredWidth);
   if (preferredWidth == null) return;
 
   ensureGridWidth(columnWidths, skippedColumn.columnIndex + 1, defaultAddedColumnWidth);
-  columnWidths[skippedColumn.columnIndex] = Math.max(columnWidths[skippedColumn.columnIndex] ?? 0, preferredWidth);
+  const effectivePreferredWidth = capRestatedTableWidthRequest(
+    preferredWidth,
+    columnWidths,
+    skippedColumn.columnIndex,
+    1,
+    preferredTableWidth,
+  );
+  columnWidths[skippedColumn.columnIndex] = Math.max(
+    columnWidths[skippedColumn.columnIndex] ?? 0,
+    effectivePreferredWidth,
+  );
 }
 
 /**
@@ -225,8 +240,19 @@ function setCellSpanWidth(columnWidths: number[], cell: WorkingTableCellInput, d
  *
  * Later rows only reconcile by maxima, so a subsequent-row request can enlarge
  * the span but cannot reduce it below the current resolved width.
+ *
+ * Requests that restate the authored table or grid total are capped at the
+ * remaining preferred-table budget for this span. Otherwise a later merged
+ * row whose `tcW` copies that total — including remaining-grid spans after
+ * `gridBefore` — inflates the last column and the following proportional
+ * shrink skews the entire grid (SD-3880).
  */
-function growCellSpanWidth(columnWidths: number[], cell: WorkingTableCellInput, defaultAddedColumnWidth: number): void {
+function growCellSpanWidth(
+  columnWidths: number[],
+  cell: WorkingTableCellInput,
+  defaultAddedColumnWidth: number,
+  preferredTableWidth: number | undefined,
+): void {
   const span = Math.max(1, sanitizeColumnCount(cell.span));
   const preferredWidth = sanitizeOptionalWidth(cell.preferredWidth);
   const endColumn = cell.startColumn + span;
@@ -235,12 +261,42 @@ function growCellSpanWidth(columnWidths: number[], cell: WorkingTableCellInput, 
 
   if (preferredWidth == null) return;
 
+  const effectivePreferredWidth = capRestatedTableWidthRequest(
+    preferredWidth,
+    columnWidths,
+    cell.startColumn,
+    span,
+    preferredTableWidth,
+  );
+
   const currentSpanWidth = sumSpan(columnWidths, cell.startColumn, span);
-  const deficit = preferredWidth - currentSpanWidth;
+  const deficit = effectivePreferredWidth - currentSpanWidth;
   if (deficit <= 0) return;
 
   const lastColumnIndex = endColumn - 1;
   columnWidths[lastColumnIndex] = Math.max(0, (columnWidths[lastColumnIndex] ?? 0) + deficit);
+}
+
+/**
+ * Cap a later-row preferred-width request that restates the full table width.
+ *
+ * After the first-row shrink, remaining width for any span already equals the
+ * current span total. Capping only when the request is at least the preferred
+ * table width preserves legitimate later-row growth of smaller spans.
+ */
+function capRestatedTableWidthRequest(
+  preferredWidth: number,
+  columnWidths: number[],
+  startColumn: number,
+  span: number,
+  preferredTableWidth: number | undefined,
+): number {
+  if (preferredTableWidth == null || preferredWidth < preferredTableWidth) {
+    return preferredWidth;
+  }
+
+  const widthOutsideSpan = sumWidths(columnWidths) - sumSpan(columnWidths, startColumn, span);
+  return Math.min(preferredWidth, Math.max(0, preferredTableWidth - widthOutsideSpan));
 }
 
 /**

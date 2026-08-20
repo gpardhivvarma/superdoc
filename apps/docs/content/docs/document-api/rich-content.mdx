@@ -1,0 +1,76 @@
+---
+title: Insert HTML and Markdown
+navTitle: Rich content
+description: Convert, inspect, and apply bounded HTML or Markdown content to an open DOCX.
+---
+
+The Document API accepts HTML and Markdown as structured input. You can inspect the canonical fragment first, or pass the source directly to `insert()` or `replace()`.
+
+HTML and Markdown are not Word package fragments. SuperDoc preserves the supported structure listed below, normalizes representation details, and reports anything it drops or downgrades.
+
+## Convert before applying
+
+Use `htmlToFragment()` or `markdownToFragment()` when your application needs to inspect diagnostics or reuse the canonical fragment:
+
+<include>../../../snippets/document-api/rich-content.ts</include>
+
+Each result contains:
+
+- `fragment`: the canonical structured content.
+- `lossy`: `true` when conversion normalized, downgraded, or dropped source content.
+- `diagnostics`: ordered, source-located conversion findings.
+
+A warning-bearing result can still be applied. An error means there is no safe rich fragment to apply. Check diagnostic `severity` and `disposition` instead of treating every lossy result as a failure.
+
+## Check an exact workflow before applying
+
+Use `doc.capabilities()` for a cheap synchronous snapshot of general operation availability. Use
+`doc.capabilities.check()` when the answer must account for exact HTML or Markdown, the current target, the requested
+change mode, and the current document revision. A check does not mutate package bytes, history, tracked changes, or the
+public revision.
+
+A supported write that would change the document returns a guard. Pass it to the unchanged rich `insert()` or
+`replace()` request. The write fails closed when the source, format, target, placement, story, nesting policy, mode,
+analysis result, or document revision no longer matches. The guard digest detects accidental reuse; it is not a
+security signature.
+
+The common `outcome` is `preserved`, `preserved-with-warnings`, `simplified`, `rejected`, `no-op`, `invalid-target`, or
+`outdated`. Read the complete conversion diagnostics and final mutation receipt before choosing application-specific
+fallback behavior.
+
+## Insert or replace raw source
+
+Pass `value` with `type: 'html'` or `type: 'markdown'` to convert and apply in one call. Rich insert supports a selection, a block with `before` or `after`, a ref, or no target for append. Rich replace accepts a selection, paragraph or heading block, whole table block, ref, or the explicit `{ kind: 'story', storyType: 'body' }` target.
+
+The body target replaces all main-body blocks in one direct mutation while retaining the destination DOCX package and terminal section properties. It does not replace the DOCX file. Tracked mode is supported for selection and block workflows, but tracked whole-body replacement returns `CAPABILITY_UNSUPPORTED`.
+
+Use `dryRun: true` to resolve and preflight without creating IDs, history, or document changes. Pair a mutation with `expectedRevision` when it depends on an earlier read.
+
+Successful raw-source receipts include the final `outcome` and a `conversion` report. They may also include created entity identities, source-path effects, affected stories, text-range shifts, and a transaction ID. Check `success` before using any success-only field.
+
+## Supported inbound constructs
+
+| Source construct                                                                                          | Result                                                                  |
+| --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Paragraphs, headings, bold, italic, underline, strike, hard breaks                                        | Preserved as canonical blocks and runs                                  |
+| Ordered and unordered lists, including bounded nesting and ordered starts                                 | Preserved with canonical list levels                                    |
+| Tables with a complete leading header row and column spans                                                | Preserved; explicit widths and broad table styling are not              |
+| Safe `http`, `https`, and `mailto` links                                                                  | Preserved as external hyperlinks                                        |
+| Horizontal rules                                                                                          | Preserved as durable horizontal-rule blocks                             |
+| Safe bounded color, font, spacing, indentation, cell shading, and padding                                 | Normalized to typed canonical properties                                |
+| Code, block quotes, task markers, and unsupported inline forms                                            | Downgraded or dropped with diagnostics                                  |
+| Scripts, event handlers, unsafe URLs, raw images, nested tables, row spans, malformed or over-limit input | Sanitized with warnings when safe structure remains; otherwise rejected |
+
+The limits are deliberate. Arbitrary CSS, embedded active content, and full DOCX package fidelity are outside the HTML/Markdown contract.
+
+## Projection and persistence
+
+Direct changes are immediately part of the document. This inbound API creates review markup that can be accepted or
+rejected through the tracked-changes API. Detailed outbound HTML and Markdown reads can then project `redline`, `final`,
+or `original` views. Save and reopen the DOCX before treating a mutation workflow as complete.
+
+Standalone outbound conversion of an `SDFragment` to HTML or Markdown is not part of this inbound API. Document reads
+have a separate [HTML and Markdown projection contract](/document-api/output-projections), including compact string
+getters and detailed reads with review, fidelity, and provenance metadata.
+
+For target discovery, start with [query content](/document-api/query-content). For failure handling, see [receipts and errors](/document-api/receipts-and-errors). The generated [HTML conversion reference](/document-api/reference/html-to-fragment), [insert reference](/document-api/reference/insert), and [replace reference](/document-api/reference/replace) list the complete shapes.

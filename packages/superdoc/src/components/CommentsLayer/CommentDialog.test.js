@@ -920,13 +920,91 @@ describe('CommentDialog', () => {
     }
   });
 
-  it('routes v2 tracked-change replies through the sidecar parent when an unrelated pending comment exists', async () => {
+  it('coalesces rapid new-comment clicks while the first submission is pending', async () => {
+    superdocStub.activeEditor.editorVersion = 2;
+    superdocStub.activeEditor.v2Comments = {
+      getCapabilityState: vi.fn(() => ({ canWrite: true })),
+    };
+    const pendingDraft = useComment({
+      commentId: 'pending-new-comment-delayed',
+      fileId: 'doc-1',
+      commentText: '',
+    });
+    commentsStore.pendingComment = pendingDraft;
+    commentsStore.currentCommentText = '<p>one delayed new comment</p>';
+
+    let settleAdd;
+    const pendingAdd = new Promise((resolve) => {
+      settleAdd = resolve;
+    });
+    const addComment = vi.spyOn(commentsStore, 'addComment').mockReturnValue(pendingAdd);
+
+    const wrapper = mountDialog(pendingDraft);
+    try {
+      const submitButton = wrapper.find('button.reply-btn-primary');
+
+      await submitButton.trigger('click');
+      await submitButton.trigger('click');
+      await submitButton.trigger('click');
+
+      expect(addComment).toHaveBeenCalledTimes(1);
+      expect(submitButton.attributes('disabled')).toBeDefined();
+
+      settleAdd({ ok: true });
+      await flushPromises();
+      expect(submitButton.attributes('disabled')).toBeUndefined();
+    } finally {
+      settleAdd?.({ ok: true });
+      wrapper.unmount();
+    }
+  });
+
+  it('clears the new-comment submitting flag even when addComment throws synchronously', async () => {
+    superdocStub.activeEditor.editorVersion = 2;
+    superdocStub.activeEditor.v2Comments = {
+      getCapabilityState: vi.fn(() => ({ canWrite: true })),
+    };
+    const pendingDraft = useComment({
+      commentId: 'pending-new-comment-throws',
+      fileId: 'doc-1',
+      commentText: '',
+    });
+    commentsStore.pendingComment = pendingDraft;
+    commentsStore.currentCommentText = '<p>a new comment that fails</p>';
+
+    const addComment = vi.spyOn(commentsStore, 'addComment').mockImplementation(() => {
+      throw new Error('boom');
+    });
+
+    const wrapper = mountDialog(pendingDraft);
+    try {
+      const submitButton = wrapper.find('button.reply-btn-primary');
+
+      await submitButton.trigger('click');
+      await flushPromises();
+
+      expect(addComment).toHaveBeenCalledTimes(1);
+      expect(submitButton.attributes('disabled')).toBeUndefined();
+
+      await submitButton.trigger('click');
+      await flushPromises();
+      expect(addComment).toHaveBeenCalledTimes(2);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('creates a v2 comment anchored to the tracked change when an unrelated pending comment exists', async () => {
     superdocStub.activeEditor.editorVersion = 2;
     superdocStub.activeEditor.v2Comments = {};
+    const trackedChangeCanonicalId = 'tc|main%3A%2Fword%2Fdocument.xml|del|coalesced|0';
+    const trackedChangeStory = { kind: 'story', storyType: 'body' };
     const trackedChange = useComment({
       commentId:
         'tc|main%3A%2Fword%2Fdocument.xml|del|sd%3Amain%3A%2Fword%2Fdocument.xml%7Cdel%7CSuperdoc%20User%7C2024-12-20T04%3A20%3A00Z%7C0%7CwId%3A0',
       importedId: '0',
+      trackedChangeCanonicalId,
+      trackedChangeStory,
       fileId: 'doc-1',
       commentText: '',
       trackedChange: true,
@@ -942,6 +1020,9 @@ describe('CommentDialog', () => {
       commentText: '',
     });
     commentsStore.currentCommentText = '<p>tracked-change sidecar reply proof</p>';
+    commentsStore.currentCommentMentions = [
+      { id: 'reviewer-1', name: 'Internal Reviewer', email: 'reviewer@example.com' },
+    ];
     const replyCommentV2 = vi.spyOn(commentsStore, 'replyCommentV2').mockResolvedValue({ ok: true });
     const addComment = vi.spyOn(commentsStore, 'addComment').mockResolvedValue({ ok: true });
 
@@ -954,8 +1035,14 @@ describe('CommentDialog', () => {
       expect(replyCommentV2).toHaveBeenCalledTimes(1);
       expect(replyCommentV2).toHaveBeenCalledWith({
         superdoc: superdocStub,
-        parentCommentId: '0',
+        parentCommentId: trackedChangeCanonicalId,
         text: '<p>tracked-change sidecar reply proof</p>',
+        mentions: [{ id: 'reviewer-1', name: 'Internal Reviewer', email: 'reviewer@example.com' }],
+        trackedChangeTarget: {
+          kind: 'trackedChange',
+          trackedChangeId: trackedChangeCanonicalId,
+          story: trackedChangeStory,
+        },
       });
       expect(addComment).not.toHaveBeenCalled();
     } finally {

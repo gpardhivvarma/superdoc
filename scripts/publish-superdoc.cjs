@@ -1,56 +1,40 @@
 #!/usr/bin/env node
+
 const { execFileSync } = require('node:child_process');
-const {
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync
-} = require('node:fs');
-const os = require('node:os');
+const { existsSync, readFileSync } = require('node:fs');
 const path = require('node:path');
 
 const rootDir = path.resolve(__dirname, '..');
 const superdocDir = path.join(rootDir, 'packages', 'superdoc');
 const packageJsonPath = path.join(superdocDir, 'package.json');
+const sealedTarballPath = path.join(superdocDir, 'superdoc.tgz');
+const auditScript = path.join(rootDir, 'scripts', 'audit-publish-artifact.mjs');
 const defaultRegistry = process.env.NPM_CONFIG_REGISTRY || 'https://registry.npmjs.org';
 
 const run = (command, args, cwd) => {
   execFileSync(command, args, { stdio: 'inherit', cwd });
 };
 
-const runCapture = (command, args, cwd) => {
-  return execFileSync(command, args, { cwd, encoding: 'utf8' }).trim();
-};
-
 const isVersionLookupNotFoundError = (error) => {
-  const details = [error?.stderr, error?.stdout, error?.message]
-    .filter(Boolean)
-    .join('\n');
+  const details = [error?.stderr, error?.stdout, error?.message].filter(Boolean).join('\n');
   return /E404|Not found|not found|No match found/i.test(details);
 };
 
-const isVersionPublished = (packageName, version) => {
+const isVersionPublished = (packageName, version, registry = defaultRegistry) => {
   try {
-    execFileSync(
-      'pnpm',
-      ['view', `${packageName}@${version}`, 'version', '--registry', defaultRegistry],
-      { stdio: 'pipe' }
-    );
+    execFileSync('pnpm', ['view', `${packageName}@${version}`, 'version', '--registry', registry], {
+      stdio: 'pipe',
+    });
     return true;
   } catch (error) {
-    if (isVersionLookupNotFoundError(error)) {
-      return false;
-    }
+    if (isVersionLookupNotFoundError(error)) return false;
     throw error;
   }
 };
 
 const ensurePackageJson = () => {
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-  if (packageJson.name !== 'superdoc') {
-    throw new Error('Unexpected package name for packages/superdoc');
-  }
+  if (packageJson.name !== 'superdoc') throw new Error('Unexpected package name for packages/superdoc');
   return packageJson;
 };
 
@@ -59,122 +43,109 @@ const assertPublicPublisherVersionAllowed = (version) => {
   if (!match) throw new Error(`Invalid SuperDoc package version: ${version}`);
   if (Number(match[1]) >= 2) {
     throw new Error(
-      `SuperDoc ${version} is not eligible for this publisher; ` +
-        'the public publisher is restricted to 1.x releases.'
+      `SuperDoc ${version} is not eligible for this publisher; `
+        + 'the public publisher is restricted to 1.x releases.',
     );
   }
 };
 
-const ensureDist = () => {
-  const distPath = path.join(superdocDir, 'dist');
-  if (!existsSync(distPath)) {
-    throw new Error('Missing dist build for superdoc');
+function assertSealedTarball() {
+  if (!existsSync(sealedTarballPath)) {
+    throw new Error(`Missing sealed SuperDoc tarball: ${sealedTarballPath}`);
   }
-};
+  run(process.execPath, [auditScript, sealedTarballPath, '--label', 'superdoc-release-tarball', '--superdoc'], rootDir);
+}
 
-const publishScopedMirror = (packageJson, distTag, logger = console) => {
-  const scopedName = '@harbour-enterprises/superdoc';
+function createSealedTarball({ build, logger }) {
+  logger.log(build ? 'Building and sealed-packing SuperDoc...' : 'Sealed-packing existing verified SuperDoc output...');
+  if (build) run('pnpm', ['run', 'pack:es'], rootDir);
+  else run('pnpm', ['--prefix', 'packages/superdoc', 'run', 'pack:sealed'], rootDir);
+  assertSealedTarball();
+  return sealedTarballPath;
+}
 
-  if (isVersionPublished(scopedName, packageJson.version)) {
-    logger.log(`${scopedName}@${packageJson.version} already published, ensuring dist-tag "${distTag}" and skipping.`);
-    run('pnpm', ['dist-tag', 'add', `${scopedName}@${packageJson.version}`, distTag, '--registry', defaultRegistry], rootDir);
-    return;
-  }
+function buildPublishArgs(tarballPath, { distTag, registry, access = 'public' }) {
+  if (!tarballPath.endsWith('.tgz')) throw new Error(`publish target must be an audited tarball: ${tarballPath}`);
+  return [
+    'publish',
+    tarballPath,
+    '--access',
+    access,
+    '--tag',
+    distTag,
+    '--no-git-checks',
+    '--registry',
+    registry,
+  ];
+}
 
-  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'superdoc-publish-'));
-  try {
-    // Pack from workspace - pnpm resolves catalog: and workspace: refs automatically
-    logger.log('Packing superdoc (pnpm resolves workspace/catalog refs)...');
-    const packOutput = runCapture('pnpm', ['pack', '--pack-destination', tempDir], superdocDir);
-    // pnpm pack outputs multiple lines; extract the .tgz filename
-    const tarballLine = packOutput.split('\n').find(line => line.endsWith('.tgz'));
-    if (!tarballLine) {
-      throw new Error(`Could not find .tgz in pnpm pack output:\n${packOutput}`);
-    }
-    // tarballLine may be full path or just filename
-    const tarballPath = tarballLine.startsWith('/') ? tarballLine : path.join(tempDir, tarballLine);
+function ensureDistTag(packageName, version, distTag, registry) {
+  run('pnpm', ['dist-tag', 'add', `${packageName}@${version}`, distTag, '--registry', registry], rootDir);
+}
 
-    // Extract the tarball
-    run('tar', ['-xzf', tarballPath, '-C', tempDir], tempDir);
-    rmSync(tarballPath);
-
-    // Modify package.json to use scoped name
-    const extractedDir = path.join(tempDir, 'package');
-    const extractedPkgPath = path.join(extractedDir, 'package.json');
-    const extractedPkg = JSON.parse(readFileSync(extractedPkgPath, 'utf8'));
-    extractedPkg.name = scopedName;
-    extractedPkg.publishConfig = {
-      ...(extractedPkg.publishConfig || {}),
-      access: 'public'
-    };
-    writeFileSync(extractedPkgPath, `${JSON.stringify(extractedPkg, null, 2)}\n`);
-
-    logger.log(`Publishing @harbour-enterprises/superdoc with dist-tag "${distTag}"...`);
-    run('pnpm', ['publish', '--access', 'public', '--tag', distTag, '--no-git-checks'], extractedDir);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-};
-
-const publishPackages = ({
+function publishPackages({
   distTag = 'latest',
   publishUnscoped = true,
   build = true,
-  logger = console
-} = {}) => {
+  logger = console,
+  registry = defaultRegistry,
+} = {}) {
   const packageJson = ensurePackageJson();
   assertPublicPublisherVersionAllowed(packageJson.version);
-  if (build) {
-    logger.log('Building packages...');
-    run('pnpm', ['run', 'build'], rootDir);
-  }
-
-  ensureDist();
+  const baseTarball = createSealedTarball({ build, logger });
 
   if (publishUnscoped) {
-    if (isVersionPublished(packageJson.name, packageJson.version)) {
+    if (isVersionPublished(packageJson.name, packageJson.version, registry)) {
       logger.log(`superdoc@${packageJson.version} already published, ensuring dist-tag "${distTag}" and skipping.`);
-      run('pnpm', ['dist-tag', 'add', `${packageJson.name}@${packageJson.version}`, distTag, '--registry', defaultRegistry], rootDir);
+      ensureDistTag(packageJson.name, packageJson.version, distTag, registry);
     } else {
-      logger.log(`Publishing superdoc with dist-tag "${distTag}"...`);
-      run('pnpm', ['publish', '--access', 'public', '--tag', distTag, '--no-git-checks'], superdocDir);
+      logger.log(`Publishing audited ${path.basename(baseTarball)} with dist-tag "${distTag}"...`);
+      run('pnpm', buildPublishArgs(baseTarball, { distTag, registry }), rootDir);
     }
   }
+}
 
-  publishScopedMirror(packageJson, distTag, logger);
-};
+function publishFromSemanticRelease(context, publish = publishPackages) {
+  const { nextRelease, logger = console } = context;
+  return publish({
+    distTag: (nextRelease && nextRelease.channel) || 'latest',
+    publishUnscoped: true,
+    // semantic-release-pnpm stamps the release version during prepare. Build
+    // after that mutation so the producer receipt, packed manifest, and bundle
+    // all describe the version that is actually published.
+    build: true,
+    logger,
+  });
+}
 
 const parseArgs = (argv) => {
   let distTag;
+  let registry;
   let skipUnscoped = false;
   let skipBuild = false;
-
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--dist-tag') {
-      distTag = argv[index + 1];
+    if (arg === '--dist-tag' || arg === '--registry') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${arg} requires a value`);
+      if (arg === '--dist-tag') distTag = value;
+      else registry = value;
       index += 1;
-    } else if (arg === '--skip-unscoped') {
-      skipUnscoped = true;
-    } else if (arg === '--skip-build') {
-      skipBuild = true;
-    }
+    } else if (arg === '--skip-unscoped') skipUnscoped = true;
+    else if (arg === '--skip-build') skipBuild = true;
+    else throw new Error(`Unknown argument: ${arg}`);
   }
-
-  const envTag = process.env.RELEASE_DIST_TAG;
-  const resolvedTag = distTag || envTag || 'latest';
-
   return {
-    distTag: resolvedTag,
+    distTag: distTag || process.env.RELEASE_DIST_TAG || 'latest',
+    registry: registry || defaultRegistry,
     publishUnscoped: !skipUnscoped && process.env.SKIP_UNSCOPED_PUBLISH !== 'true',
-    build: !skipBuild && process.env.SKIP_BUILD !== 'true'
+    build: !skipBuild && process.env.SKIP_BUILD !== 'true',
   };
 };
 
 if (require.main === module) {
   try {
-    const options = parseArgs(process.argv.slice(2));
-    publishPackages(options);
+    publishPackages(parseArgs(process.argv.slice(2)));
   } catch (error) {
     console.error(error.message || error);
     process.exit(1);
@@ -183,16 +154,8 @@ if (require.main === module) {
 
 module.exports = {
   assertPublicPublisherVersionAllowed,
-  publish: async (pluginConfig, context) => {
-    const { nextRelease, logger = console } = context;
-    const distTag = (nextRelease && nextRelease.channel) || 'latest';
-
-    publishPackages({
-      distTag,
-      publishUnscoped: true,
-      build: true,
-      logger
-    });
-  },
-  publishPackages
+  buildPublishArgs,
+  publish: async (pluginConfig, context) => publishFromSemanticRelease(context),
+  publishFromSemanticRelease,
+  publishPackages,
 };
