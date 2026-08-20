@@ -126,6 +126,47 @@ production build: **fontkit ≈331 KB gzip + pdf-lib**, and **no `.wasm` files a
 all**. (The large chunks in the build are SuperDoc's own engine, which the app
 loads regardless of export.)
 
+## 3b. `mode: 'pixel'` — literal 100% pixel parity with the editor
+
+The default vector mode above matches the editor to the **anti-aliasing floor**
+(~2.5% of pixels differ, all thin grey glyph-edge halos from two different
+rasterizers — verified by localized cluster analysis to contain zero structural
+differences). For callers who need *literal* pixel identity, the exporter now has
+a second strategy:
+
+**`mode: 'pixel'`** embeds each page as an image **rasterized by the browser's
+own engine**, with an invisible selectable-text + clickable-link overlay on top.
+
+- **How:** the page element is deep-cloned with every element's computed style
+  frozen inline, wrapped in an SVG `<foreignObject>`, and drawn to a canvas.
+  Unlike html2canvas (a from-scratch JS re-implementation of CSS painting, which
+  we measured at **7% diff — worse than vector**), a `<foreignObject>` image is
+  painted by the *same Blink layout+paint pipeline* as the live page.
+- **The unlock:** SuperDoc registers the DOCX's embedded fonts via the
+  **FontFace API** under synthetic `__superdoc_embedded_N__<Family>` names —
+  no CSS `@font-face` exists, and an isolated SVG image cannot see
+  `document.fonts`, so text initially fell back to system fonts (4.3% diff).
+  Fix: re-declare the font bytes the exporter already extracts from the DOCX
+  (`fontExtract.ts`) as **data-URI `@font-face` rules inside the SVG**, under
+  both the plain and synthetic family names.
+- **Proof:** extracting the page image back out of the exported PDF
+  (`pdfimages`) and diffing against a device-scale-2 screenshot of the live
+  editor page: **100.00% identical — 0 of 3.4M pixels differ** on the calibre
+  torture-test, and **100.00%** on a Hebrew RTL fixture. (Rasterizing the PDF
+  with poppler shows ~3%, but that is poppler's own image resampling — the
+  same measurement artifact any raster PDF exhibits.)
+- **RTL/Arabic solved:** because the browser performs bidi + cursive shaping and
+  the export photographs the result, pixel mode sidesteps the one fundamental
+  limit of the vector path (§4.6) entirely.
+- **Costs:** ~190 KB/page on dense pages (1.5 MB vs 117 KB for the 8-page
+  sample), ~700 ms/page (5.7 s vs 1.6 s), and text prints as 2× raster — crisp
+  on screen and normal print, but not vector-crisp under extreme zoom. Text
+  selection order over RTL follows the logical-order invisible layer.
+
+**Recommendation:** keep `word` as the default; offer `pixel` for
+pixel-critical documents, and consider auto-selecting it when a document
+contains RTL/complex scripts.
+
 ## 4. Known limitations & gaps
 
 1. **Symbol glyphs.** Handled by **per-glyph font fallback**: when the primary
@@ -151,21 +192,44 @@ loads regardless of export.)
    seen) plus **per-character font fallback** (each glyph drawn with the first
    face that covers it). Validated on a generated Chinese + Japanese document;
    text stays selectable.
-6. **RTL / complex-script shaping — a fundamental limit of this approach.**
-   Arabic and Hebrew fail: pdf-lib does no **bidi reordering** and no **cursive
-   shaping** (Arabic contextual joining), so mixed LTR/RTL lines scramble and
-   Arabic letters don't join. The browser (and SuperDoc) get this right because
-   they run a shaping engine (HarfBuzz). A pure-JS + pdf-lib pipeline cannot —
-   this is precisely the capability a **WASM shaping engine buys you**, and the
-   main scenario where an engine like Typst would be worth its size. For
-   RTL-heavy documents, that trade-off should be revisited.
-6. **Multi-column** sections export at whatever geometry SuperDoc lays out
+6. **RTL / complex scripts — solved in `pixel` mode; mostly solved in vector.**
+   In **vector (`word`) mode**, Hebrew body text renders correctly (each glyph is
+   drawn at its browser-measured visual position, so the browser's bidi is
+   inherited), **bold Hebrew keeps its weight** (weight-aware DejaVu Sans Bold
+   fallback), and **synthesized RTL footer fields** (real page numbers, which
+   have no DOM layout to borrow bidi from) get a level-1 visual reorder. The
+   remaining vector-mode gap is **Arabic cursive shaping** — pdf-lib has no
+   HarfBuzz, so joined forms can't be produced. **`mode: 'pixel'` (§3b) removes
+   the limit entirely**: the browser shapes the text and the export embeds its
+   exact pixels (verified 100.00% on a Hebrew fixture).
+7. **Multi-column** sections export at whatever geometry SuperDoc lays out
    (in testing, content stayed in the first column) — faithful to the editor,
    but SuperDoc's own column balancing is the limit.
-7. **Large documents.** Export scrolls + waits for each page to paint. Measured
-   ~**76 ms/page** (the 8-page sample exports in ~0.6 s), so a 100-page document
-   is ~8 s — acceptable, and the **scrolling is now hidden behind a progress
-   overlay**. A model-based export (§5) would remove the scroll entirely.
+8. **Large documents.** Export scrolls + waits for each page to paint. Measured
+   ~**76 ms/page** in vector mode (the 8-page sample exports in ~0.6 s), so a
+   100-page document is ~8 s — acceptable, and the **scrolling is now hidden
+   behind a progress overlay**. `pixel` mode is ~700 ms/page. A model-based
+   export (§5) would remove the scroll entirely.
+
+### Editor-parity fixes found by pixel-level diffing (Aug 2026)
+
+Localized cluster diffing (192 dpi, connected-component analysis rather than
+whole-page averages) against live editor screenshots surfaced four real,
+systematic exporter bugs — all fixed and re-verified:
+
+1. **Floating images were see-through.** Images that paint in front of text
+   (absolutely-positioned fragments with `z-index ≥ 0`, e.g. Word "in front of
+   text" floats) were drawn *before* the text pass, so overlapping words bled
+   through them. They are now deferred and drawn after the text, matching CSS
+   paint order.
+2. **Bold Hebrew fell back to regular.** The Hebrew-capable fallback face
+   (DejaVu Sans) was loaded weight-blind. A bold DejaVu face is now bundled and
+   the fallback is weight-aware.
+3. **RTL page-number fields drew in logical order** ("עמוד 1 מתוך 2" reversed) —
+   fixed with a level-1 bidi visual reorder for field text.
+4. **Table borders sat ~1.5 CSS px off.** pdf-lib strokes lines centered on the
+   path; CSS paints borders *inside* the box edge. Every border stroke is now
+   inset by half its width — borders land pixel-exact on the editor's.
 
 ## 5. Recommendations
 
@@ -194,8 +258,9 @@ loads regardless of export.)
 
 | Approach | WASM | Size | Selectable text | Clickable links | Faithful to SuperDoc's layout |
 |---|---|---|---|---|---|
-| **pdf-lib from SuperDoc's DOM (this POC)** | No | ~0.9 MB gz | Yes | Yes (URI + GoTo) | **Yes — mirrors the render** |
+| **pdf-lib from SuperDoc's DOM, vector (`word`, this POC)** | No | ~0.9 MB gz | Yes | Yes (URI + GoTo) | **Yes — mirrors the render (to the AA floor)** |
+| **`<foreignObject>` raster sandwich (`pixel`, this POC)** | No | ~0.9 MB gz | Yes (invisible layer) | Yes | **Literally 100.00% — the browser's own pixels** |
 | pdf-lib from `ResolvedLayout` (future) | No | ~0.9 MB gz | Yes | Yes | Yes, headless-capable; must re-derive justification |
-| Rasterize pages → image PDF | No | small | **No** | **No** | Visually yes, but not selectable/clickable |
+| html2canvas raster sandwich | No | +200 KB | Yes (invisible layer) | Yes | **No — re-implements CSS painting; measured 7% diff, worse than vector** |
 | Typst WASM | Yes | ~15 MB+ | Yes | Yes | **No — reflows, no DOCX input** |
 | takumi-pdf | Yes | ~1.5 MB | Yes | via CSS | No — HTML/CSS reflow |

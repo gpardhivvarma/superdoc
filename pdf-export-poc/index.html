@@ -27,6 +27,12 @@
     <div id="toolbar">
       <strong>SuperDoc V2</strong>
       <span>client-side DOCX → PDF (pdf-lib)</span>
+      <span style="font-size:11px;color:#6b7280;border:1px solid #374151;border-radius:4px;padding:2px 6px">build: pixel-parity</span>
+      <label for="mode" style="font-size:13px;color:#9ca3af">mode</label>
+      <select id="mode" style="font:inherit;padding:6px 8px;border-radius:6px;background:#374151;color:#fff;border:0">
+        <option value="word">word — vector (small, crisp)</option>
+        <option value="pixel">pixel — 100% editor parity</option>
+      </select>
       <label for="file" class="filebtn">Open .docx…</label>
       <input id="file" type="file" accept=".docx" hidden />
       <span class="spacer"></span>

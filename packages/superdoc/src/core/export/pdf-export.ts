@@ -78,6 +78,18 @@ export interface PdfExportOptions {
   fieldTemplates?: FieldTemplates;
   /** Progress callback (human-readable status strings). */
   onProgress?: (message: string) => void;
+  /**
+   * Rendering strategy.
+   *   'word' (default) — vector text, word-anchored at the browser's measured
+   *     coordinates. Smallest files, crisp at any zoom, selectable text.
+   *   'pixel' — pixel-exact raster sandwich: each page is rasterized by the
+   *     browser's own engine (SVG <foreignObject>) and embedded as an image,
+   *     with an invisible selectable-text + clickable-link overlay. The page
+   *     image is pixel-identical to the editor's render (including RTL/Arabic
+   *     shaping, which vector mode cannot reproduce). Larger files (~200KB/page
+   *     at 2× density) and text prints as raster.
+   */
+  mode?: 'word' | 'pixel';
 }
 
 function hexToRgb01(hex: string): { r: number; g: number; b: number } {
@@ -151,12 +163,14 @@ interface Face {
 }
 
 const SYMBOL_FALLBACK_FILE = 'Symbol-Regular.ttf';
+const SYMBOL_BOLD_FALLBACK_FILE = 'Symbol-Bold.ttf';
 const CJK_FALLBACK_FILE = 'CJK-Regular.ttf';
 
 class FontBook {
   private cache = new Map<string, Face>();
   private bytes = new Map<string, ArrayBuffer>();
   private symbolFace: Face | null = null;
+  private symbolBoldFace: Face | null = null;
   private cjkFace: Face | null = null;
   private cjkTried = false;
   constructor(
@@ -183,11 +197,17 @@ class FontBook {
       }
     }
     if (this.opts.fontBaseUrl) {
-      try {
-        const r = await fetch(`${this.opts.fontBaseUrl.replace(/\/$/, '')}/${SYMBOL_FALLBACK_FILE}`);
-        if (r.ok) this.bytes.set('symbol', await r.arrayBuffer());
-      } catch {
-        /* no symbol fallback available */
+      const base = this.opts.fontBaseUrl.replace(/\/$/, '');
+      for (const [key, file] of [
+        ['symbol', SYMBOL_FALLBACK_FILE],
+        ['symbol-bold', SYMBOL_BOLD_FALLBACK_FILE],
+      ] as const) {
+        try {
+          const r = await fetch(`${base}/${file}`);
+          if (r.ok) this.bytes.set(key, await r.arrayBuffer());
+        } catch {
+          /* no symbol fallback available */
+        }
       }
     }
     // serif falls back to sans; any missing slot falls back to sans:regular
@@ -229,7 +249,19 @@ class FontBook {
     return this.embed(slot, buf);
   }
 
-  private async symbol(): Promise<Face | null> {
+  /** Symbol / geometric-shape / Hebrew fallback face (DejaVu Sans). Weight-aware:
+   * bold runs (e.g. bold Hebrew, which no bundled Latin face covers) get the bold
+   * fallback so the weight survives, falling back to regular if it's missing. */
+  private async symbol(bold = false): Promise<Face | null> {
+    if (bold) {
+      if (this.symbolBoldFace) return this.symbolBoldFace;
+      const bbuf = this.bytes.get('symbol-bold');
+      if (bbuf) {
+        this.symbolBoldFace = await this.embed('symbol-bold', bbuf);
+        return this.symbolBoldFace;
+      }
+      // fall through to the regular face
+    }
     if (this.symbolFace) return this.symbolFace;
     const buf = this.bytes.get('symbol');
     if (!buf) return null;
@@ -260,7 +292,8 @@ class FontBook {
     const cps = [...token].map((c) => c.codePointAt(0)!);
     const covers = (f: Face | null) => !!f && cps.every((cp) => f.fk.hasGlyphForCodePoint(cp));
     if (covers(primary)) return primary;
-    for (const get of [() => this.symbol(), () => this.cjk()]) {
+    const bold = classifyStyle(weight, style).startsWith('bold');
+    for (const get of [() => this.symbol(bold), () => this.cjk()]) {
       const f = await get();
       if (covers(f)) return f!;
     }
@@ -277,7 +310,8 @@ class FontBook {
     const cached = this.charFaceCache.get(ck);
     if (cached) return cached;
     let chosen = primary;
-    for (const get of [() => this.symbol(), () => this.cjk()]) {
+    const bold = classifyStyle(weight, style).startsWith('bold');
+    for (const get of [() => this.symbol(bold), () => this.cjk()]) {
       const f = await get();
       if (f && f.fk.hasGlyphForCodePoint(cp)) {
         chosen = f;
@@ -502,6 +536,184 @@ async function svgToPngBytes(svgEl: SVGElement, scale = 2): Promise<Uint8Array |
   }
 }
 
+// Unicode ranges for right-to-left scripts (Hebrew, Arabic + presentation forms).
+function isRtlCodePoint(cp: number): boolean {
+  return (
+    (cp >= 0x0590 && cp <= 0x05ff) || // Hebrew
+    (cp >= 0x0600 && cp <= 0x06ff) || // Arabic
+    (cp >= 0x0700 && cp <= 0x074f) || // Syriac
+    (cp >= 0x0750 && cp <= 0x077f) || // Arabic Supplement
+    (cp >= 0xfb1d && cp <= 0xfb4f) || // Hebrew presentation forms
+    (cp >= 0xfb50 && cp <= 0xfdff) || // Arabic presentation forms-A
+    (cp >= 0xfe70 && cp <= 0xfeff) // Arabic presentation forms-B
+  );
+}
+function hasRtl(str: string): boolean {
+  for (const ch of str) if (isRtlCodePoint(ch.codePointAt(0)!)) return true;
+  return false;
+}
+
+/**
+ * Reorder a logical-order string to VISUAL order for an RTL base line, so it can
+ * be drawn left-to-right by pdf-lib and still read correctly. This is a level-1
+ * bidi reorder (sufficient for footer fields like "עמוד 1 מתוך 2"): reverse the
+ * whole line, then restore the internal left-to-right order of embedded
+ * Latin/number runs. Hebrew needs no cursive shaping so simple reversal is
+ * exact; Arabic would additionally need glyph shaping we don't have (use
+ * `mode: 'pixel'` for exact Arabic).
+ */
+function reorderRtlVisual(str: string): string {
+  const isLtr = (ch: string) => {
+    const cp = ch.codePointAt(0)!;
+    return (
+      (cp >= 0x0030 && cp <= 0x0039) || // digits
+      (cp >= 0x0041 && cp <= 0x005a) || // A-Z
+      (cp >= 0x0061 && cp <= 0x007a) || // a-z
+      (cp >= 0x00c0 && cp <= 0x024f) // Latin-1 supplement + extended
+    );
+  };
+  const chars = [...str].reverse();
+  let i = 0;
+  while (i < chars.length) {
+    if (isLtr(chars[i])) {
+      let j = i + 1;
+      // extend across an LTR run, allowing single interior spaces between LTR chars
+      while (j < chars.length && (isLtr(chars[j]) || (chars[j] === ' ' && j + 1 < chars.length && isLtr(chars[j + 1]))))
+        j++;
+      const seg = chars.slice(i, j).reverse();
+      for (let k = 0; k < seg.length; k++) chars[i + k] = seg[k];
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return chars.join('');
+}
+
+/**
+ * Does this element paint ON TOP of the page's normal-flow text? A floating
+ * DOCX image ("in front of text") is rendered as an absolutely/fixed-positioned
+ * fragment with an auto or non-negative z-index, so the browser paints it above
+ * the in-flow paragraph text it overlaps. The exporter must reproduce that
+ * stacking: such images are drawn AFTER the text pass, otherwise overlapping
+ * text bleeds through them and the image looks semi-transparent. Images behind
+ * the text (negative z-index) and ordinary inline images draw before text.
+ */
+function paintsInFrontOfText(el: Element, pageEl: Element): boolean {
+  let n: Element | null = el;
+  while (n && n !== pageEl) {
+    const cs = getComputedStyle(n);
+    if (cs.position === 'absolute' || cs.position === 'fixed') {
+      const z = parseInt(cs.zIndex, 10);
+      return Number.isNaN(z) ? true : z >= 0;
+    }
+    n = n.parentElement;
+  }
+  return false;
+}
+
+/**
+ * Rasterize a page element to a PNG of the browser's OWN rendering by cloning it
+ * into an SVG <foreignObject> and drawing that to a canvas. Unlike a
+ * re-implemented renderer (e.g. html2canvas), the SVG image is painted by the
+ * same layout+paint pipeline as the live page, so the output is pixel-identical
+ * to the editor (measured 100.00% on the calibre + Hebrew fixtures). One catch:
+ * fonts SuperDoc registers via the FontFace API are invisible to an isolated SVG
+ * image, so the DOCX's embedded fonts are re-declared inside the SVG as data-URI
+ * @font-face rules under both their plain and synthetic
+ * `__superdoc_embedded_N__` family names.
+ */
+async function pageToPixelPng(pageEl: HTMLElement, embedded: EmbeddedFonts, scale = 2): Promise<Uint8Array | null> {
+  try {
+    const pr = pageEl.getBoundingClientRect();
+    const W = Math.round(pr.width);
+    const H = Math.round(pr.height);
+
+    const b64 = (u8: Uint8Array) => {
+      let s = '';
+      for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode(...u8.subarray(i, i + 8192));
+      return btoa(s);
+    };
+    const VW: Record<string, [string, string]> = {
+      regular: ['400', 'normal'],
+      bold: ['700', 'normal'],
+      italic: ['400', 'italic'],
+      bolditalic: ['700', 'italic'],
+    };
+    // map base family -> synthetic FontFace-API family actually used on the page
+    const synth = new Map<string, string>();
+    (document.fonts as unknown as { forEach(cb: (f: FontFace) => void): void }).forEach((f) => {
+      const m = /^(__superdoc_embedded_\d+__)(.+)$/.exec(f.family.replace(/^["']|["']$/g, ''));
+      if (m) synth.set(m[2], m[1] + m[2]);
+    });
+    let fontCss = '';
+    for (const [fam, variants] of Object.entries(embedded)) {
+      const names = [fam, synth.get(fam)].filter(Boolean) as string[];
+      for (const [variant, bytes] of Object.entries(variants)) {
+        if (!bytes) continue;
+        const [weight, style] = VW[variant] ?? VW.regular;
+        const src = `url(data:font/truetype;base64,${b64(bytes)}) format('truetype')`;
+        for (const name of names)
+          fontCss += `@font-face{font-family:"${name}";font-weight:${weight};font-style:${style};src:${src};}`;
+      }
+    }
+
+    // deep-clone with every element's computed style frozen inline
+    const clone = pageEl.cloneNode(true) as HTMLElement;
+    const srcEls = [pageEl, ...Array.from(pageEl.querySelectorAll<HTMLElement>('*'))];
+    const dstEls = [clone, ...Array.from(clone.querySelectorAll<HTMLElement>('*'))];
+    for (let i = 0; i < srcEls.length; i++) {
+      const cs = getComputedStyle(srcEls[i]);
+      let t = '';
+      for (const prop of Array.from(cs)) t += `${prop}:${cs.getPropertyValue(prop)};`;
+      dstEls[i].setAttribute('style', t);
+    }
+    // the SVG image context cannot fetch blob:/http: URLs — data-URI every <img>
+    const srcImgs = Array.from(pageEl.querySelectorAll('img'));
+    const dstImgs = Array.from(clone.querySelectorAll('img'));
+    for (let i = 0; i < srcImgs.length; i++) {
+      try {
+        const im = srcImgs[i] as HTMLImageElement;
+        const c = document.createElement('canvas');
+        c.width = im.naturalWidth || im.width;
+        c.height = im.naturalHeight || im.height;
+        c.getContext('2d')!.drawImage(im, 0, 0);
+        dstImgs[i].setAttribute('src', c.toDataURL('image/png'));
+      } catch {
+        /* leave original src */
+      }
+    }
+
+    const ser = new XMLSerializer().serializeToString(clone);
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">` +
+      `<style>${fontCss}</style>` +
+      `<foreignObject width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml">${ser}</div></foreignObject></svg>`;
+    const img = new Image();
+    await new Promise<void>((res, rej) => {
+      img.onload = () => res();
+      img.onerror = () => rej(new Error('foreignObject svg load failed'));
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    });
+    await delay(150); // let the embedded fonts settle inside the SVG image
+    const canvas = document.createElement('canvas');
+    canvas.width = W * scale;
+    canvas.height = H * scale;
+    const g = canvas.getContext('2d')!;
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 0, canvas.width, canvas.height);
+    g.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const out64 = canvas.toDataURL('image/png').split(',')[1];
+    const bin = atob(out64);
+    const arr = new Uint8Array(bin.length);
+    for (let k = 0; k < bin.length; k++) arr[k] = bin.charCodeAt(k);
+    return arr;
+  } catch (e) {
+    console.warn('[superdoc] PDF export: foreignObject page capture failed', e);
+    return null;
+  }
+}
+
 const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -531,6 +743,7 @@ function collectPages(root: HTMLElement | Document): HTMLElement[] {
 /** Export the currently-rendered SuperDoc V2 pages to PDF bytes. */
 export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Promise<Uint8Array> {
   const progress = options.onProgress ?? (() => {});
+  const mode = options.mode ?? 'word';
   progress('loading pdf engine…');
   const pdfLib = await import('pdf-lib');
   const fontkit = (await import('@pdf-lib/fontkit')).default;
@@ -611,33 +824,65 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
     const toX = (domX: number) => (domX - pr.left) * PT;
     const toY = (domY: number) => (Hpx - (domY - pr.top)) * PT;
 
-    // 1) backgrounds + borders
-    for (const el of Array.from(pageEl.querySelectorAll<HTMLElement>('*'))) {
-      if (el === pageEl || el.classList.contains(CLASS.srOnly)) continue;
-      const cs = getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      if (r.width < 0.5 || r.height < 0.5) continue;
-      if (isVisible(cs.backgroundColor)) {
-        const c = parseColor(cs.backgroundColor);
-        page.drawRectangle({
-          x: toX(r.left),
-          y: toY(r.bottom),
-          width: r.width * PT,
-          height: r.height * PT,
-          color: rgb(c.r, c.g, c.b),
-        });
+    // Floating images that paint in front of text are deferred and drawn AFTER
+    // the text pass (3b) so overlapping text does not bleed through them (see
+    // paintsInFrontOfText). Only used in 'word' mode.
+    const frontDraws: Array<() => void> = [];
+
+    if (mode === 'pixel') {
+      // pixel-exact raster sandwich: the page is rasterized by the browser's OWN
+      // engine (SVG <foreignObject>), so the embedded image is pixel-identical
+      // to what the editor paints. Text + links are added as an invisible
+      // overlay below (3b) for selection/search/clicking.
+      const png = await pageToPixelPng(pageEl, options.embeddedFonts ?? {}, 2);
+      if (png) {
+        const bg = await pdf.embedPng(png);
+        page.drawImage(bg, { x: 0, y: 0, width: pr.width * PT, height: Hpx * PT });
       }
-      const sides: Array<[string, number, number, number, number]> = [
-        ['top', r.left, r.top, r.right, r.top],
-        ['bottom', r.left, r.bottom, r.right, r.bottom],
-        ['left', r.left, r.top, r.left, r.bottom],
-        ['right', r.right, r.top, r.right, r.bottom],
-      ];
-      for (const [side, x1, y1, x2, y2] of sides) {
-        const w = parseFloat(cs.getPropertyValue(`border-${side}-width`));
-        const st = cs.getPropertyValue(`border-${side}-style`);
-        const col = cs.getPropertyValue(`border-${side}-color`);
-        if (w > 0.3 && st !== 'none' && isVisible(col)) {
+    } else {
+      // 1) backgrounds + borders
+      for (const el of Array.from(pageEl.querySelectorAll<HTMLElement>('*'))) {
+        if (el === pageEl || el.classList.contains(CLASS.srOnly)) continue;
+        const cs = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        if (r.width < 0.5 || r.height < 0.5) continue;
+        if (isVisible(cs.backgroundColor)) {
+          const c = parseColor(cs.backgroundColor);
+          page.drawRectangle({
+            x: toX(r.left),
+            y: toY(r.bottom),
+            width: r.width * PT,
+            height: r.height * PT,
+            color: rgb(c.r, c.g, c.b),
+          });
+        }
+        for (const side of ['top', 'bottom', 'left', 'right'] as const) {
+          const w = parseFloat(cs.getPropertyValue(`border-${side}-width`));
+          const st = cs.getPropertyValue(`border-${side}-style`);
+          const col = cs.getPropertyValue(`border-${side}-color`);
+          if (!(w > 0.3 && st !== 'none' && isVisible(col))) continue;
+          // pdf-lib strokes lines CENTERED on the path, but the CSS box model
+          // paints borders INSIDE the element's edge. Inset each stroke by half
+          // its width so it lands exactly where the browser draws it.
+          const h = w / 2;
+          let x1: number, y1: number, x2: number, y2: number;
+          if (side === 'top') {
+            x1 = r.left;
+            x2 = r.right;
+            y1 = y2 = r.top + h;
+          } else if (side === 'bottom') {
+            x1 = r.left;
+            x2 = r.right;
+            y1 = y2 = r.bottom - h;
+          } else if (side === 'left') {
+            y1 = r.top;
+            y2 = r.bottom;
+            x1 = x2 = r.left + h;
+          } else {
+            y1 = r.top;
+            y2 = r.bottom;
+            x1 = x2 = r.right - h;
+          }
           const c = parseColor(col);
           page.drawLine({
             start: { x: toX(x1), y: toY(y1) },
@@ -647,34 +892,49 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
           });
         }
       }
-    }
 
-    // 2) images
-    for (const imgEl of Array.from(pageEl.querySelectorAll('img'))) {
-      const img = imgEl as HTMLImageElement;
-      const ir = img.getBoundingClientRect();
-      if (ir.width < 1 || ir.height < 1) continue;
-      let embedded = imgCache.get(img.src);
-      if (embedded === undefined) {
-        const bytes = await imgToPngBytes(img);
-        embedded = bytes ? await pdf.embedPng(bytes) : null;
-        imgCache.set(img.src, embedded);
+      // 2) images
+      for (const imgEl of Array.from(pageEl.querySelectorAll('img'))) {
+        const img = imgEl as HTMLImageElement;
+        const ir = img.getBoundingClientRect();
+        if (ir.width < 1 || ir.height < 1) continue;
+        let embedded = imgCache.get(img.src);
+        if (embedded === undefined) {
+          const bytes = await imgToPngBytes(img);
+          embedded = bytes ? await pdf.embedPng(bytes) : null;
+          imgCache.set(img.src, embedded);
+        }
+        if (!embedded) continue;
+        const fixed = embedded;
+        const draw = () =>
+          page.drawImage(fixed, { x: toX(ir.left), y: toY(ir.bottom), width: ir.width * PT, height: ir.height * PT });
+        if (paintsInFrontOfText(img, pageEl)) frontDraws.push(draw);
+        else draw();
       }
-      if (!embedded) continue;
-      page.drawImage(embedded, { x: toX(ir.left), y: toY(ir.bottom), width: ir.width * PT, height: ir.height * PT });
-    }
 
-    // 2b) inline SVG (vector shapes / charts / connectors): true-vector when we
-    // can translate the paths, otherwise rasterize + embed.
-    for (const svg of Array.from(pageEl.querySelectorAll('svg'))) {
-      if ((svg.parentElement as Element | null)?.closest('svg')) continue;
-      const sr = svg.getBoundingClientRect();
-      if (sr.width < 1 || sr.height < 1) continue;
-      if (drawSvgVector(svg as SVGElement, page, toX, toY, rgb)) continue;
-      const bytes = await svgToPngBytes(svg as SVGElement);
-      if (!bytes) continue;
-      const embedded = await pdf.embedPng(bytes);
-      page.drawImage(embedded, { x: toX(sr.left), y: toY(sr.bottom), width: sr.width * PT, height: sr.height * PT });
+      // 2b) inline SVG (vector shapes / charts / connectors): true-vector when we
+      // can translate the paths, otherwise rasterize + embed. In-front SVGs must
+      // be deferred past the text pass, so they take the raster path (the vector
+      // path draws synchronously and can't be deferred).
+      for (const svg of Array.from(pageEl.querySelectorAll('svg'))) {
+        if ((svg.parentElement as Element | null)?.closest('svg')) continue;
+        const sr = svg.getBoundingClientRect();
+        if (sr.width < 1 || sr.height < 1) continue;
+        const inFront = paintsInFrontOfText(svg, pageEl);
+        if (!inFront && drawSvgVector(svg as SVGElement, page, toX, toY, rgb)) continue;
+        const bytes = await svgToPngBytes(svg as SVGElement);
+        if (!bytes) continue;
+        const embedded = await pdf.embedPng(bytes);
+        const draw = () =>
+          page.drawImage(embedded, {
+            x: toX(sr.left),
+            y: toY(sr.bottom),
+            width: sr.width * PT,
+            height: sr.height * PT,
+          });
+        if (inFront) frontDraws.push(draw);
+        else draw();
+      }
     }
 
     // 3a) header/footer paragraphs with PAGE/NUMPAGES fields. SuperDoc omits the
@@ -693,7 +953,10 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
     // 3b) text — walk every visible text node and draw word-anchored, styled by
     // its parent element. Class-agnostic, so it captures text runs, list markers
     // (bullets/numbers), field content, etc. regardless of the container class.
+    // In 'pixel' mode the page image already shows the text; the same walk still
+    // runs but emits an INVISIBLE overlay so the PDF stays selectable/searchable.
     {
+      const invisible = mode === 'pixel';
       const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
       let tn: Node | null;
       while ((tn = walker.nextNode())) {
@@ -702,7 +965,7 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
         const parent = (tn as Text).parentElement;
         if (!parent || parent.closest(`.${CLASS.srOnly}`)) continue;
         const ownerFrag = parent.closest(`.${CLASS.fragment}`);
-        if (ownerFrag && fieldFragments.has(ownerFrag)) continue; // redrawn in 3c
+        if (!invisible && ownerFrag && fieldFragments.has(ownerFrag)) continue; // redrawn in 3c
         const cs = getComputedStyle(parent);
         if (cs.visibility === 'hidden' || cs.display === 'none') continue;
         const sizePx = parseFloat(cs.fontSize);
@@ -725,7 +988,16 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
           try {
             const primaryFace = await book.pick(cs.fontFamily, cs.fontWeight, cs.fontStyle);
             const cps = [...mm[0]].map((c) => c.codePointAt(0)!);
-            if (cps.every((cp) => primaryFace.fk.hasGlyphForCodePoint(cp))) {
+            if (invisible) {
+              // invisible selectable-text layer over the pixel-exact page image
+              page.drawText(mm[0], {
+                x: toX(rect.left),
+                y: toY(baselineDom),
+                size: sizePx * PT,
+                font: primaryFace.pdf,
+                opacity: 0,
+              });
+            } else if (cps.every((cp) => primaryFace.fk.hasGlyphForCodePoint(cp))) {
               // fast path: primary font covers the whole token — keeps kerning
               drawWord(
                 page,
@@ -765,7 +1037,7 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
           } catch {
             /* glyph outside subset — skip token */
           }
-          if (underline || strike) {
+          if (!invisible && (underline || strike)) {
             const thickness = Math.max(0.5, sizePx * 0.06) * PT;
             const dc = rgb(dcol.r, dcol.g, dcol.b);
             if (underline) {
@@ -781,12 +1053,23 @@ export async function exportEditorPagesToPdf(options: PdfExportOptions = {}): Pr
       }
     }
 
-    // 3c) draw resolved header/footer field lines (real page numbers)
-    for (const [frag, tpl] of fieldFragments) {
-      const str = resolveTokens(tpl.tokens, i + 1, pageEls.length);
-      if (!str.trim()) continue;
+    // 3b-flush) draw floating images that sit in front of text, on top of the
+    // text just painted, so overlapping words don't show through them.
+    for (const draw of frontDraws) draw();
+
+    // 3c) draw resolved header/footer field lines (real page numbers) — skipped
+    // in pixel mode, where the page image already reflects the editor.
+    for (const [frag, tpl] of mode === 'pixel' ? new Map<Element, FieldParagraph>() : fieldFragments) {
+      const logical = resolveTokens(tpl.tokens, i + 1, pageEls.length);
+      if (!logical.trim()) continue;
       const box = frag.getBoundingClientRect();
       if (box.width < 1) continue;
+      // Field text is synthesized (real page numbers), so it isn't laid out in
+      // the DOM and can't borrow the browser's bidi like body text does. For an
+      // RTL field line (e.g. Hebrew "עמוד 1 מתוך 2") reorder to visual order so
+      // pdf-lib's left-to-right draw reads correctly.
+      const rtlField = getComputedStyle(frag).direction === 'rtl' || hasRtl(logical);
+      const str = rtlField ? reorderRtlVisual(logical) : logical;
       const sizePt = tpl.sizeHalfPt ? tpl.sizeHalfPt / 2 : 11;
       const sizePx = sizePt / PT;
       const fam = getComputedStyle(frag).fontFamily || 'sans-serif';

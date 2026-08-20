@@ -121,7 +121,10 @@ const originalExport = superdoc.export.bind(superdoc);
     showOverlay(true);
     try {
       if (restoreZoom) pm.setZoom(100);
-      bytes = await exportSuperDocToPdf(superdoc, { onProgress: progress, embeddedFonts, fieldTemplates });
+      // mode: ?mode= query param overrides the toolbar picker
+      const picker = document.querySelector<HTMLSelectElement>('#mode');
+      const mode = ((new URLSearchParams(location.search).get('mode') || picker?.value) as any) || undefined;
+      bytes = await exportSuperDocToPdf(superdoc, { onProgress: progress, embeddedFonts, fieldTemplates, mode });
     } finally {
       if (restoreZoom) pm.setZoom(prevZoom);
       window.scrollTo(scrollX0, scrollY0);

@@ -38,10 +38,28 @@ into a PDF with [pdf-lib](https://pdf-lib.js.org/):
   for it to paint** (behind a progress overlay) so full documents export in a
   normal window.
 
-**Not handled:** RTL / complex-script shaping (Arabic joining, bidi reordering)
-— pdf-lib has no shaping engine; see `FINDINGS.md`.
-
 pdf-lib + fontkit are **lazy-imported only when an export runs**.
+
+## Export modes
+
+The toolbar **mode** picker (or `?mode=` query param / `mode` export option)
+selects the rendering strategy:
+
+- **`word`** (default) — vector text as described above. Smallest files
+  (~110 KB for the 8-page sample), crisp at any zoom. Matches the editor to the
+  anti-aliasing floor (~2.5% of pixels, all glyph-edge halos — verified to
+  contain zero structural differences). Hebrew renders correctly (incl. bold +
+  RTL page-number fields); Arabic cursive joining is the one remaining gap
+  (pdf-lib has no shaping engine).
+- **`pixel`** — **literal 100.00% pixel parity with the editor**: each page is
+  rasterized by the browser's own engine via SVG `<foreignObject>` (with the
+  DOCX's embedded fonts re-declared as data-URI `@font-face` inside the SVG)
+  and embedded as an image, plus an invisible selectable-text + clickable-link
+  overlay. Verified 0-of-3.4M-pixels different per page on the calibre fixture
+  and a Hebrew RTL fixture — RTL/Arabic shaping is exact by construction.
+  Costs: ~190 KB/page dense, ~700 ms/page, text prints as 2× raster.
+
+See `FINDINGS.md` §3b for the measurement methodology.
 
 ## Run
 

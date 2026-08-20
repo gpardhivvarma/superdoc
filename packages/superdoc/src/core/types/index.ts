@@ -2703,6 +2703,14 @@ export interface ExportParams {
      */
     embeddedFonts?: Record<string, Partial<Record<'regular' | 'bold' | 'italic' | 'bolditalic', Uint8Array>>>;
     onProgress?: (message: string) => void;
+    /**
+     * Rendering strategy. `'word'` (default) draws vector text at the browser's
+     * measured coordinates — smallest files, crisp at any zoom. `'pixel'`
+     * embeds each page as a raster painted by the browser's own engine —
+     * pixel-identical to the editor (including RTL/Arabic shaping) with an
+     * invisible selectable-text/link overlay, at larger file sizes.
+     */
+    mode?: 'word' | 'pixel';
   };
 }
 

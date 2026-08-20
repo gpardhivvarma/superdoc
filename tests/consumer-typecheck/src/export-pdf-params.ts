@@ -4,7 +4,8 @@
  * Pins the public shape of the PDF export surface so a regression fails CI:
  *   - `ExportType` includes `'pdf'`, so `exportType: ['pdf']` type-checks;
  *   - `ExportParams.pdfOptions` is optional and carries `fontBaseUrl`, `fonts`,
- *     `embeddedFonts`, and `onProgress`.
+ *     `embeddedFonts`, `onProgress`, and `mode` ('word' vector | 'pixel'
+ *     pixel-exact raster).
  *
  * Mirrors the documented call from the feature brief:
  *   await superdoc.export({ exportType: ['pdf'], triggerDownload: true });
@@ -34,7 +35,14 @@ const withPdfOptions: ExportParams = {
     fonts: { 'sans:regular': new ArrayBuffer(0) },
     embeddedFonts: { Ubuntu: { regular: new Uint8Array(0), bold: new Uint8Array(0) } },
     onProgress: (message: string) => void message,
+    mode: 'word',
   },
+};
+
+// Pixel-exact raster mode is a valid rendering strategy.
+const pixelMode: ExportParams = {
+  exportType: ['pdf'],
+  pdfOptions: { mode: 'pixel' },
 };
 
 // pdfOptions is optional (omitting it is valid).
@@ -52,8 +60,9 @@ const _pdfOptionsTypeIsExact: AssertEqual<
       fonts?: Record<string, ArrayBuffer>;
       embeddedFonts?: Record<string, Partial<Record<'regular' | 'bold' | 'italic' | 'bolditalic', Uint8Array>>>;
       onProgress?: (message: string) => void;
+      mode?: 'word' | 'pixel';
     }
   | undefined
 > = true;
 
-void [docx, pdf, html, pdfExport, bothFormats, withPdfOptions, noPdfOptions, _pdfOptionsTypeIsExact];
+void [docx, pdf, html, pdfExport, bothFormats, withPdfOptions, noPdfOptions, pixelMode, _pdfOptionsTypeIsExact];
